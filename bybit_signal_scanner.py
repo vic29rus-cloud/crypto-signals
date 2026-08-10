@@ -27,7 +27,7 @@ TIMEFRAME_PARAMS = {
     "1w": {"bybit_interval": "W",   "ema_fast": 10, "ema_slow": 30,  "atr_mult_sl": 2.5, "atr_mult_tp": 5.0, "min_bars": 60},
 }
 
-BASE_URL = "https://api.bybit.com"
+BASE_URL = "https://api.bytick.com"
 STATE_FILE = "bybit_scanner_state.json"
 
 EXCLUDE_BASE_SUBSTRINGS = ["UP", "DOWN", "BULL", "BEAR", "3L", "3S", "5L", "5S"]
