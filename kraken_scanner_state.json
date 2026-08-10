@@ -376,5 +376,414 @@
   "TRUMPUSD_1d": {
     "position": "closed",
     "last_bar_processed": "1786233600"
+  },
+  "XXBTZUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "XETHZUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "SOLUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "XXRPZUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "ADAUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "XZECZUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "HYPEUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "BMTUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "PUMPUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "SUIUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "TAOUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "XXMRZUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "PAXGUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "AVAXUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "XXLMZUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "CRVUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "CAPUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "XANUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "ICPUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "XLTCZUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "ONDOUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "XDGUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "CCUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "AAVEUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "ENAUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "NEARUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "USDGUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "LINKUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "WLDUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "AKEUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "BLUAIUSD_4h": {
+    "position": "open",
+    "entry_price": 0.02801,
+    "stop": 0.021746,
+    "target": 0.040538000000000005,
+    "last_bar_processed": "1786377600"
+  },
+  "GWEIUSD_4h": {
+    "position": "open",
+    "entry_price": 0.029874,
+    "stop": 0.02609614285714286,
+    "target": 0.03742971428571429,
+    "last_bar_processed": "1786377600"
+  },
+  "PENGUUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "BICOUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "ESPORTSUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "FARTCOINUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "TRXUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "BNBUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "UNIUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "AUDUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "ALGOUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "HFTUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "REUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "XAUTUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "PEPEUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "NIGHTUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "USELESSUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "FETUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "KAITOUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "MUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "SHIBUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "MONUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "INJUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "NILUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "EURCUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "DASHUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "FLRUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "HBARUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "XNYUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "VVVUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "BABYUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "WEMIXUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "POLUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "XDCUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "KASUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "RENDERUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "TONUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "DOTUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "UAIUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "DOGUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "JTOUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "ZROUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "SPXUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "MUBARAKUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "CVXUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "EULUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "LITUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "USUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "TRUUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "KSMUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "BLESSUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "XCNUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "ICNTUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "AKTUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "REPPOUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "FHEUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "MORPHOUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "ATOMUSD_4h": {
+    "position": "open",
+    "entry_price": 1.4071,
+    "stop": 1.3827464285714286,
+    "target": 1.4558071428571429,
+    "last_bar_processed": "1786377600"
+  },
+  "COTIUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "PLAYUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "SAGAUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "CSPRUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "MNTUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "QNTUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "ARBUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "AEROUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "AIOZUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "JITOSOLUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "ZEREBROUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
+  },
+  "PROSUSD_4h": {
+    "position": "closed",
+    "last_bar_processed": "1786377600"
   }
 }
