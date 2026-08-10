@@ -1,0 +1,86 @@
+name: Bybit Signal Scanner
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeframe:
+        description: 'Таймфрейм для ручного теста (4h / 1d / 1w)'
+        required: false
+        default: '1d'
+  schedule:
+    # Bybit закрывает 4H-свечи в 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC
+    - cron: '5 0,4,8,12,16,20 * * *'
+    # Дневная свеча закрывается в 00:00 UTC
+    - cron: '10 0 * * *'
+    # Недельная свеча закрывается в понедельник 00:00 UTC
+    - cron: '15 0 * * 1'
+
+permissions:
+  contents: write
+
+jobs:
+  scan-4h:
+    if: github.event.schedule == '5 0,4,8,12,16,20 * * *' || github.event.inputs.timeframe == '4h'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests pandas numpy
+      - name: Сканировать пары (4H)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python bybit_signal_scanner.py --timeframe 4h --top-n 100
+      - name: Сохранить состояние
+        run: |
+          git config user.name "signal-bot"
+          git config user.email "signal-bot@users.noreply.github.com"
+          git add bybit_scanner_state.json
+          git diff --staged --quiet || git commit -m "chore: update bybit scanner state (4h)"
+          git push || true
+
+  scan-1d:
+    if: github.event.schedule == '10 0 * * *' || github.event.inputs.timeframe == '1d'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests pandas numpy
+      - name: Сканировать пары (1D)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python bybit_signal_scanner.py --timeframe 1d --top-n 100
+      - name: Сохранить состояние
+        run: |
+          git config user.name "signal-bot"
+          git config user.email "signal-bot@users.noreply.github.com"
+          git add bybit_scanner_state.json
+          git diff --staged --quiet || git commit -m "chore: update bybit scanner state (1d)"
+          git push || true
+
+  scan-1w:
+    if: github.event.schedule == '15 0 * * 1' || github.event.inputs.timeframe == '1w'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests pandas numpy
+      - name: Сканировать пары (1W)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python bybit_signal_scanner.py --timeframe 1w --top-n 100
+      - name: Сохранить состояние
+        run: |
+          git config user.name "signal-bot"
+          git config user.email "signal-bot@users.noreply.github.com"
+          git add bybit_scanner_state.json
+          git diff --staged --quiet || git commit -m "chore: update bybit scanner state (1w)"
+          git push || true
