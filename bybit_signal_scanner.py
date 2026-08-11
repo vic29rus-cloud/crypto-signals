@@ -1,12 +1,13 @@
 """
-Сканер сигналов по ВСЕМ ликвидным SPOT-парам Bybit.
-Использует официальный публичный API Bybit v5 (ключ не нужен для рыночных данных).
+Сканер сигналов по ликвидным SPOT-парам Kraken (котировка в USD).
+Использует официальный публичный API Kraken (ключ не нужен для рыночных данных).
+Kraken официально доступен пользователям США (в отличие от Bybit).
 
 УСТАНОВКА:
     pip install requests pandas numpy --break-system-packages
 
 ЗАПУСК ВРУЧНУЮ (тест):
-    python bybit_signal_scanner.py --timeframe 1d --top-n 100
+    python kraken_signal_scanner.py --timeframe 1d --top-n 100
 """
 
 import argparse
@@ -18,102 +19,107 @@ import pandas as pd
 import numpy as np
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")  # опционально: личный чат-админ, всегда получает сигналы
 
-# Bybit interval-коды: 1,3,5,15,30,60,120,240,360,720,D,M,W
+SUBSCRIBERS_FILE = "telegram_subscribers.json"
+WELCOME_TEXT = (
+    "✅ Вы подписались на сигналы Kraken Scanner.\n"
+    "Здесь будут появляться сигналы входа (BUY) и выхода (SELL) по отслеживаемым парам."
+)
+
+# Kraken interval задаётся в минутах: 1,5,15,30,60,240,1440,10080,21600
 TIMEFRAME_PARAMS = {
-    "4h": {"bybit_interval": "240", "ema_fast": 21, "ema_slow": 55,  "atr_mult_sl": 1.5, "atr_mult_tp": 3.0, "min_bars": 120},
-    "1d": {"bybit_interval": "D",   "ema_fast": 50, "ema_slow": 200, "atr_mult_sl": 2.0, "atr_mult_tp": 4.0, "min_bars": 220},
-    "1w": {"bybit_interval": "W",   "ema_fast": 10, "ema_slow": 30,  "atr_mult_sl": 2.5, "atr_mult_tp": 5.0, "min_bars": 60},
+    "4h": {"kraken_interval": 240,   "ema_fast": 21, "ema_slow": 55,  "atr_mult_sl": 1.5, "atr_mult_tp": 3.0, "min_bars": 120},
+    "1d": {"kraken_interval": 1440,  "ema_fast": 50, "ema_slow": 200, "atr_mult_sl": 2.0, "atr_mult_tp": 4.0, "min_bars": 220},
+    "1w": {"kraken_interval": 10080, "ema_fast": 10, "ema_slow": 30,  "atr_mult_sl": 2.5, "atr_mult_tp": 5.0, "min_bars": 60},
 }
 
-BASE_URL = "https://api.bybit.com"
-STATE_FILE = "bybit_scanner_state.json"
+BASE_URL = "https://api.kraken.com/0/public"
+STATE_FILE = "kraken_scanner_state.json"
 
 EXCLUDE_BASE_SUBSTRINGS = ["UP", "DOWN", "BULL", "BEAR", "3L", "3S", "5L", "5S"]
-STABLECOINS = {"USDC", "BUSD", "TUSD", "FDUSD", "DAI", "USDP", "PYUSD", "USDT", "EUR"}
+STABLECOINS = {"USDC", "USDT", "DAI", "USD", "EUR", "GBP", "PYUSD", "TUSD", "FDUSD"}
 
 
 def get_top_pairs(quote_coin: str, top_n: int) -> list:
-    """Топ-N спот-пар Bybit по 24ч обороту в USDT (turnover24h)."""
-    instr_resp = requests.get(
-        f"{BASE_URL}/v5/market/instruments-info",
-        params={"category": "spot"}, timeout=20
-    )
-    instr_resp.raise_for_status()
-    instr_data = instr_resp.json()["result"]["list"]
+    """Топ-N спот-пар Kraken по 24ч обороту (в quote_coin), отсортированных по убыванию."""
+    pairs_resp = requests.get(f"{BASE_URL}/AssetPairs", timeout=20)
+    pairs_resp.raise_for_status()
+    pairs_data = pairs_resp.json()
+    if pairs_data.get("error"):
+        raise RuntimeError(f"Kraken API error: {pairs_data['error']}")
 
-    tradable = {
-        i["symbol"] for i in instr_data
-        if i["status"] == "Trading" and i["quoteCoin"] == quote_coin
-    }
+    all_pairs = pairs_data["result"]
 
-    tick_resp = requests.get(
-        f"{BASE_URL}/v5/market/tickers",
-        params={"category": "spot"}, timeout=20
-    )
-    tick_resp.raise_for_status()
-    tickers = tick_resp.json()["result"]["list"]
-
-    candidates = []
-    for t in tickers:
-        symbol = t["symbol"]
-        if symbol not in tradable:
+    candidates_names = []
+    for kraken_name, info in all_pairs.items():
+        wsname = info.get("wsname", "")
+        if "/" not in wsname:
             continue
-        base = symbol[:-len(quote_coin)] if symbol.endswith(quote_coin) else None
-        if base is None:
+        base, quote = wsname.split("/")
+        if quote != quote_coin:
             continue
         if any(x in base for x in EXCLUDE_BASE_SUBSTRINGS):
             continue
         if base in STABLECOINS:
             continue
-        try:
-            turnover = float(t.get("turnover24h", 0))
-        except (TypeError, ValueError):
-            turnover = 0.0
-        candidates.append((symbol, turnover))
+        candidates_names.append(kraken_name)
 
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    return [c[0] for c in candidates[:top_n]]
+    # Kraken Ticker принимает список пар через запятую, но с ограничением длины URL — бьём на чанки
+    volumes = {}
+    chunk_size = 50
+    for i in range(0, len(candidates_names), chunk_size):
+        chunk = candidates_names[i:i + chunk_size]
+        tick_resp = requests.get(
+            f"{BASE_URL}/Ticker", params={"pair": ",".join(chunk)}, timeout=20
+        )
+        tick_resp.raise_for_status()
+        tick_data = tick_resp.json()
+        if tick_data.get("error"):
+            time.sleep(0.3)
+            continue
+        for pair_name, t in tick_data.get("result", {}).items():
+            try:
+                vwap_24h = float(t["p"][1])
+                vol_24h = float(t["v"][1])
+                volumes[pair_name] = vwap_24h * vol_24h
+            except (KeyError, ValueError, TypeError):
+                volumes[pair_name] = 0.0
+        time.sleep(0.3)
+
+    sorted_pairs = sorted(volumes.items(), key=lambda x: x[1], reverse=True)
+    return [p[0] for p in sorted_pairs[:top_n]]
 
 
-def fetch_klines(symbol: str, interval: str, min_bars: int) -> pd.DataFrame:
+def fetch_klines(pair: str, interval_minutes: int, min_bars: int) -> pd.DataFrame:
     """
-    Bybit отдаёт максимум 200 свечей за запрос, поэтому пагинируем через end=.
-    Возвращаем DataFrame отсортированный по времени по возрастанию.
+    Kraken отдаёт до 720 последних свечей за один запрос — этого хватает
+    для всех наших таймфреймов без дополнительной пагинации.
     """
-    all_rows = []
-    end_ts = None
-    remaining = min_bars
+    resp = requests.get(
+        f"{BASE_URL}/OHLC", params={"pair": pair, "interval": interval_minutes}, timeout=20
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    if payload.get("error"):
+        raise RuntimeError(f"Kraken API error: {payload['error']}")
 
-    while remaining > 0:
-        params = {"category": "spot", "symbol": symbol, "interval": interval, "limit": min(200, remaining)}
-        if end_ts:
-            params["end"] = end_ts
-        resp = requests.get(f"{BASE_URL}/v5/market/kline", params=params, timeout=15)
-        resp.raise_for_status()
-        payload = resp.json()
-        if payload.get("retCode") != 0:
-            raise RuntimeError(f"Bybit API error: {payload.get('retMsg')}")
-        rows = payload["result"]["list"]  # новые сначала
-        if not rows:
+    result = payload["result"]
+    # Ответ содержит ключ с реальным именем пары (может отличаться от запрошенного) + служебный "last"
+    rows = None
+    for key, val in result.items():
+        if key != "last":
+            rows = val
             break
-        all_rows.extend(rows)
-        oldest_start = int(rows[-1][0])
-        end_ts = oldest_start - 1
-        remaining -= len(rows)
-        if len(rows) < 200:
-            break  # больше истории нет
-
-    if not all_rows:
+    if not rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(all_rows, columns=["start", "open", "high", "low", "close", "volume", "turnover"])
+    df = pd.DataFrame(rows, columns=["start", "open", "high", "low", "close", "vwap", "volume", "count"])
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
     df["start"] = df["start"].astype(np.int64)
     df = df.drop_duplicates(subset="start").sort_values("start").reset_index(drop=True)
-    return df
+    return df.tail(min_bars + 10).reset_index(drop=True)
 
 
 def ema(series, length):
@@ -145,7 +151,7 @@ def analyze(df: pd.DataFrame, params: dict) -> dict:
     df["macd_line"], df["macd_signal"] = macd(df["close"])
     df["atr"] = atr(df)
 
-    last = df.iloc[-2]   # последняя ЗАКРЫТАЯ свеча
+    last = df.iloc[-2]   # последняя ЗАКРЫТАЯ свеча (последняя строка Kraken — текущая незакрытая)
     prev = df.iloc[-3]
 
     trend_up = last["ema_fast"] > last["ema_slow"]
@@ -162,13 +168,93 @@ def analyze(df: pd.DataFrame, params: dict) -> dict:
     }
 
 
+def load_subscribers() -> dict:
+    if os.path.exists(SUBSCRIBERS_FILE):
+        with open(SUBSCRIBERS_FILE) as f:
+            return json.load(f)
+    return {"offset": 0, "chat_ids": []}
+
+
+def save_subscribers(data: dict):
+    with open(SUBSCRIBERS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def poll_new_subscribers():
+    """
+    Проверяет новые сообщения боту через getUpdates.
+    Каждый, кто прислал /start, добавляется в список подписчиков и получает приветствие.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        return
+
+    data = load_subscribers()
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    try:
+        resp = requests.get(url, params={"offset": data["offset"] + 1, "timeout": 0}, timeout=15)
+        resp.raise_for_status()
+        updates = resp.json().get("result", [])
+    except Exception as e:
+        print(f"Не удалось получить обновления Telegram: {e}")
+        return
+
+    for update in updates:
+        data["offset"] = max(data["offset"], update.get("update_id", data["offset"]))
+        msg = update.get("message") or update.get("channel_post")
+        if not msg:
+            continue
+        chat_id = msg["chat"]["id"]
+        text = (msg.get("text") or "").strip().lower()
+
+        if text.startswith("/start") and chat_id not in data["chat_ids"]:
+            data["chat_ids"].append(chat_id)
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": chat_id, "text": WELCOME_TEXT},
+                    timeout=15,
+                )
+            except Exception as e:
+                print(f"Не удалось отправить приветствие {chat_id}: {e}")
+
+        if text.startswith("/stop") and chat_id in data["chat_ids"]:
+            data["chat_ids"].remove(chat_id)
+
+    save_subscribers(data)
+    print(f"Подписчиков: {len(data['chat_ids'])}")
+
+
 def send_telegram(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_BOT_TOKEN:
         print("[NO TELEGRAM CONFIG]", text)
         return
+
+    data = load_subscribers()
+    chat_ids = set(data.get("chat_ids", []))
+    if TELEGRAM_CHAT_ID:
+        chat_ids.add(TELEGRAM_CHAT_ID)
+
+    if not chat_ids:
+        print("[NO SUBSCRIBERS]", text)
+        return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=15)
-    r.raise_for_status()
+    still_active = []
+    for chat_id in chat_ids:
+        try:
+            r = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=15)
+            if r.status_code == 403:
+                # Пользователь заблокировал бота — не сохраняем его в списке дальше
+                continue
+            r.raise_for_status()
+            still_active.append(chat_id)
+        except Exception as e:
+            print(f"Не удалось отправить сообщение {chat_id}: {e}")
+            still_active.append(chat_id)  # временная ошибка — оставляем в списке
+
+    # Убираем из подписчиков тех, кто заблокировал бота
+    data["chat_ids"] = [c for c in data.get("chat_ids", []) if c in still_active or c == TELEGRAM_CHAT_ID]
+    save_subscribers(data)
 
 
 def load_state():
@@ -187,25 +273,27 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--timeframe", choices=list(TIMEFRAME_PARAMS.keys()), default="1d")
     parser.add_argument("--top-n", type=int, default=100)
-    parser.add_argument("--quote-coin", default="USDT")
-    parser.add_argument("--request-delay", type=float, default=0.15)
+    parser.add_argument("--quote-coin", default="USD")
+    parser.add_argument("--request-delay", type=float, default=0.3)
     args = parser.parse_args()
 
     params = TIMEFRAME_PARAMS[args.timeframe]
     state = load_state()
 
+    poll_new_subscribers()
+
     pairs = get_top_pairs(args.quote_coin, args.top_n)
-    print(f"Сканирую {len(pairs)} пар Bybit Spot на {args.timeframe}...")
+    print(f"Сканирую {len(pairs)} пар Kraken Spot на {args.timeframe}...")
 
     found_buy, found_sell = 0, 0
 
-    for symbol in pairs:
-        key = f"{symbol}_{args.timeframe}"
+    for pair in pairs:
+        key = f"{pair}_{args.timeframe}"
         try:
-            df = fetch_klines(symbol, params["bybit_interval"], params["min_bars"] + 5)
+            df = fetch_klines(pair, params["kraken_interval"], params["min_bars"] + 5)
             result = analyze(df, params)
         except Exception as e:
-            print(f"[{symbol}] ошибка получения данных: {e}")
+            print(f"[{pair}] ошибка получения данных: {e}")
             time.sleep(args.request_delay)
             continue
 
@@ -224,8 +312,8 @@ def main():
             target = result["close"] + result["atr"] * params["atr_mult_tp"]
             text = (
                 f"🟢 <b>ВХОД (BUY)</b>\n"
-                f"Биржа: Bybit Spot\n"
-                f"Пара: <b>{symbol}</b>\n"
+                f"Биржа: Kraken Spot\n"
+                f"Пара: <b>{pair}</b>\n"
                 f"Таймфрейм: <b>{args.timeframe}</b>\n"
                 f"Цена входа: <b>{result['close']:.6g}</b>\n"
                 f"Stop-Loss: {stop:.6g}\n"
@@ -253,8 +341,8 @@ def main():
                 reason = "Take-Profit" if hit_target else ("Stop-Loss" if hit_stop else "Сигнал разворота")
                 text = (
                     f"🔴 <b>ВЫХОД (SELL)</b>\n"
-                    f"Биржа: Bybit Spot\n"
-                    f"Пара: <b>{symbol}</b>\n"
+                    f"Биржа: Kraken Spot\n"
+                    f"Пара: <b>{pair}</b>\n"
                     f"Таймфрейм: <b>{args.timeframe}</b>\n"
                     f"Цена выхода: <b>{result['close']:.6g}</b>\n"
                     f"Причина: {reason}\n"
