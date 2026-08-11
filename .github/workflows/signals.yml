@@ -2,22 +2,26 @@ name: Kraken Signal Scanner
 on:
   workflow_dispatch:
     inputs:
-      timeframe:
-        description: 'Таймфрейм для ручного теста (4h / 1d / 1w)'
+      mode:
+        description: 'Режим для ручного теста (scan / report)'
         required: false
-        default: '1d'
+        default: 'scan'
+      period:
+        description: 'Период отчёта, если mode=report (3d / month)'
+        required: false
+        default: '3d'
   schedule:
-    # Дневная свеча Kraken закрывается в 00:00 UTC
-    - cron: '10 0 * * *'
-    # Каждые 4 часа (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC)
+    # Сканирование входов/выходов каждые 4 часа
     - cron: '5 0,4,8,12,16,20 * * *'
-    # Недельная свеча закрывается в понедельник 00:00 UTC
-    - cron: '15 0 * * 1'
+    # Отчёт каждые 3 дня в 09:00 UTC
+    - cron: '0 9 */3 * *'
+    # Отчёт раз в месяц, 1 числа в 09:30 UTC
+    - cron: '30 9 1 * *'
 permissions:
   contents: write
 jobs:
-  scan-4h:
-    if: github.event.schedule == '5 0,4,8,12,16,20 * * *' || github.event.inputs.timeframe == '4h'
+  scan:
+    if: github.event.schedule == '5 0,4,8,12,16,20 * * *' || github.event.inputs.mode == 'scan'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,20 +29,21 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install requests pandas numpy
-      - name: Сканировать пары (4H)
+      - name: Сканировать волатильные пары (confluence 4h/1d/1w)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python kraken_signal_scanner.py --timeframe 4h --top-n 100
+        run: python kraken_signal_scanner.py --mode scan --top-n 30
       - name: Сохранить состояние
         run: |
           git config user.name "signal-bot"
           git config user.email "signal-bot@users.noreply.github.com"
-          git add kraken_scanner_state.json telegram_subscribers.json
-          git diff --staged --quiet || git commit -m "chore: update kraken scanner state (4h)"
+          git add kraken_scanner_state.json telegram_subscribers.json trades_log.json
+          git diff --staged --quiet || git commit -m "chore: update scanner state"
           git push || true
-  scan-1d:
-    if: github.event.schedule == '10 0 * * *' || github.event.inputs.timeframe == '1d'
+
+  report-3d:
+    if: github.event.schedule == '0 9 */3 * *' || (github.event.inputs.mode == 'report' && github.event.inputs.period == '3d')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -46,20 +51,21 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install requests pandas numpy
-      - name: Сканировать пары (1D)
+      - name: Отчёт за 3 дня
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python kraken_signal_scanner.py --timeframe 1d --top-n 100
-      - name: Сохранить состояние
+        run: python kraken_signal_scanner.py --mode report --period 3d
+      - name: Сохранить состояние подписчиков
         run: |
           git config user.name "signal-bot"
           git config user.email "signal-bot@users.noreply.github.com"
-          git add kraken_scanner_state.json telegram_subscribers.json
-          git diff --staged --quiet || git commit -m "chore: update kraken scanner state (1d)"
+          git add telegram_subscribers.json
+          git diff --staged --quiet || git commit -m "chore: update subscribers (3d report)"
           git push || true
-  scan-1w:
-    if: github.event.schedule == '15 0 * * 1' || github.event.inputs.timeframe == '1w'
+
+  report-monthly:
+    if: github.event.schedule == '30 9 1 * *' || (github.event.inputs.mode == 'report' && github.event.inputs.period == 'month')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -67,15 +73,15 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install requests pandas numpy
-      - name: Сканировать пары (1W)
+      - name: Отчёт за месяц
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python kraken_signal_scanner.py --timeframe 1w --top-n 100
-      - name: Сохранить состояние
+        run: python kraken_signal_scanner.py --mode report --period month
+      - name: Сохранить состояние подписчиков
         run: |
           git config user.name "signal-bot"
           git config user.email "signal-bot@users.noreply.github.com"
-          git add kraken_scanner_state.json telegram_subscribers.json
-          git diff --staged --quiet || git commit -m "chore: update kraken scanner state (1w)"
+          git add telegram_subscribers.json
+          git diff --staged --quiet || git commit -m "chore: update subscribers (monthly report)"
           git push || true
