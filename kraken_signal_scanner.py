@@ -19,7 +19,13 @@ import pandas as pd
 import numpy as np
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")  # опционально: личный чат-админ, всегда получает сигналы
+
+SUBSCRIBERS_FILE = "telegram_subscribers.json"
+WELCOME_TEXT = (
+    "✅ Вы подписались на сигналы Kraken Scanner.\n"
+    "Здесь будут появляться сигналы входа (BUY) и выхода (SELL) по отслеживаемым парам."
+)
 
 # Kraken interval задаётся в минутах: 1,5,15,30,60,240,1440,10080,21600
 TIMEFRAME_PARAMS = {
@@ -162,13 +168,93 @@ def analyze(df: pd.DataFrame, params: dict) -> dict:
     }
 
 
+def load_subscribers() -> dict:
+    if os.path.exists(SUBSCRIBERS_FILE):
+        with open(SUBSCRIBERS_FILE) as f:
+            return json.load(f)
+    return {"offset": 0, "chat_ids": []}
+
+
+def save_subscribers(data: dict):
+    with open(SUBSCRIBERS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def poll_new_subscribers():
+    """
+    Проверяет новые сообщения боту через getUpdates.
+    Каждый, кто прислал /start, добавляется в список подписчиков и получает приветствие.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        return
+
+    data = load_subscribers()
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    try:
+        resp = requests.get(url, params={"offset": data["offset"] + 1, "timeout": 0}, timeout=15)
+        resp.raise_for_status()
+        updates = resp.json().get("result", [])
+    except Exception as e:
+        print(f"Не удалось получить обновления Telegram: {e}")
+        return
+
+    for update in updates:
+        data["offset"] = max(data["offset"], update.get("update_id", data["offset"]))
+        msg = update.get("message") or update.get("channel_post")
+        if not msg:
+            continue
+        chat_id = msg["chat"]["id"]
+        text = (msg.get("text") or "").strip().lower()
+
+        if text.startswith("/start") and chat_id not in data["chat_ids"]:
+            data["chat_ids"].append(chat_id)
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": chat_id, "text": WELCOME_TEXT},
+                    timeout=15,
+                )
+            except Exception as e:
+                print(f"Не удалось отправить приветствие {chat_id}: {e}")
+
+        if text.startswith("/stop") and chat_id in data["chat_ids"]:
+            data["chat_ids"].remove(chat_id)
+
+    save_subscribers(data)
+    print(f"Подписчиков: {len(data['chat_ids'])}")
+
+
 def send_telegram(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_BOT_TOKEN:
         print("[NO TELEGRAM CONFIG]", text)
         return
+
+    data = load_subscribers()
+    chat_ids = set(data.get("chat_ids", []))
+    if TELEGRAM_CHAT_ID:
+        chat_ids.add(TELEGRAM_CHAT_ID)
+
+    if not chat_ids:
+        print("[NO SUBSCRIBERS]", text)
+        return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=15)
-    r.raise_for_status()
+    still_active = []
+    for chat_id in chat_ids:
+        try:
+            r = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=15)
+            if r.status_code == 403:
+                # Пользователь заблокировал бота — не сохраняем его в списке дальше
+                continue
+            r.raise_for_status()
+            still_active.append(chat_id)
+        except Exception as e:
+            print(f"Не удалось отправить сообщение {chat_id}: {e}")
+            still_active.append(chat_id)  # временная ошибка — оставляем в списке
+
+    # Убираем из подписчиков тех, кто заблокировал бота
+    data["chat_ids"] = [c for c in data.get("chat_ids", []) if c in still_active or c == TELEGRAM_CHAT_ID]
+    save_subscribers(data)
 
 
 def load_state():
@@ -193,6 +279,8 @@ def main():
 
     params = TIMEFRAME_PARAMS[args.timeframe]
     state = load_state()
+
+    poll_new_subscribers()
 
     pairs = get_top_pairs(args.quote_coin, args.top_n)
     print(f"Сканирую {len(pairs)} пар Kraken Spot на {args.timeframe}...")
