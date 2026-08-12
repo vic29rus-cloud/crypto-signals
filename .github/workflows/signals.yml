@@ -33,7 +33,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python kraken_signal_scanner.py --mode scan --top-n 30
+        run: python kraken_signal_scanner.py --mode scan --top-n 60
       - name: Сохранить состояние
         run: |
           git config user.name "signal-bot"
