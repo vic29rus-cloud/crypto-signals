@@ -69,6 +69,13 @@ ADX_MIN = 20                # ниже — считаем рынок "боков
 ATR_MULT_SL = 2.0
 ATR_MULT_TP = 4.0
 
+# Перевод стопа в безубыток НЕ сразу при входе (это выбивало бы сделки на обычном шуме),
+# а после того как цена пройдёт в прибыль на BREAKEVEN_TRIGGER_ATR x ATR — то есть когда
+# движение уже подтвердилось. BREAKEVEN_BUFFER_PCT — небольшой запас сверх цены входа,
+# чтобы покрыть комиссии/проскальзывание при закрытии по стопу.
+BREAKEVEN_TRIGGER_ATR = 1.0
+BREAKEVEN_BUFFER_PCT = 0.1
+
 EXCLUDE_BASE_SUBSTRINGS = ["UP", "DOWN", "BULL", "BEAR", "3L", "3S", "5L", "5S"]
 STABLECOINS = {"USDC", "USDT", "DAI", "USD", "EUR", "GBP", "PYUSD", "TUSD", "FDUSD"}
 
@@ -259,12 +266,33 @@ def check_exit(results: dict, pos: dict) -> tuple:
     if r4h is None:
         return False, ""
     if r4h["close"] <= pos["stop"]:
-        return True, "Stop-Loss"
+        return True, "Stop-Loss" if not pos.get("breakeven_moved") else "Безубыток (Break-Even)"
     if r4h["close"] >= pos["target"]:
         return True, "Take-Profit"
     if r4h["ema_cross_down"] or r4h["macd_cross_down"]:
         return True, "Сигнал разворота (4h)"
     return False, ""
+
+
+def maybe_move_to_breakeven(pos: dict, current_close: float) -> bool:
+    """
+    Если цена прошла в прибыль >= BREAKEVEN_TRIGGER_ATR x ATR от входа —
+    подтягивает стоп к цене входа (+небольшой буфер). Возвращает True, если стоп был передвинут.
+    """
+    if pos.get("breakeven_moved"):
+        return False
+    atr_entry = pos.get("atr_entry", 0)
+    if atr_entry <= 0:
+        return False
+
+    profit_in_atr = (current_close - pos["entry_price"]) / atr_entry
+    if profit_in_atr >= BREAKEVEN_TRIGGER_ATR:
+        new_stop = pos["entry_price"] * (1 + BREAKEVEN_BUFFER_PCT / 100)
+        if new_stop > pos["stop"]:
+            pos["stop"] = new_stop
+            pos["breakeven_moved"] = True
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +427,7 @@ def run_scan(args):
 
     found_buy, found_sell = 0, 0
     now_iso = datetime.now(timezone.utc).isoformat()
+    scan_summary = []  # для итогового статус-сообщения
 
     for pair in pairs:
         results = {}
@@ -412,9 +441,25 @@ def run_scan(args):
             print(f"[{pair}] ошибка получения данных: {e}")
             continue
 
+        if all(results.get(tf) is not None for tf in TIMEFRAME_ORDER):
+            trend_score = sum(1 for tf in TIMEFRAME_ORDER if results[tf]["trend_up"])
+            scan_summary.append({
+                "pair": pair,
+                "trend_score": trend_score,
+                "rsi_4h": results["4h"]["rsi"],
+                "adx_1d": results["1d"]["adx"],
+            })
+
         pos = state.get(pair, {"position": "closed"})
 
         if pos["position"] == "open":
+            moved = maybe_move_to_breakeven(pos, results[TRIGGER_TF]["close"])
+            if moved:
+                send_telegram(
+                    f"🔒 <b>Стоп переведён в безубыток</b>\nПара: <b>{pair}</b>\nНовый стоп: {pos['stop']:.6g}"
+                )
+                print(f"[{pair}] стоп переведён в безубыток: {pos['stop']:.6g}")
+
             exit_now, reason = check_exit(results, pos)
             if exit_now:
                 exit_price = results[TRIGGER_TF]["close"]
@@ -452,11 +497,43 @@ def run_scan(args):
                     "entry_time": now_iso,
                     "stop": stop,
                     "target": target,
+                    "atr_entry": daily_atr,
+                    "breakeven_moved": False,
                 }
                 found_buy += 1
 
     save_json(STATE_FILE, state)
     print(f"Готово. Новых входов: {found_buy}, выходов: {found_sell}")
+
+    open_positions = sum(1 for p in state.values() if p.get("position") == "open")
+    send_status_message(scan_summary, len(pairs), open_positions, found_buy, found_sell)
+
+
+def send_status_message(scan_summary: list, pairs_count: int, open_positions: int, found_buy: int, found_sell: int):
+    """Отправляет статус даже если сделок не было — чтобы было видно, что бот жив и что-то анализирует."""
+    now_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+    lines = [
+        f"📡 <b>Статус сканирования</b> — {now_str}",
+        f"Отслеживается пар: {pairs_count}",
+        f"Открытых позиций: {open_positions}",
+        f"Входов за этот цикл: {found_buy}, выходов: {found_sell}",
+    ]
+
+    # Ближе всего к сигналу — тренд совпал на 2-3 из 3 таймфреймов
+    close_calls = [s for s in scan_summary if s["trend_score"] >= 2]
+    close_calls.sort(key=lambda s: (s["trend_score"], s["adx_1d"]), reverse=True)
+
+    if close_calls:
+        lines.append("\nБлиже всего к сигналу:")
+        for s in close_calls[:3]:
+            lines.append(
+                f"• {s['pair']}: тренд {s['trend_score']}/3, RSI(4h) {s['rsi_4h']:.0f}, ADX(1d) {s['adx_1d']:.0f}"
+            )
+    else:
+        lines.append("\nСейчас ни одна пара не близка к полному совпадению тренда.")
+
+    send_telegram("\n".join(lines))
+    print("Статус-сообщение отправлено.")
 
 
 # ---------------------------------------------------------------------------
