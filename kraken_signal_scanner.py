@@ -387,6 +387,13 @@ def run_scan(args):
     state = load_json(STATE_FILE, {})
     poll_new_subscribers()
 
+    # Гарантируем, что файлы существуют физически, даже если пока пусты —
+    # иначе `git add` в workflow падает с "pathspec did not match any files"
+    if not os.path.exists(TRADES_LOG_FILE):
+        save_json(TRADES_LOG_FILE, [])
+    if not os.path.exists(STATE_FILE):
+        save_json(STATE_FILE, {})
+
     pairs = get_volatile_pairs(args.quote_coin, args.top_n)
     print(f"Отслеживаю {len(pairs)} самых волатильных пар Kraken Spot (мин. волатильность {MIN_VOLATILITY_PCT}%)...")
 
@@ -458,6 +465,8 @@ def run_scan(args):
 
 def run_report(args):
     poll_new_subscribers()
+    if not os.path.exists(TRADES_LOG_FILE):
+        save_json(TRADES_LOG_FILE, [])
     trades = load_json(TRADES_LOG_FILE, [])
 
     days = 3 if args.period == "3d" else 30
