@@ -66,6 +66,14 @@ RSI_MIN, RSI_MAX = 40, 75  # входим не на перекупленност
 ADX_LENGTH = 14
 ADX_MIN = 20                # ниже — считаем рынок "боковиком", сигнал игнорируем
 
+# --- Smart Money Concepts (упрощённо): Break of Structure ---
+# Требуем, чтобы цена на триггерном ТФ (4h) пробила последний подтверждённый
+# локальный максимум (swing high) — это доп. подтверждение силы движения.
+# Внимание: это ЕЩЁ ОДИН строгий фильтр поверх уже строгих условий — сделок
+# станет меньше. Если сигналов совсем не будет несколько недель — поставьте False.
+REQUIRE_SMC_BOS = True
+SMC_SWING_WINDOW = 5   # сколько баров до/после нужно для подтверждения свинга
+
 ATR_MULT_SL = 2.0
 ATR_MULT_TP = 4.0
 
@@ -75,6 +83,11 @@ ATR_MULT_TP = 4.0
 # чтобы покрыть комиссии/проскальзывание при закрытии по стопу.
 BREAKEVEN_TRIGGER_ATR = 1.0
 BREAKEVEN_BUFFER_PCT = 0.1
+
+# Трейлинг-стоп включается ТОЛЬКО после безубытка (по вашей просьбе — "на всякий случай").
+# Стоп подтягивается на TRAILING_ATR_MULT x ATR от текущей цены, но никогда не двигается вниз —
+# поэтому безубыток остаётся гарантированным минимумом, а трейлинг только улучшает результат.
+TRAILING_ATR_MULT = 1.5
 
 EXCLUDE_BASE_SUBSTRINGS = ["UP", "DOWN", "BULL", "BEAR", "3L", "3S", "5L", "5S"]
 STABLECOINS = {"USDC", "USDT", "DAI", "USD", "EUR", "GBP", "PYUSD", "TUSD", "FDUSD"}
@@ -217,6 +230,25 @@ def adx(df, length=ADX_LENGTH):
     return adx_val.fillna(0)
 
 
+def find_recent_swing_high(df: pd.DataFrame, window: int = SMC_SWING_WINDOW, exclude_last: int = 2):
+    """
+    Smart Money Concepts (упрощённо): находит последний ПОДТВЕРЖДЁННЫЙ swing high —
+    локальный максимум, у которого есть window баров слева и справа ниже него.
+    exclude_last исключает последние бары — им ещё не хватает "будущих" баров
+    для подтверждения, что это действительно локальный пик, а не текущий рост.
+    """
+    highs = df["high"]
+    if len(highs) < window * 2 + 1 + exclude_last:
+        return None
+    rolling_max = highs.rolling(window * 2 + 1, center=True).max()
+    is_swing = highs == rolling_max
+    candidates = is_swing.iloc[:-exclude_last]
+    idx = candidates[candidates].index
+    if len(idx) == 0:
+        return None
+    return float(highs.loc[idx[-1]])
+
+
 def analyze_timeframe(df: pd.DataFrame, params: dict) -> dict:
     if df.empty or len(df) < params["min_bars"]:
         return None
@@ -237,11 +269,16 @@ def analyze_timeframe(df: pd.DataFrame, params: dict) -> dict:
     macd_cross_down = bool((prev["macd_line"] >= prev["macd_signal"]) and (last["macd_line"] < last["macd_signal"]))
     ema_cross_down = bool((prev["ema_fast"] >= prev["ema_slow"]) and (last["ema_fast"] < last["ema_slow"]))
 
+    # Smart Money Concepts: пробила ли цена последний подтверждённый swing high
+    swing_high = find_recent_swing_high(df.iloc[:-1], window=SMC_SWING_WINDOW)
+    bos_up = bool(swing_high is not None and last["close"] > swing_high)
+
     return {
         "trend_up": trend_up,
         "macd_cross_up": macd_cross_up,
         "macd_cross_down": macd_cross_down,
         "ema_cross_down": ema_cross_down,
+        "bos_up": bos_up,
         "rsi": float(last["rsi"]),
         "adx": float(last["adx"]),
         "close": float(last["close"]),
@@ -257,7 +294,8 @@ def check_confluence_entry(results: dict) -> bool:
     trigger = results[TRIGGER_TF]["macd_cross_up"]
     rsi_ok = RSI_MIN <= results[TRIGGER_TF]["rsi"] <= RSI_MAX
     adx_ok = results[ADX_REF_TF]["adx"] >= ADX_MIN
-    return trend_all_up and trigger and rsi_ok and adx_ok
+    smc_ok = (not REQUIRE_SMC_BOS) or results[TRIGGER_TF]["bos_up"]
+    return trend_all_up and trigger and rsi_ok and adx_ok and smc_ok
 
 
 def check_exit(results: dict, pos: dict) -> tuple:
@@ -266,7 +304,13 @@ def check_exit(results: dict, pos: dict) -> tuple:
     if r4h is None:
         return False, ""
     if r4h["close"] <= pos["stop"]:
-        return True, "Stop-Loss" if not pos.get("breakeven_moved") else "Безубыток (Break-Even)"
+        if pos.get("trailing_active"):
+            reason = "Трейлинг-стоп"
+        elif pos.get("breakeven_moved"):
+            reason = "Безубыток (Break-Even)"
+        else:
+            reason = "Stop-Loss"
+        return True, reason
     if r4h["close"] >= pos["target"]:
         return True, "Take-Profit"
     if r4h["ema_cross_down"] or r4h["macd_cross_down"]:
@@ -292,6 +336,26 @@ def maybe_move_to_breakeven(pos: dict, current_close: float) -> bool:
             pos["stop"] = new_stop
             pos["breakeven_moved"] = True
             return True
+    return False
+
+
+def maybe_trail_stop(pos: dict, current_close: float, current_atr: float) -> bool:
+    """
+    Трейлинг включается ТОЛЬКО после того, как стоп уже переведён в безубыток —
+    поэтому дальше стоп только подтягивается вверх и никогда не опускается ниже
+    уровня безубытка (это "пол", который трейлинг не может пробить).
+    Возвращает True, если стоп был передвинут.
+    """
+    if not pos.get("breakeven_moved"):
+        return False
+    if current_atr <= 0:
+        return False
+
+    candidate_stop = current_close - current_atr * TRAILING_ATR_MULT
+    if candidate_stop > pos["stop"]:
+        pos["stop"] = candidate_stop
+        pos["trailing_active"] = True
+        return True
     return False
 
 
@@ -460,6 +524,11 @@ def run_scan(args):
                 )
                 print(f"[{pair}] стоп переведён в безубыток: {pos['stop']:.6g}")
 
+            # Трейлинг — только после безубытка, поэтому ниже безубытка стоп уже не опустится
+            trailed = maybe_trail_stop(pos, results[TRIGGER_TF]["close"], results["1d"]["atr"])
+            if trailed:
+                print(f"[{pair}] трейлинг-стоп подтянут: {pos['stop']:.6g}")
+
             exit_now, reason = check_exit(results, pos)
             if exit_now:
                 exit_price = results[TRIGGER_TF]["close"]
@@ -486,6 +555,7 @@ def run_scan(args):
                     f"Пара: <b>{pair}</b>\n"
                     f"Цена входа: <b>{close:.6g}</b>\n"
                     f"RSI(4h): {results['4h']['rsi']:.1f}  ADX(1d): {results['1d']['adx']:.1f}\n"
+                    f"Smart Money BOS: {'✅ пробит swing high' if results['4h']['bos_up'] else '—'}\n"
                     f"Stop-Loss: {stop:.6g}\n"
                     f"Take-Profit: {target:.6g}"
                 )
@@ -499,6 +569,7 @@ def run_scan(args):
                     "target": target,
                     "atr_entry": daily_atr,
                     "breakeven_moved": False,
+                    "trailing_active": False,
                 }
                 found_buy += 1
 
@@ -583,7 +654,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["scan", "report"], default="scan")
     parser.add_argument("--period", choices=["3d", "month"], default="3d")
-    parser.add_argument("--top-n", type=int, default=30)
+    parser.add_argument("--top-n", type=int, default=60)
     parser.add_argument("--quote-coin", default="USD")
     parser.add_argument("--request-delay", type=float, default=0.3)
     args = parser.parse_args()
