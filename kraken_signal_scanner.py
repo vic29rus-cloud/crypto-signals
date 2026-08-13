@@ -2,9 +2,9 @@
 """
 Сканер сигналов Kraken Spot – две стратегии:
   1. Confluence (тренд 4h/1d/1w + MACD) – на топ-200 волатильных пар
-  2. Breakout из боковика (консолидация >30 дней) – на топ-400 парах (первые 200 уже в основном списке, ещё 200 дополнительных)
+  2. Breakout из боковика (консолидация >30 дней) – на топ-600 парах (первые 200 уже в основном списке, ещё 400 дополнительных)
 
-Версия 4.6 – расширенный поиск боковиков без увеличения нагрузки на основные сигналы.
+Версия 4.6.1 – ослаблены фильтры для расширения списка кандидатов.
 """
 
 import argparse
@@ -31,8 +31,8 @@ SCANNER_LOG_FILE = "kraken_scanner.log"
 LAST_STATUS_FILE = "last_status_time.json"
 
 WELCOME_TEXT = (
-    "✅ Вы подписались на сигналы Kraken Scanner v4.6\n"
-    "Основной поиск: 200 пар. Боковики: до 400 пар."
+    "✅ Вы подписались на сигналы Kraken Scanner v4.6.1\n"
+    "Основной поиск: 200 пар. Боковики: до 600 пар (с учётом дополнительных)."
 )
 
 BASE_URL = "https://api.kraken.com/0/public"
@@ -83,9 +83,9 @@ STRATEGY_CONFIGS = {
         "require_trend_all": False,
         "min_rr_ratio": 1.5,
         "top_n": 200,
-        "consolidation_top_n": 400,
-        "min_volatility": 1.5,
-        "min_turnover": 100000,
+        "consolidation_top_n": 600,
+        "min_volatility": 1.0,
+        "min_turnover": 50000,
         "atr_mult_sl": 1.5,
         "atr_mult_tp": 3.0,
         "breakeven_trigger_atr": 0.8,
@@ -105,9 +105,9 @@ STRATEGY_CONFIGS = {
         "require_trend_all": True,
         "min_rr_ratio": 2.0,
         "top_n": 200,
-        "consolidation_top_n": 400,
-        "min_volatility": 1.5,
-        "min_turnover": 100000,
+        "consolidation_top_n": 600,
+        "min_volatility": 1.0,
+        "min_turnover": 50000,
         "atr_mult_sl": 2.0,
         "atr_mult_tp": 4.0,
         "breakeven_trigger_atr": 1.0,
@@ -127,9 +127,9 @@ STRATEGY_CONFIGS = {
         "require_trend_all": True,
         "min_rr_ratio": 3.0,
         "top_n": 200,
-        "consolidation_top_n": 400,
-        "min_volatility": 2.0,
-        "min_turnover": 200000,
+        "consolidation_top_n": 600,
+        "min_volatility": 1.0,
+        "min_turnover": 50000,
         "atr_mult_sl": 2.5,
         "atr_mult_tp": 5.0,
         "breakeven_trigger_atr": 1.2,
@@ -145,8 +145,8 @@ ATR_MULT_SL = 2.0
 ATR_MULT_TP = 4.0
 BREAKEVEN_TRIGGER_ATR = 1.0
 TRAILING_ATR_MULT = 1.5
-MIN_VOLATILITY_PCT = 3.0
-MIN_TURNOVER_USD = 300000
+MIN_VOLATILITY_PCT = 3.0   # не используется, т.к. переопределяется стратегией
+MIN_TURNOVER_USD = 300000  # не используется, т.к. переопределяется стратегией
 RSI_MIN, RSI_MAX = 40, 75
 ADX_MIN = 20
 REQUIRE_SMC_BOS = True
@@ -195,7 +195,7 @@ def get_strategy_config(strategy_name: str) -> Dict[str, Any]:
 
 # ==================== ПОЛУЧЕНИЕ СПИСКА ПАР (расширенный) ====================
 
-def get_candidates(quote_coin: str, max_candidates: int = 600) -> List[str]:
+def get_candidates(quote_coin: str, max_candidates: int = 1000) -> List[str]:
     """
     Возвращает список пар, отфильтрованных по ликвидности и отсортированных по волатильности.
     max_candidates – ограничение сверху (чтобы не перегружать память).
@@ -856,7 +856,7 @@ def send_status_message(scan_summary: list, pairs_count: int, open_positions: in
         lines.append(f"\n😴 <b>Кандидатов на вход (Confluence) нет</b>")
 
     if consolidation_list:
-        lines.append(f"\n📦 <b>Монеты в длительном боковике (> {CONSOLIDATION_DAYS_MIN} дней, до 400 пар):</b>")
+        lines.append(f"\n📦 <b>Монеты в длительном боковике (> {CONSOLIDATION_DAYS_MIN} дней):</b>")
         consolidation_list.sort(key=lambda x: x["days"], reverse=True)
         for i, item in enumerate(consolidation_list[:5], 1):
             lines.append(
@@ -897,8 +897,8 @@ def run_scan(args: argparse.Namespace) -> None:
     if not os.path.exists(STATE_FILE):
         save_json(STATE_FILE, {})
 
-    # Получаем расширенный список кандидатов (до 600 пар)
-    candidates = get_candidates(args.quote_coin, max_candidates=600)
+    # Получаем расширенный список кандидатов (до 1000 пар)
+    candidates = get_candidates(args.quote_coin, max_candidates=1000)
     logger.info(f"Всего кандидатов: {len(candidates)}")
 
     # Основной список для Confluence
@@ -906,7 +906,7 @@ def run_scan(args: argparse.Namespace) -> None:
     pairs = candidates[:top_n]
     logger.info(f"Основной список (Confluence): {len(pairs)} пар")
 
-    # Дополнительные пары для боковиков (первые 400, исключая уже взятые для Confluence)
+    # Дополнительные пары для боковиков (первые 600, исключая уже взятые для Confluence)
     cons_top_n = config.get("consolidation_top_n", top_n * 2)
     consolidation_extra = candidates[top_n:cons_top_n] if len(candidates) > top_n else []
     logger.info(f"Дополнительные пары для боковиков: {len(consolidation_extra)} пар")
@@ -1240,7 +1240,7 @@ def run_report(args: argparse.Namespace) -> None:
 # ==================== НЕПРЕРЫВНЫЙ РЕЖИМ (не используется в GitHub Actions) ====================
 
 def run_forever():
-    logger.info("🚀 Запуск сканера в НЕПРЕРЫВНОМ режиме (v4.6)...")
+    logger.info("🚀 Запуск сканера в НЕПРЕРЫВНОМ режиме (v4.6.1)...")
     logger.info(f"⏱️ Интервал между сканированиями: {SCAN_INTERVAL_SECONDS // 3600} час(ов)")
     logger.info(f"📊 Статус будет отправляться не чаще {STATUS_INTERVAL_MINUTES // 60} час(ов)")
 
@@ -1269,7 +1269,7 @@ def run_forever():
 # ==================== MAIN ====================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Kraken Signal Scanner v4.6 – расширенный поиск боковиков")
+    parser = argparse.ArgumentParser(description="Kraken Signal Scanner v4.6.1 – расширенный поиск боковиков")
     parser.add_argument("--mode", choices=["scan", "report"], default=None,
                         help="Режим работы (если не указан – непрерывный режим)")
     parser.add_argument("--period", choices=["3d", "month"], default="3d", help="Период отчёта")
