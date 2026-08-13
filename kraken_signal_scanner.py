@@ -4,7 +4,7 @@
   1. Confluence (тренд 4h/1d/1w + MACD)
   2. Breakout из боковика (консолидация >30 дней)
 
-Версия 4.3 – в отчётах выводятся ВСЕ завершённые сделки за период с датами.
+Версия 4.3.1 – миграция старых позиций, отображение стратегии и времени входа.
 """
 
 import argparse
@@ -31,7 +31,7 @@ SCANNER_LOG_FILE = "kraken_scanner.log"
 LAST_STATUS_FILE = "last_status_time.json"
 
 WELCOME_TEXT = (
-    "✅ Вы подписались на сигналы Kraken Scanner v4.3\n"
+    "✅ Вы подписались на сигналы Kraken Scanner v4.3.1\n"
     "Стратегии: Confluence (тренд) + Breakout (боковик)."
 )
 
@@ -816,8 +816,8 @@ def send_status_message(scan_summary: list, pairs_count: int, open_positions: in
         for pos in open_positions_list:
             pair = pos.get("pair", "?")
             entry = pos.get("entry_price", 0)
-            entry_time = pos.get("entry_time", "?")
-            if len(entry_time) > 16:
+            entry_time = pos.get("entry_time", "неизвестно")
+            if entry_time != "неизвестно" and len(entry_time) > 16:
                 entry_time = entry_time[:16]
             stop = pos.get("stop", 0)
             target = pos.get("target", 0)
@@ -871,6 +871,15 @@ def run_scan(args: argparse.Namespace) -> None:
     logger.info(f"Стратегия: {config['name']} — {config['description']}")
 
     state = load_json(STATE_FILE, {})
+    # Миграция старых позиций – добавляем поля strategy и entry_time, если их нет
+    for pair, pos in state.items():
+        if pos.get("position") == "open":
+            if "strategy" not in pos:
+                pos["strategy"] = "unknown"
+            if "entry_time" not in pos:
+                pos["entry_time"] = "неизвестно"
+    save_json(STATE_FILE, state)
+
     poll_new_subscribers()
 
     if not os.path.exists(TRADES_LOG_FILE):
@@ -1091,7 +1100,7 @@ def run_scan(args: argparse.Namespace) -> None:
     else:
         logger.info(f"Статусное сообщение пропущено (интервал {STATUS_INTERVAL_MINUTES} мин)")
 
-# ==================== РЕЖИМ REPORT (ОБНОВЛЁН) ====================
+# ==================== РЕЖИМ REPORT ====================
 
 def run_report(args: argparse.Namespace) -> None:
     poll_new_subscribers()
@@ -1177,7 +1186,7 @@ def run_report(args: argparse.Namespace) -> None:
 # ==================== НЕПРЕРЫВНЫЙ РЕЖИМ ====================
 
 def run_forever():
-    logger.info("🚀 Запуск сканера в НЕПРЕРЫВНОМ режиме (v4.3)...")
+    logger.info("🚀 Запуск сканера в НЕПРЕРЫВНОМ режиме (v4.3.1)...")
     logger.info(f"⏱️ Интервал между сканированиями: {SCAN_INTERVAL_SECONDS // 3600} час(ов)")
     logger.info(f"📊 Статус будет отправляться не чаще {STATUS_INTERVAL_MINUTES // 60} час(ов)")
 
@@ -1206,7 +1215,7 @@ def run_forever():
 # ==================== MAIN ====================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Kraken Signal Scanner v4.3 – Confluence + Breakout")
+    parser = argparse.ArgumentParser(description="Kraken Signal Scanner v4.3.1 – Confluence + Breakout")
     parser.add_argument("--mode", choices=["scan", "report"], default=None,
                         help="Режим работы (если не указан – непрерывный режим)")
     parser.add_argument("--period", choices=["3d", "month"], default="3d", help="Период отчёта")
