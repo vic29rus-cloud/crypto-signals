@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Сканер сигналов Kraken Spot – две стратегии:
-  1. Confluence (тренд 4h/1d/1w + MACD) – для сильных трендов.
-  2. Breakout из боковика – для монет, накопившихся в диапазоне >30 дней.
+  1. Confluence (тренд 4h/1d/1w + MACD)
+  2. Breakout из боковика (консолидация >30 дней)
 
-Версия 4.0 – объединённый сканер с поддержкой обоих подходов.
+Версия 4.1 – исправлена ошибка NoneType при отсутствии данных 4h.
 """
 
 import argparse
@@ -31,7 +31,7 @@ SCANNER_LOG_FILE = "kraken_scanner.log"
 LAST_STATUS_FILE = "last_status_time.json"
 
 WELCOME_TEXT = (
-    "✅ Вы подписались на сигналы Kraken Scanner v4.0\n"
+    "✅ Вы подписались на сигналы Kraken Scanner v4.1\n"
     "Стратегии: Confluence (тренд) + Breakout (боковик)."
 )
 
@@ -299,7 +299,7 @@ def fetch_klines(pair: str, interval_minutes: int, min_bars: int, retries: int =
             break
     return pd.DataFrame()
 
-# ==================== ИНДИКАТОРЫ (без изменений) ====================
+# ==================== ИНДИКАТОРЫ ====================
 
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
@@ -401,7 +401,9 @@ def analyze_volume(df: pd.DataFrame, mult: float = 2.0) -> bool:
 
 def calculate_rr_ratio(results: Dict[str, Any], entry_result: Dict[str, Any]) -> float:
     close = entry_result["close"]
-    daily_atr = results["1d"]["atr"]
+    daily_atr = results.get("1d", {}).get("atr", 0) if results.get("1d") else 0
+    if daily_atr <= 0:
+        return 0.0
     stop = close - daily_atr * ATR_MULT_SL
     target = close + daily_atr * ATR_MULT_TP
     risk = close - stop
@@ -419,7 +421,6 @@ def check_consolidation(df_daily: pd.DataFrame) -> Optional[int]:
     df = df_daily.copy()
     df["adx"] = adx(df, length=14)
 
-    # Идём от конца вглубь
     for i in range(len(df)-1, max(0, len(df)-90), -1):
         window = df.iloc[i:]
         if len(window) < CONSOLIDATION_DAYS_MIN:
@@ -442,15 +443,11 @@ def check_consolidation(df_daily: pd.DataFrame) -> Optional[int]:
     return None
 
 def check_breakout(df_daily: pd.DataFrame, current_price: float, volume_mult: float) -> bool:
-    """
-    Проверяет пробой верхней границы диапазона за последние BREAKOUT_RANGE_DAYS дней.
-    """
     if df_daily.empty or len(df_daily) < BREAKOUT_RANGE_DAYS:
         return False
 
     window = df_daily.tail(BREAKOUT_RANGE_DAYS)
     high_max = window["high"].max()
-    # Подтверждение объёмом
     vol_ok = analyze_volume(df_daily.tail(30), mult=volume_mult)
     return current_price > high_max and vol_ok
 
@@ -572,25 +569,17 @@ def check_confluence_entry(results: Dict[str, Any], entry_results: Dict[str, Any
 
 def check_breakout_entry(results: Dict[str, Any], df_daily: pd.DataFrame,
                          current_price: float, config: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict]]:
-    """
-    Проверяет условия пробоя из боковика.
-    Возвращает (ok, причина, словарь с ценой входа).
-    """
-    # 1. Монета должна быть в боковике
     cons_days = check_consolidation(df_daily)
     if cons_days is None or cons_days < CONSOLIDATION_DAYS_MIN:
         return False, "Не в боковике", None
 
-    # 2. Пробой верхней границы диапазона
     if not check_breakout(df_daily, current_price, BREAKOUT_VOLUME_MULT):
         return False, "Нет пробоя или слабый объём", None
 
-    # 3. (Опционально) RSI > 50 и растущий
     rsi_val = rsi(df_daily["close"]).iloc[-1]
     if rsi_val < 50:
         return False, f"RSI {rsi_val:.1f} < 50", None
 
-    # 4. Соотношение риск/прибыль (используем дневной ATR)
     daily_atr = atr(df_daily).iloc[-1]
     if daily_atr <= 0:
         return False, "ATR = 0", None
@@ -605,11 +594,10 @@ def check_breakout_entry(results: Dict[str, Any], df_daily: pd.DataFrame,
     if rr < config["min_rr_ratio"]:
         return False, f"RR {rr:.2f} < {config['min_rr_ratio']}", None
 
-    # Возвращаем триггер (без MACD и прочего, просто цена)
     trigger = {
         "close": current_price,
         "rsi": rsi_val,
-        "bos_up": False,  # не используется
+        "bos_up": False,
         "tf": "breakout",
         "cons_days": cons_days
     }
@@ -820,7 +808,6 @@ def send_status_message(scan_summary: list, pairs_count: int, open_positions: in
         f"• Выходов за цикл: {found_sell}",
     ]
 
-    # Кандидаты на вход (Confluence)
     close_calls = [s for s in scan_summary if s["trend_score"] >= 2]
     close_calls.sort(key=lambda s: (s["trend_score"], s["adx_1d"]), reverse=True)
 
@@ -836,7 +823,6 @@ def send_status_message(scan_summary: list, pairs_count: int, open_positions: in
     else:
         lines.append(f"\n😴 <b>Кандидатов на вход (Confluence) нет</b>")
 
-    # Монеты в боковике
     if consolidation_list:
         lines.append(f"\n📦 <b>Долгий боковик (> {CONSOLIDATION_DAYS_MIN} дней):</b>")
         consolidation_list.sort(key=lambda x: x["days"], reverse=True)
@@ -899,7 +885,7 @@ def run_scan(args: argparse.Namespace) -> None:
             df_daily = fetch_klines(pair, daily_params["kraken_interval"], daily_params["min_bars"] + 60)
             cons_days = check_consolidation(df_daily)
             if cons_days:
-                adx_val = results.get("1d", {}).get("adx", 0)
+                adx_val = results.get("1d", {}).get("adx", 0) if results.get("1d") else 0
                 if not df_daily.empty and len(df_daily) >= 30:
                     window = df_daily.tail(30)
                     high = window["high"].max()
@@ -996,7 +982,6 @@ def run_scan(args: argparse.Namespace) -> None:
             ok_conf, reason_conf, trigger_conf = check_confluence_entry(results, entry_results, config, df15)
 
             if ok_conf and trigger_conf is not None:
-                # Вход по Confluence
                 close = trigger_conf["close"]
                 daily_atr = results["1d"]["atr"]
                 stop = close - daily_atr * ATR_MULT_SL
@@ -1029,47 +1014,48 @@ def run_scan(args: argparse.Namespace) -> None:
                 }
                 found_buy += 1
                 save_json(STATE_FILE, state)
-                continue  # уже открыли позицию, переходим к следующей паре
+                continue
 
-            # 2. Если Confluence не сработал, проверяем Breakout (только если монета в боковике)
-            # Для этого нам нужны дневные данные (уже загружены)
-            if not df_daily.empty:
-                current_price = results.get("4h", {}).get("close", 0)
-                if current_price > 0:
-                    ok_break, reason_break, trigger_break = check_breakout_entry(results, df_daily, current_price, config)
-                    if ok_break and trigger_break is not None:
-                        close = trigger_break["close"]
-                        daily_atr = atr(df_daily).iloc[-1]
-                        stop = close - daily_atr * ATR_MULT_SL
-                        target = close + daily_atr * ATR_MULT_TP
-                        strategy_name = "breakout"
+            # 2. Если Confluence не сработал, проверяем Breakout
+            # Берем цену из 4h, если есть
+            r4h = results.get("4h")
+            current_price = r4h.get("close", 0) if r4h else 0
 
-                        msg = (
-                            f"🟢 <b>ВХОД (BUY) — {strategy_name}</b>\n"
-                            f"Пара: <b>{pair}</b>\n"
-                            f"Цена входа: <b>{close:.6g}</b>\n"
-                            f"Боковик: {trigger_break['cons_days']} дн. | RSI: {trigger_break['rsi']:.1f}\n"
-                            f"Stop-Loss: {stop:.6g}\n"
-                            f"Take-Profit: {target:.6g}\n"
-                            f"Причина: {reason_break}"
-                        )
-                        send_telegram(msg)
-                        logger.info(msg)
+            if current_price > 0 and not df_daily.empty:
+                ok_break, reason_break, trigger_break = check_breakout_entry(results, df_daily, current_price, config)
+                if ok_break and trigger_break is not None:
+                    close = trigger_break["close"]
+                    daily_atr = atr(df_daily).iloc[-1]
+                    stop = close - daily_atr * ATR_MULT_SL
+                    target = close + daily_atr * ATR_MULT_TP
+                    strategy_name = "breakout"
 
-                        state[pair] = {
-                            "position": "open",
-                            "entry_price": close,
-                            "entry_time": now_iso,
-                            "stop": stop,
-                            "target": target,
-                            "atr_entry": daily_atr,
-                            "breakeven_moved": False,
-                            "trailing_active": False,
-                            "strategy": strategy_name,
-                        }
-                        found_buy += 1
-                        save_json(STATE_FILE, state)
-                        continue
+                    msg = (
+                        f"🟢 <b>ВХОД (BUY) — {strategy_name}</b>\n"
+                        f"Пара: <b>{pair}</b>\n"
+                        f"Цена входа: <b>{close:.6g}</b>\n"
+                        f"Боковик: {trigger_break['cons_days']} дн. | RSI: {trigger_break['rsi']:.1f}\n"
+                        f"Stop-Loss: {stop:.6g}\n"
+                        f"Take-Profit: {target:.6g}\n"
+                        f"Причина: {reason_break}"
+                    )
+                    send_telegram(msg)
+                    logger.info(msg)
+
+                    state[pair] = {
+                        "position": "open",
+                        "entry_price": close,
+                        "entry_time": now_iso,
+                        "stop": stop,
+                        "target": target,
+                        "atr_entry": daily_atr,
+                        "breakeven_moved": False,
+                        "trailing_active": False,
+                        "strategy": strategy_name,
+                    }
+                    found_buy += 1
+                    save_json(STATE_FILE, state)
+                    continue
 
     save_json(STATE_FILE, state)
     logger.info(f"Готово. Новых входов: {found_buy}, выходов: {found_sell}")
@@ -1105,12 +1091,10 @@ def run_report(args: argparse.Namespace) -> None:
     avg_win = sum(t["pnl_pct"] for t in wins) / len(wins) if wins else 0
     avg_loss = sum(t["pnl_pct"] for t in losses) / len(losses) if losses else 0
 
-    # Статистика по стратегиям
     strategies = {}
     for t in period_trades:
         strat = t.get("strategy", "unknown")
         strategies[strat] = strategies.get(strat, 0) + 1
-
     strat_line = " | ".join([f"{k}: {v}" for k, v in strategies.items()]) if strategies else "—"
 
     text = (
@@ -1129,7 +1113,7 @@ def run_report(args: argparse.Namespace) -> None:
 # ==================== НЕПРЕРЫВНЫЙ РЕЖИМ ====================
 
 def run_forever():
-    logger.info("🚀 Запуск сканера в НЕПРЕРЫВНОМ режиме (v4.0)...")
+    logger.info("🚀 Запуск сканера в НЕПРЕРЫВНОМ режиме (v4.1)...")
     logger.info(f"⏱️ Интервал между сканированиями: {SCAN_INTERVAL_SECONDS // 3600} час(ов)")
     logger.info(f"📊 Статус будет отправляться не чаще {STATUS_INTERVAL_MINUTES // 60} час(ов)")
 
@@ -1158,7 +1142,7 @@ def run_forever():
 # ==================== MAIN ====================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Kraken Signal Scanner v4.0 – Confluence + Breakout")
+    parser = argparse.ArgumentParser(description="Kraken Signal Scanner v4.1 – Confluence + Breakout")
     parser.add_argument("--mode", choices=["scan", "report"], default=None,
                         help="Режим работы (если не указан – непрерывный режим)")
     parser.add_argument("--period", choices=["3d", "month"], default="3d", help="Период отчёта")
