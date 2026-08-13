@@ -4,7 +4,7 @@
   1. Confluence (тренд 4h/1d/1w + MACD)
   2. Breakout из боковика (консолидация >30 дней)
 
-Версия 4.1 – исправлена ошибка NoneType при отсутствии данных 4h.
+Версия 4.3 – в отчётах выводятся ВСЕ завершённые сделки за период с датами.
 """
 
 import argparse
@@ -31,7 +31,7 @@ SCANNER_LOG_FILE = "kraken_scanner.log"
 LAST_STATUS_FILE = "last_status_time.json"
 
 WELCOME_TEXT = (
-    "✅ Вы подписались на сигналы Kraken Scanner v4.1\n"
+    "✅ Вы подписались на сигналы Kraken Scanner v4.3\n"
     "Стратегии: Confluence (тренд) + Breakout (боковик)."
 )
 
@@ -795,8 +795,11 @@ def should_send_status() -> bool:
         pass
     return True
 
+# ==================== ОТПРАВКА СТАТУСА ====================
+
 def send_status_message(scan_summary: list, pairs_count: int, open_positions: int,
-                        found_buy: int, found_sell: int, consolidation_list: list) -> None:
+                        found_buy: int, found_sell: int, consolidation_list: list,
+                        open_positions_list: list) -> None:
     now_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
     lines = [
         f"📡 <b>Статус сканирования</b> — {now_str}",
@@ -807,6 +810,25 @@ def send_status_message(scan_summary: list, pairs_count: int, open_positions: in
         f"• Входов за цикл: {found_buy}",
         f"• Выходов за цикл: {found_sell}",
     ]
+
+    if open_positions_list:
+        lines.append(f"\n💰 <b>Открытые позиции:</b>")
+        for pos in open_positions_list:
+            pair = pos.get("pair", "?")
+            entry = pos.get("entry_price", 0)
+            entry_time = pos.get("entry_time", "?")
+            if len(entry_time) > 16:
+                entry_time = entry_time[:16]
+            stop = pos.get("stop", 0)
+            target = pos.get("target", 0)
+            strategy = pos.get("strategy", "unknown")
+            lines.append(
+                f"• <b>{pair}</b> ({strategy})\n"
+                f"  Вход: {entry:.6g} | Время: {entry_time}\n"
+                f"  Стоп: {stop:.6g} | Тейк: {target:.6g}"
+            )
+    else:
+        lines.append(f"\n💰 <b>Открытых позиций нет.</b>")
 
     close_calls = [s for s in scan_summary if s["trend_score"] >= 2]
     close_calls.sort(key=lambda s: (s["trend_score"], s["adx_1d"]), reverse=True)
@@ -834,9 +856,6 @@ def send_status_message(scan_summary: list, pairs_count: int, open_positions: in
             lines.append(f"   ... и ещё {len(consolidation_list)-5} монет в боковике")
     else:
         lines.append(f"\n📦 <b>Монет в длительном боковике не найдено.</b>")
-
-    if open_positions > 0:
-        lines.append(f"\n💰 <b>Активные позиции:</b> {open_positions}")
 
     lines.append(f"\n━━━━━━━━━━━━━━━━━━━━━")
     if STATUS_INTERVAL_MINUTES > 0:
@@ -873,14 +892,12 @@ def run_scan(args: argparse.Namespace) -> None:
     for pair in pairs:
         results = {}
         try:
-            # Загружаем трендовые ТФ
             for tf in TIMEFRAME_ORDER:
                 params = TIMEFRAME_PARAMS[tf]
                 df = fetch_klines(pair, params["kraken_interval"], params["min_bars"] + 5)
                 results[tf] = analyze_timeframe(df, params)
                 time.sleep(args.request_delay)
 
-            # Дневные данные для боковика
             daily_params = TIMEFRAME_PARAMS["1d"]
             df_daily = fetch_klines(pair, daily_params["kraken_interval"], daily_params["min_bars"] + 60)
             cons_days = check_consolidation(df_daily)
@@ -905,7 +922,6 @@ def run_scan(args: argparse.Namespace) -> None:
             logger.error(f"[{pair}] ошибка получения данных: {e}")
             continue
 
-        # Собираем статистику для статуса
         if all(results.get(tf) is not None for tf in TIMEFRAME_ORDER):
             trend_score = sum(1 for tf in TIMEFRAME_ORDER if results[tf]["trend_up"])
             scan_summary.append({
@@ -917,7 +933,6 @@ def run_scan(args: argparse.Namespace) -> None:
 
         pos = state.get(pair, {"position": "closed"})
 
-        # ------ ОБРАБОТКА ОТКРЫТОЙ ПОЗИЦИИ ------
         if pos.get("position") == "open":
             if results.get(TRIGGER_TF) is None or results.get("1d") is None:
                 logger.debug(f"[{pair}] недостаточно данных для проверки открытой позиции")
@@ -953,9 +968,7 @@ def run_scan(args: argparse.Namespace) -> None:
                 found_sell += 1
                 save_json(STATE_FILE, state)
 
-        # ------ ПОИСК НОВОГО ВХОДА ------
         else:
-            # 1. Проверяем Confluence (трендовую стратегию)
             has_all_data = all(results.get(tf) is not None for tf in TIMEFRAME_ORDER)
             trend_all_up = has_all_data and all(results[tf]["trend_up"] for tf in TIMEFRAME_ORDER)
             entry_results = {}
@@ -1016,8 +1029,6 @@ def run_scan(args: argparse.Namespace) -> None:
                 save_json(STATE_FILE, state)
                 continue
 
-            # 2. Если Confluence не сработал, проверяем Breakout
-            # Берем цену из 4h, если есть
             r4h = results.get("4h")
             current_price = r4h.get("close", 0) if r4h else 0
 
@@ -1061,12 +1072,26 @@ def run_scan(args: argparse.Namespace) -> None:
     logger.info(f"Готово. Новых входов: {found_buy}, выходов: {found_sell}")
 
     open_positions = sum(1 for p in state.values() if p.get("position") == "open")
+
+    open_positions_list = []
+    for pair, pos in state.items():
+        if pos.get("position") == "open":
+            open_positions_list.append({
+                "pair": pair,
+                "entry_price": pos.get("entry_price", 0),
+                "entry_time": pos.get("entry_time", "неизвестно"),
+                "stop": pos.get("stop", 0),
+                "target": pos.get("target", 0),
+                "strategy": pos.get("strategy", "unknown")
+            })
+
     if should_send_status():
-        send_status_message(scan_summary, len(pairs), open_positions, found_buy, found_sell, consolidation_list)
+        send_status_message(scan_summary, len(pairs), open_positions, found_buy, found_sell,
+                            consolidation_list, open_positions_list)
     else:
         logger.info(f"Статусное сообщение пропущено (интервал {STATUS_INTERVAL_MINUTES} мин)")
 
-# ==================== РЕЖИМ REPORT ====================
+# ==================== РЕЖИМ REPORT (ОБНОВЛЁН) ====================
 
 def run_report(args: argparse.Namespace) -> None:
     poll_new_subscribers()
@@ -1084,6 +1109,7 @@ def run_report(args: argparse.Namespace) -> None:
         print(text)
         return
 
+    # Сводная статистика
     wins = [t for t in period_trades if t["result"] == "win"]
     losses = [t for t in period_trades if t["result"] == "loss"]
     win_rate = len(wins) / len(period_trades) * 100
@@ -1097,23 +1123,61 @@ def run_report(args: argparse.Namespace) -> None:
         strategies[strat] = strategies.get(strat, 0) + 1
     strat_line = " | ".join([f"{k}: {v}" for k, v in strategies.items()]) if strategies else "—"
 
-    text = (
-        f"📊 <b>Отчёт за {'3 дня' if args.period == '3d' else '30 дней'}</b>\n"
-        f"Всего сделок: {len(period_trades)}\n"
-        f"✅ Прибыльных: {len(wins)} ({win_rate:.1f}%)\n"
-        f"❌ Убыточных: {len(losses)} ({100 - win_rate:.1f}%)\n"
-        f"Средняя прибыль: {avg_win:+.2f}%\n"
-        f"Средний убыток: {avg_loss:+.2f}%\n"
-        f"Суммарный результат: <b>{total_pnl:+.2f}%</b>\n"
-        f"Стратегии: {strat_line}"
-    )
-    send_telegram(text)
-    print(text)
+    # Заголовок
+    header_lines = [
+        f"📊 <b>Отчёт за {'3 дня' if args.period == '3d' else '30 дней'}</b>",
+        f"━━━━━━━━━━━━━━━━━━━━━",
+        f"Всего сделок: {len(period_trades)}",
+        f"✅ Прибыльных: {len(wins)} ({win_rate:.1f}%)",
+        f"❌ Убыточных: {len(losses)} ({100 - win_rate:.1f}%)",
+        f"Средняя прибыль: {avg_win:+.2f}%",
+        f"Средний убыток: {avg_loss:+.2f}%",
+        f"Суммарный результат: <b>{total_pnl:+.2f}%</b>",
+        f"Стратегии: {strat_line}",
+        f"━━━━━━━━━━━━━━━━━━━━━",
+        f"📋 <b>Все сделки ({len(period_trades)}):</b>"
+    ]
+    header_text = "\n".join(header_lines)
+
+    # Формируем строки всех сделок с датами
+    trades_lines = []
+    for t in period_trades:
+        entry_time = t.get("entry_time", "?").replace("T", " ")[:16]
+        exit_time = t.get("exit_time", "?").replace("T", " ")[:16]
+        pnl = t.get("pnl_pct", 0)
+        symbol = t.get("symbol", "?")
+        strategy = t.get("strategy", "unknown")
+        result_emoji = "✅" if t["result"] == "win" else "❌"
+        trades_lines.append(
+            f"{result_emoji} {symbol} | {pnl:+.2f}% | {strategy} | {entry_time} → {exit_time}"
+        )
+
+    # Отправляем
+    full_text = header_text + "\n" + "\n".join(trades_lines)
+
+    if len(full_text) <= 4096:
+        send_telegram(full_text)
+        print(full_text)
+    else:
+        # Сначала заголовок
+        send_telegram(header_text)
+        # Затем сделки по частям
+        chunk = []
+        chunk_len = 0
+        for line in trades_lines:
+            if chunk_len + len(line) + 1 > 4000:
+                send_telegram("\n".join(chunk))
+                chunk = []
+                chunk_len = 0
+            chunk.append(line)
+            chunk_len += len(line) + 1
+        if chunk:
+            send_telegram("\n".join(chunk))
 
 # ==================== НЕПРЕРЫВНЫЙ РЕЖИМ ====================
 
 def run_forever():
-    logger.info("🚀 Запуск сканера в НЕПРЕРЫВНОМ режиме (v4.1)...")
+    logger.info("🚀 Запуск сканера в НЕПРЕРЫВНОМ режиме (v4.3)...")
     logger.info(f"⏱️ Интервал между сканированиями: {SCAN_INTERVAL_SECONDS // 3600} час(ов)")
     logger.info(f"📊 Статус будет отправляться не чаще {STATUS_INTERVAL_MINUTES // 60} час(ов)")
 
@@ -1142,7 +1206,7 @@ def run_forever():
 # ==================== MAIN ====================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Kraken Signal Scanner v4.1 – Confluence + Breakout")
+    parser = argparse.ArgumentParser(description="Kraken Signal Scanner v4.3 – Confluence + Breakout")
     parser.add_argument("--mode", choices=["scan", "report"], default=None,
                         help="Режим работы (если не указан – непрерывный режим)")
     parser.add_argument("--period", choices=["3d", "month"], default="3d", help="Период отчёта")
