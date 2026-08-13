@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Сканер сигналов Kraken Spot – две стратегии:
-  1. Confluence (тренд 4h/1d/1w + MACD)
-  2. Breakout из боковика (консолидация >30 дней)
+  1. Confluence (тренд 4h/1d/1w + MACD) – на топ-200 волатильных пар
+  2. Breakout из боковика (консолидация >30 дней) – на топ-400 парах (первые 200 уже в основном списке, ещё 200 дополнительных)
 
-Версия 4.5 – оптимизированные запросы, top_n=200, интервал сканирования задаётся в GitHub Actions.
+Версия 4.6 – расширенный поиск боковиков без увеличения нагрузки на основные сигналы.
 """
 
 import argparse
@@ -31,8 +31,8 @@ SCANNER_LOG_FILE = "kraken_scanner.log"
 LAST_STATUS_FILE = "last_status_time.json"
 
 WELCOME_TEXT = (
-    "✅ Вы подписались на сигналы Kraken Scanner v4.5\n"
-    "Оптимизированные запросы, 200 пар, сканирование по расписанию."
+    "✅ Вы подписались на сигналы Kraken Scanner v4.6\n"
+    "Основной поиск: 200 пар. Боковики: до 400 пар."
 )
 
 BASE_URL = "https://api.kraken.com/0/public"
@@ -83,6 +83,7 @@ STRATEGY_CONFIGS = {
         "require_trend_all": False,
         "min_rr_ratio": 1.5,
         "top_n": 200,
+        "consolidation_top_n": 400,
         "min_volatility": 1.5,
         "min_turnover": 100000,
         "atr_mult_sl": 1.5,
@@ -104,6 +105,7 @@ STRATEGY_CONFIGS = {
         "require_trend_all": True,
         "min_rr_ratio": 2.0,
         "top_n": 200,
+        "consolidation_top_n": 400,
         "min_volatility": 1.5,
         "min_turnover": 100000,
         "atr_mult_sl": 2.0,
@@ -125,6 +127,7 @@ STRATEGY_CONFIGS = {
         "require_trend_all": True,
         "min_rr_ratio": 3.0,
         "top_n": 200,
+        "consolidation_top_n": 400,
         "min_volatility": 2.0,
         "min_turnover": 200000,
         "atr_mult_sl": 2.5,
@@ -190,9 +193,13 @@ def get_strategy_config(strategy_name: str) -> Dict[str, Any]:
     BREAKOUT_RANGE_DAYS = config["breakout_range_days"]
     return config
 
-# ==================== ПОИСК ПАР И ЗАПРОС ДАННЫХ ====================
+# ==================== ПОЛУЧЕНИЕ СПИСКА ПАР (расширенный) ====================
 
-def get_volatile_pairs(quote_coin: str, top_n: int) -> List[str]:
+def get_candidates(quote_coin: str, max_candidates: int = 600) -> List[str]:
+    """
+    Возвращает список пар, отфильтрованных по ликвидности и отсортированных по волатильности.
+    max_candidates – ограничение сверху (чтобы не перегружать память).
+    """
     try:
         pairs_resp = requests.get(f"{BASE_URL}/AssetPairs", timeout=20)
         pairs_resp.raise_for_status()
@@ -257,9 +264,11 @@ def get_volatile_pairs(quote_coin: str, top_n: int) -> List[str]:
         time.sleep(0.3)
 
     scored.sort(key=lambda x: x[1], reverse=True)
-    result = [s[0] for s in scored[:top_n]]
-    logger.info(f"Отобрано {len(result)} самых волатильных пар")
+    result = [s[0] for s in scored[:max_candidates]]
+    logger.info(f"Отобрано {len(result)} пар (максимум {max_candidates})")
     return result
+
+# ==================== ЗАПРОС ДАННЫХ ====================
 
 def fetch_klines(pair: str, interval_minutes: int, min_bars: int, retries: int = 3) -> pd.DataFrame:
     for attempt in range(retries):
@@ -805,7 +814,8 @@ def send_status_message(scan_summary: list, pairs_count: int, open_positions: in
         f"📡 <b>Статус сканирования</b> — {now_str}",
         f"━━━━━━━━━━━━━━━━━━━━━",
         f"📊 <b>Общая статистика:</b>",
-        f"• Отслеживается пар: {pairs_count}",
+        f"• Отслеживается пар (Confluence): {pairs_count}",
+        f"• Проверено на боковик (всего): {len(consolidation_list)} (включая дополнительные)",
         f"• Открытых позиций: {open_positions}",
         f"• Входов за цикл: {found_buy}",
         f"• Выходов за цикл: {found_sell}",
@@ -846,7 +856,7 @@ def send_status_message(scan_summary: list, pairs_count: int, open_positions: in
         lines.append(f"\n😴 <b>Кандидатов на вход (Confluence) нет</b>")
 
     if consolidation_list:
-        lines.append(f"\n📦 <b>Долгий боковик (> {CONSOLIDATION_DAYS_MIN} дней):</b>")
+        lines.append(f"\n📦 <b>Монеты в длительном боковике (> {CONSOLIDATION_DAYS_MIN} дней, до 400 пар):</b>")
         consolidation_list.sort(key=lambda x: x["days"], reverse=True)
         for i, item in enumerate(consolidation_list[:5], 1):
             lines.append(
@@ -864,7 +874,7 @@ def send_status_message(scan_summary: list, pairs_count: int, open_positions: in
         lines.append("🔄 Статус при каждом запуске.")
     send_telegram("\n".join(lines))
 
-# ==================== РЕЖИМ SCAN ====================
+# ==================== РЕЖИМ SCAN (ОСНОВНОЙ) ====================
 
 def run_scan(args: argparse.Namespace) -> None:
     config = get_strategy_config(args.strategy)
@@ -887,8 +897,20 @@ def run_scan(args: argparse.Namespace) -> None:
     if not os.path.exists(STATE_FILE):
         save_json(STATE_FILE, {})
 
-    pairs = get_volatile_pairs(args.quote_coin, config["top_n"])
-    logger.info(f"Отслеживаю {len(pairs)} пар (мин. волатильность {MIN_VOLATILITY_PCT}%)")
+    # Получаем расширенный список кандидатов (до 600 пар)
+    candidates = get_candidates(args.quote_coin, max_candidates=600)
+    logger.info(f"Всего кандидатов: {len(candidates)}")
+
+    # Основной список для Confluence
+    top_n = config["top_n"]
+    pairs = candidates[:top_n]
+    logger.info(f"Основной список (Confluence): {len(pairs)} пар")
+
+    # Дополнительные пары для боковиков (первые 400, исключая уже взятые для Confluence)
+    cons_top_n = config.get("consolidation_top_n", top_n * 2)
+    consolidation_extra = candidates[top_n:cons_top_n] if len(candidates) > top_n else []
+    logger.info(f"Дополнительные пары для боковиков: {len(consolidation_extra)} пар")
+
     if not pairs:
         logger.warning("Не найдено подходящих пар!")
         return
@@ -898,11 +920,12 @@ def run_scan(args: argparse.Namespace) -> None:
     scan_summary = []
     consolidation_list = []
 
+    # ---------- 1. Обработка основного списка (Confluence + боковик) ----------
     for pair in pairs:
         results = {}
         df_cache = {}
         try:
-            # Загружаем трендовые ТФ (без дублей)
+            # Загружаем трендовые ТФ (4h, 1d, 1w)
             for tf in TIMEFRAME_ORDER:
                 params = TIMEFRAME_PARAMS[tf]
                 df = fetch_klines(pair, params["kraken_interval"], params["min_bars"] + 5)
@@ -910,7 +933,7 @@ def run_scan(args: argparse.Namespace) -> None:
                 results[tf] = analyze_timeframe(df, params)
                 time.sleep(args.request_delay)
 
-            # Используем уже загруженный df для 1d (без повторного запроса)
+            # Проверка консолидации (используем уже загруженный 1d)
             df_daily = df_cache.get("1d")
             if df_daily is not None and not df_daily.empty:
                 cons_days = check_consolidation(df_daily)
@@ -935,6 +958,7 @@ def run_scan(args: argparse.Namespace) -> None:
             logger.error(f"[{pair}] ошибка получения данных: {e}")
             continue
 
+        # Сбор статистики для статуса
         if all(results.get(tf) is not None for tf in TIMEFRAME_ORDER):
             trend_score = sum(1 for tf in TIMEFRAME_ORDER if results[tf]["trend_up"])
             scan_summary.append({
@@ -946,6 +970,7 @@ def run_scan(args: argparse.Namespace) -> None:
 
         pos = state.get(pair, {"position": "closed"})
 
+        # Обработка открытой позиции
         if pos.get("position") == "open":
             if results.get(TRIGGER_TF) is None or results.get("1d") is None:
                 logger.debug(f"[{pair}] недостаточно данных для проверки открытой позиции")
@@ -981,6 +1006,7 @@ def run_scan(args: argparse.Namespace) -> None:
                 found_sell += 1
                 save_json(STATE_FILE, state)
 
+        # Поиск нового входа (Confluence)
         else:
             has_all_data = all(results.get(tf) is not None for tf in TIMEFRAME_ORDER)
             trend_all_up = has_all_data and all(results[tf]["trend_up"] for tf in TIMEFRAME_ORDER)
@@ -1042,6 +1068,7 @@ def run_scan(args: argparse.Namespace) -> None:
                 save_json(STATE_FILE, state)
                 continue
 
+            # Если Confluence не сработал, проверяем Breakout (для основной пары, если она в боковике)
             r4h = results.get("4h")
             current_price = r4h.get("close", 0) if r4h else 0
 
@@ -1081,11 +1108,40 @@ def run_scan(args: argparse.Namespace) -> None:
                     save_json(STATE_FILE, state)
                     continue
 
+    # ---------- 2. Дополнительный проход по парам только для боковиков ----------
+    for pair in consolidation_extra:
+        try:
+            daily_params = TIMEFRAME_PARAMS["1d"]
+            df_daily = fetch_klines(pair, daily_params["kraken_interval"], daily_params["min_bars"] + 60)
+            cons_days = check_consolidation(df_daily)
+            if cons_days:
+                # Получить ADX из данных (придётся пересчитать, так как у нас нет готового results)
+                # Мы можем вычислить ADX на основе df_daily
+                adx_val = adx(df_daily).iloc[-1] if not df_daily.empty else 0
+                if not df_daily.empty and len(df_daily) >= 30:
+                    window = df_daily.tail(30)
+                    high = window["high"].max()
+                    low = window["low"].min()
+                    mean = window["close"].mean()
+                    range_pct = (high - low) / mean * 100 if mean > 0 else 0
+                else:
+                    range_pct = 0
+                consolidation_list.append({
+                    "pair": pair,
+                    "days": cons_days,
+                    "range_pct": range_pct,
+                    "adx": adx_val
+                })
+            time.sleep(args.request_delay)
+        except Exception as e:
+            logger.error(f"[{pair}] ошибка при проверке боковика: {e}")
+            continue
+
+    # Сохраняем состояние
     save_json(STATE_FILE, state)
     logger.info(f"Готово. Новых входов: {found_buy}, выходов: {found_sell}")
 
     open_positions = sum(1 for p in state.values() if p.get("position") == "open")
-
     open_positions_list = []
     for pair, pos in state.items():
         if pos.get("position") == "open":
@@ -1184,7 +1240,7 @@ def run_report(args: argparse.Namespace) -> None:
 # ==================== НЕПРЕРЫВНЫЙ РЕЖИМ (не используется в GitHub Actions) ====================
 
 def run_forever():
-    logger.info("🚀 Запуск сканера в НЕПРЕРЫВНОМ режиме (v4.5)...")
+    logger.info("🚀 Запуск сканера в НЕПРЕРЫВНОМ режиме (v4.6)...")
     logger.info(f"⏱️ Интервал между сканированиями: {SCAN_INTERVAL_SECONDS // 3600} час(ов)")
     logger.info(f"📊 Статус будет отправляться не чаще {STATUS_INTERVAL_MINUTES // 60} час(ов)")
 
@@ -1213,11 +1269,11 @@ def run_forever():
 # ==================== MAIN ====================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Kraken Signal Scanner v4.5 – 200 пар")
+    parser = argparse.ArgumentParser(description="Kraken Signal Scanner v4.6 – расширенный поиск боковиков")
     parser.add_argument("--mode", choices=["scan", "report"], default=None,
                         help="Режим работы (если не указан – непрерывный режим)")
     parser.add_argument("--period", choices=["3d", "month"], default="3d", help="Период отчёта")
-    parser.add_argument("--top-n", type=int, default=200, help="Количество пар для сканирования")
+    parser.add_argument("--top-n", type=int, default=200, help="Количество пар для основного поиска")
     parser.add_argument("--quote-coin", default="USD", help="Базовая валюта")
     parser.add_argument("--request-delay", type=float, default=0.3, help="Задержка между запросами (сек)")
     parser.add_argument("--strategy", choices=["aggressive", "balanced", "conservative"],
