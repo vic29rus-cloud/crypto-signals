@@ -533,6 +533,10 @@ def run_scan(args):
         pos = state.get(pair, {"position": "closed"})
 
         if pos["position"] == "open":
+            if results.get(TRIGGER_TF) is None or results.get("1d") is None:
+                print(f"[{pair}] недостаточно данных ({TRIGGER_TF}/1d) для проверки открытой позиции, пропуск")
+                continue
+
             moved = maybe_move_to_breakeven(pos, results[TRIGGER_TF]["close"])
             if moved:
                 send_telegram(
@@ -561,7 +565,8 @@ def run_scan(args):
                 state[pair] = {"position": "closed"}
                 found_sell += 1
         else:
-            trend_all_up = all(results[tf]["trend_up"] for tf in TIMEFRAME_ORDER)
+            has_all_data = all(results.get(tf) is not None for tf in TIMEFRAME_ORDER)
+            trend_all_up = has_all_data and all(results[tf]["trend_up"] for tf in TIMEFRAME_ORDER)
             entry_result = None
             if trend_all_up:
                 # Тянем точный триггер входа с 15m ТОЛЬКО если старшие ТФ уже совпали —
