@@ -32,7 +32,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install requests pandas numpy
-      - name: Сканировать волатильные пары (confluence 4h/1d/1w)
+      - name: Сканировать волатильные пары (confluence + боковики)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
