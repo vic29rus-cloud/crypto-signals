@@ -1,4 +1,5 @@
 name: Kraken Signal Scanner
+
 on:
   workflow_dispatch:
     inputs:
@@ -11,17 +12,19 @@ on:
         required: false
         default: '3d'
   schedule:
-    # Сканирование входов/выходов каждые 4 часа
-    - cron: '5 0,4,8,12,16,20 * * *'
+    # Сканирование входов/выходов каждые 2 часа
+    - cron: '5 0,2,4,6,8,10,12,14,16,18,20,22 * * *'
     # Отчёт каждые 3 дня в 09:00 UTC
     - cron: '0 9 */3 * *'
     # Отчёт раз в месяц, 1 числа в 09:30 UTC
     - cron: '30 9 1 * *'
+
 permissions:
   contents: write
+
 jobs:
   scan:
-    if: github.event.schedule == '5 0,4,8,12,16,20 * * *' || github.event.inputs.mode == 'scan'
+    if: github.event.schedule == '5 0,2,4,6,8,10,12,14,16,18,20,22 * * *' || github.event.inputs.mode == 'scan'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
