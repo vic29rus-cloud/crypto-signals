@@ -3,10 +3,11 @@
 
 ЛОГИКА ВХОДА:
     Сигнал BUY отправляется только если ОДНОВРЕМЕННО:
-      - восходящий тренд (EMA fast > EMA slow) на 4h, 1d И 1w
-      - свежее пересечение MACD вверх на 4h (триггер входа)
-      - RSI(14) на 4h в диапазоне [RSI_MIN, RSI_MAX] — не перекуплен/перепродан
+      - восходящий тренд (EMA fast > EMA slow) на 4h, 1d И 1w — общее направление (bias)
+      - точный триггер входа на 15m: свежее пересечение MACD вверх — момент "нажать купить"
+      - RSI(14) на 15m в диапазоне [RSI_MIN, RSI_MAX] — не перекуплен/перепродан
       - ADX(14) на 1d >= ADX_MIN — тренд достаточно силён, не "боковик"
+      - (опционально) Smart Money BOS на 15m — пробит последний локальный максимум
 
 ВЫХОД:
     По 4h: разворот EMA/MACD, либо срабатывание Stop-Loss/Take-Profit (считаются от ATR дневного графика).
@@ -53,12 +54,19 @@ BASE_URL = "https://api.kraken.com/0/public"
 
 # Kraken interval в минутах: 1,5,15,30,60,240,1440,10080,21600
 TIMEFRAME_PARAMS = {
-    "4h": {"kraken_interval": 240,   "ema_fast": 21, "ema_slow": 55, "min_bars": 120},
-    "1d": {"kraken_interval": 1440,  "ema_fast": 50, "ema_slow": 100, "min_bars": 150},
-    "1w": {"kraken_interval": 10080, "ema_fast": 8,  "ema_slow": 20, "min_bars": 40},
+    "15m": {"kraken_interval": 15,   "ema_fast": 9,  "ema_slow": 21, "min_bars": 80},
+    "4h":  {"kraken_interval": 240,  "ema_fast": 21, "ema_slow": 55, "min_bars": 120},
+    "1d":  {"kraken_interval": 1440, "ema_fast": 50, "ema_slow": 100, "min_bars": 150},
+    "1w":  {"kraken_interval": 10080, "ema_fast": 8, "ema_slow": 20, "min_bars": 40},
 }
+# 4h/1d/1w задают общее НАПРАВЛЕНИЕ (bias) — тренд должен совпадать на всех трёх.
 TIMEFRAME_ORDER = ["4h", "1d", "1w"]
-TRIGGER_TF = "4h"          # на этом ТФ ищем свежий MACD-кросс как триггер входа
+# Момент входа (точный триггер) ищем на младшем ТФ — так вход происходит ближе
+# к локальному развороту/пробою внутри уже подтверждённого тренда, а не просто
+# "где-то на 4h свече". Это НЕ дополнительное условие тренда (чтобы не плодить
+# коррелированные фильтры), а просто более точная цена и момент нажатия "купить".
+ENTRY_TRIGGER_TF = "15m"
+TRIGGER_TF = "4h"          # используется для мониторинга ВЫХОДА (стабильнее, без шума 15m)
 ADX_REF_TF = "1d"          # на этом ТФ проверяем силу тренда
 
 RSI_LENGTH = 14
@@ -67,11 +75,11 @@ ADX_LENGTH = 14
 ADX_MIN = 20                # ниже — считаем рынок "боковиком", сигнал игнорируем
 
 # --- Smart Money Concepts (упрощённо): Break of Structure ---
-# Требуем, чтобы цена на триггерном ТФ (4h) пробила последний подтверждённый
+# Требуем, чтобы цена на ENTRY_TRIGGER_TF (15m) пробила последний подтверждённый
 # локальный максимум (swing high) — это доп. подтверждение силы движения.
 # Внимание: это ЕЩЁ ОДИН строгий фильтр поверх уже строгих условий — сделок
 # станет меньше. Если сигналов совсем не будет несколько недель — поставьте False.
-REQUIRE_SMC_BOS = False
+REQUIRE_SMC_BOS = True
 SMC_SWING_WINDOW = 5   # сколько баров до/после нужно для подтверждения свинга
 
 ATR_MULT_SL = 2.0
@@ -287,15 +295,23 @@ def analyze_timeframe(df: pd.DataFrame, params: dict) -> dict:
     }
 
 
-def check_confluence_entry(results: dict) -> bool:
+def check_confluence_entry(results: dict, entry_result: dict) -> bool:
+    """
+    results       — тренд-контекст на 4h/1d/1w (направление, должно совпасть на всех трёх)
+    entry_result  — точный триггер на 15m (момент входа: MACD-кросс, RSI, BOS)
+    """
     if any(results.get(tf) is None for tf in TIMEFRAME_ORDER):
         return False
+    if entry_result is None:
+        return False
     trend_all_up = all(results[tf]["trend_up"] for tf in TIMEFRAME_ORDER)
-    trigger = results[TRIGGER_TF]["macd_cross_up"]
-    rsi_ok = RSI_MIN <= results[TRIGGER_TF]["rsi"] <= RSI_MAX
+    if not trend_all_up:
+        return False
+    trigger = entry_result["macd_cross_up"]
+    rsi_ok = RSI_MIN <= entry_result["rsi"] <= RSI_MAX
     adx_ok = results[ADX_REF_TF]["adx"] >= ADX_MIN
-    smc_ok = (not REQUIRE_SMC_BOS) or results[TRIGGER_TF]["bos_up"]
-    return trend_all_up and trigger and rsi_ok and adx_ok and smc_ok
+    smc_ok = (not REQUIRE_SMC_BOS) or entry_result["bos_up"]
+    return trigger and rsi_ok and adx_ok and smc_ok
 
 
 def check_exit(results: dict, pos: dict) -> tuple:
@@ -545,17 +561,30 @@ def run_scan(args):
                 state[pair] = {"position": "closed"}
                 found_sell += 1
         else:
-            if check_confluence_entry(results):
-                close = results[TRIGGER_TF]["close"]
-                daily_atr = results["1d"]["atr"]
+            trend_all_up = all(results[tf]["trend_up"] for tf in TIMEFRAME_ORDER)
+            entry_result = None
+            if trend_all_up:
+                # Тянем точный триггер входа с 15m ТОЛЬКО если старшие ТФ уже совпали —
+                # экономим запросы к API на парах, где дальше проверять всё равно бессмысленно
+                try:
+                    entry_params = TIMEFRAME_PARAMS[ENTRY_TRIGGER_TF]
+                    df15 = fetch_klines(pair, entry_params["kraken_interval"], entry_params["min_bars"] + 5)
+                    entry_result = analyze_timeframe(df15, entry_params)
+                    time.sleep(args.request_delay)
+                except Exception as e:
+                    print(f"[{pair}] ошибка получения 15m данных: {e}")
+
+            if check_confluence_entry(results, entry_result):
+                close = entry_result["close"]          # точная цена входа — с 15m, а не с 4h
+                daily_atr = results["1d"]["atr"]        # но стоп/тейк — от дневной волатильности
                 stop = close - daily_atr * ATR_MULT_SL
                 target = close + daily_atr * ATR_MULT_TP
                 text = (
-                    f"🟢 <b>ВХОД (BUY) — подтверждён на 4h/1d/1w</b>\n"
+                    f"🟢 <b>ВХОД (BUY) — тренд 4h/1d/1w + точный триггер 15m</b>\n"
                     f"Пара: <b>{pair}</b>\n"
                     f"Цена входа: <b>{close:.6g}</b>\n"
-                    f"RSI(4h): {results['4h']['rsi']:.1f}  ADX(1d): {results['1d']['adx']:.1f}\n"
-                    f"Smart Money BOS: {'✅ пробит swing high' if results['4h']['bos_up'] else '—'}\n"
+                    f"RSI(15m): {entry_result['rsi']:.1f}  ADX(1d): {results['1d']['adx']:.1f}\n"
+                    f"Smart Money BOS: {'✅ пробит swing high (15m)' if entry_result['bos_up'] else '—'}\n"
                     f"Stop-Loss: {stop:.6g}\n"
                     f"Take-Profit: {target:.6g}"
                 )
