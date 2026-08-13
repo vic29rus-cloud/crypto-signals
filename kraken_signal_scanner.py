@@ -1,5 +1,6 @@
 """
-Сканер сигналов Kraken Spot с мультитаймфреймовым подтверждением (confluence).
+Сканер сигналов Kraken Spot с мультитаймфреймовым подтверждением (confluence)
+Версия 2.0 - с улучшенной точностью и гибкими настройками
 
 ЛОГИКА ВХОДА:
     Сигнал BUY отправляется только если ОДНОВРЕМЕННО:
@@ -20,107 +21,215 @@
     Каждый запуск заново ищет top-N САМЫХ ВОЛАТИЛЬНЫХ пар (по 24ч диапазону high/low в %),
     с фильтром минимальной ликвидности — список не фиксирован, отслеживание "плавающее".
 
-ВАЖНО (честно): ни один набор фильтров не гарантирует прибыль. Ужесточение условий
-обычно снижает число сделок и долю ложных входов, но не устраняет просадки полностью.
-Это не является финансовой рекомендацией — только сигнал по вашей собственной логике.
+РЕЖИМЫ СТРАТЕГИИ:
+    --strategy aggressive  -> больше сигналов, меньше точность
+    --strategy balanced    -> сбалансированный подход (по умолчанию)
+    --strategy conservative -> меньше сигналов, выше точность
 
 УСТАНОВКА:
-    pip install requests pandas numpy --break-system-packages
+    pip install requests pandas numpy
 """
 
 import argparse
 import json
 import os
 import time
+import logging
 from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Dict, Any, Tuple
+from functools import lru_cache
 
 import requests
 import pandas as pd
 import numpy as np
 
+# ==================== КОНФИГУРАЦИЯ ====================
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")  # опционально: личный чат-админ
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 SUBSCRIBERS_FILE = "telegram_subscribers.json"
 STATE_FILE = "kraken_scanner_state.json"
 TRADES_LOG_FILE = "trades_log.json"
+SCANNER_LOG_FILE = "kraken_scanner.log"
 
 WELCOME_TEXT = (
-    "✅ Вы подписались на сигналы Kraken Scanner.\n"
+    "✅ Вы подписались на сигналы Kraken Scanner v2.0\n"
     "Входы отправляются только при совпадении тренда на 4h/1d/1w."
 )
 
 BASE_URL = "https://api.kraken.com/0/public"
 
-# Kraken interval в минутах: 1,5,15,30,60,240,1440,10080,21600
+# ==================== НАСТРОЙКА ЛОГИРОВАНИЯ ====================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler(SCANNER_LOG_FILE, encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ==================== ПАРАМЕТРЫ ТАЙМФРЕЙМОВ ====================
+
 TIMEFRAME_PARAMS = {
     "15m": {"kraken_interval": 15,   "ema_fast": 9,  "ema_slow": 21, "min_bars": 80},
+    "1h":  {"kraken_interval": 60,   "ema_fast": 12, "ema_slow": 26, "min_bars": 100},
     "4h":  {"kraken_interval": 240,  "ema_fast": 21, "ema_slow": 55, "min_bars": 120},
     "1d":  {"kraken_interval": 1440, "ema_fast": 50, "ema_slow": 100, "min_bars": 150},
     "1w":  {"kraken_interval": 10080, "ema_fast": 8, "ema_slow": 20, "min_bars": 40},
 }
-# 4h/1d/1w задают общее НАПРАВЛЕНИЕ (bias) — тренд должен совпадать на всех трёх.
+
 TIMEFRAME_ORDER = ["4h", "1d", "1w"]
-# Момент входа (точный триггер) ищем на младшем ТФ — так вход происходит ближе
-# к локальному развороту/пробою внутри уже подтверждённого тренда, а не просто
-# "где-то на 4h свече". Это НЕ дополнительное условие тренда (чтобы не плодить
-# коррелированные фильтры), а просто более точная цена и момент нажатия "купить".
-ENTRY_TRIGGER_TF = "15m"
-TRIGGER_TF = "4h"          # используется для мониторинга ВЫХОДА (стабильнее, без шума 15m)
-ADX_REF_TF = "1d"          # на этом ТФ проверяем силу тренда
+ENTRY_TRIGGER_TFS = ["15m"]  # Можно добавить "1h" для большего количества сигналов
+TRIGGER_TF = "4h"
+ADX_REF_TF = "1d"
 
 RSI_LENGTH = 14
-RSI_MIN, RSI_MAX = 40, 75  # входим не на перекупленности и не на дне без импульса
 ADX_LENGTH = 14
-ADX_MIN = 20                # ниже — считаем рынок "боковиком", сигнал игнорируем
 
-# --- Smart Money Concepts (упрощённо): Break of Structure ---
-# Требуем, чтобы цена на ENTRY_TRIGGER_TF (15m) пробила последний подтверждённый
-# локальный максимум (swing high) — это доп. подтверждение силы движения.
-# Внимание: это ЕЩЁ ОДИН строгий фильтр поверх уже строгих условий — сделок
-# станет меньше. Если сигналов совсем не будет несколько недель — поставьте False.
-REQUIRE_SMC_BOS = True
-SMC_SWING_WINDOW = 5   # сколько баров до/после нужно для подтверждения свинга
+# ==================== НАСТРОЙКИ СТРАТЕГИЙ ====================
 
+STRATEGY_CONFIGS = {
+    "aggressive": {
+        "name": "Агрессивная",
+        "rsi_range": [30, 80],
+        "adx_min": 15,
+        "require_smc": False,
+        "require_volume": False,
+        "require_divergence": False,
+        "require_fibonacci": False,
+        "require_trend_all": False,
+        "min_rr_ratio": 1.5,
+        "top_n": 100,
+        "min_volatility": 2.0,
+        "min_turnover": 200000,
+        "atr_mult_sl": 1.5,
+        "atr_mult_tp": 3.0,
+        "breakeven_trigger_atr": 0.8,
+        "trailing_atr_mult": 1.2,
+        "description": "Максимальное количество сигналов"
+    },
+    "balanced": {
+        "name": "Сбалансированная",
+        "rsi_range": [40, 75],
+        "adx_min": 20,
+        "require_smc": True,
+        "require_volume": True,
+        "require_divergence": False,
+        "require_fibonacci": False,
+        "require_trend_all": True,
+        "min_rr_ratio": 2.0,
+        "top_n": 60,
+        "min_volatility": 3.0,
+        "min_turnover": 300000,
+        "atr_mult_sl": 2.0,
+        "atr_mult_tp": 4.0,
+        "breakeven_trigger_atr": 1.0,
+        "trailing_atr_mult": 1.5,
+        "description": "Оптимальный баланс сигналов и точности"
+    },
+    "conservative": {
+        "name": "Консервативная",
+        "rsi_range": [45, 70],
+        "adx_min": 25,
+        "require_smc": True,
+        "require_volume": True,
+        "require_divergence": True,
+        "require_fibonacci": True,
+        "require_trend_all": True,
+        "min_rr_ratio": 3.0,
+        "top_n": 40,
+        "min_volatility": 4.0,
+        "min_turnover": 500000,
+        "atr_mult_sl": 2.5,
+        "atr_mult_tp": 5.0,
+        "breakeven_trigger_atr": 1.2,
+        "trailing_atr_mult": 1.8,
+        "description": "Максимальная точность"
+    }
+}
+
+# Глобальные переменные (будут переопределены при выборе стратегии)
 ATR_MULT_SL = 2.0
 ATR_MULT_TP = 4.0
-
-# Перевод стопа в безубыток НЕ сразу при входе (это выбивало бы сделки на обычном шуме),
-# а после того как цена пройдёт в прибыль на BREAKEVEN_TRIGGER_ATR x ATR — то есть когда
-# движение уже подтвердилось. BREAKEVEN_BUFFER_PCT — небольшой запас сверх цены входа,
-# чтобы покрыть комиссии/проскальзывание при закрытии по стопу.
 BREAKEVEN_TRIGGER_ATR = 1.0
 BREAKEVEN_BUFFER_PCT = 0.1
-
-# Трейлинг-стоп включается ТОЛЬКО после безубытка (по вашей просьбе — "на всякий случай").
-# Стоп подтягивается на TRAILING_ATR_MULT x ATR от текущей цены, но никогда не двигается вниз —
-# поэтому безубыток остаётся гарантированным минимумом, а трейлинг только улучшает результат.
 TRAILING_ATR_MULT = 1.5
+MIN_VOLATILITY_PCT = 3.0
+MIN_TURNOVER_USD = 300000
+RSI_MIN = 40
+RSI_MAX = 75
+ADX_MIN = 20
+REQUIRE_SMC_BOS = True
 
 EXCLUDE_BASE_SUBSTRINGS = ["UP", "DOWN", "BULL", "BEAR", "3L", "3S", "5L", "5S"]
 STABLECOINS = {"USDC", "USDT", "DAI", "USD", "EUR", "GBP", "PYUSD", "TUSD", "FDUSD"}
 
-MIN_VOLATILITY_PCT = 3.0        # мин. дневной диапазон (high-low)/low *100, чтобы пара считалась волатильной
-MIN_TURNOVER_USD = 300_000      # фильтр ликвидности, чтобы не ловить "мёртвые" пары
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 
+def safe_float(value: Any, default: float = 0.0) -> float:
+    """Безопасное преобразование в float."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
-# ---------------------------------------------------------------------------
-# Поиск волатильных пар (пересчитывается КАЖДЫЙ запуск, список не фиксирован)
-# ---------------------------------------------------------------------------
+def safe_int(value: Any, default: int = 0) -> int:
+    """Безопасное преобразование в int."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
-def get_volatile_pairs(quote_coin: str, top_n: int) -> list:
-    pairs_resp = requests.get(f"{BASE_URL}/AssetPairs", timeout=20)
-    pairs_resp.raise_for_status()
-    pairs_data = pairs_resp.json()
-    if pairs_data.get("error"):
-        raise RuntimeError(f"Kraken API error: {pairs_data['error']}")
-    all_pairs = pairs_data["result"]
+def get_strategy_config(strategy_name: str) -> Dict[str, Any]:
+    """Возвращает конфигурацию стратегии."""
+    config = STRATEGY_CONFIGS.get(strategy_name, STRATEGY_CONFIGS["balanced"]).copy()
+    
+    global ATR_MULT_SL, ATR_MULT_TP, BREAKEVEN_TRIGGER_ATR, TRAILING_ATR_MULT
+    global MIN_VOLATILITY_PCT, MIN_TURNOVER_USD, RSI_MIN, RSI_MAX, ADX_MIN, REQUIRE_SMC_BOS
+    
+    ATR_MULT_SL = config["atr_mult_sl"]
+    ATR_MULT_TP = config["atr_mult_tp"]
+    BREAKEVEN_TRIGGER_ATR = config["breakeven_trigger_atr"]
+    TRAILING_ATR_MULT = config["trailing_atr_mult"]
+    MIN_VOLATILITY_PCT = config["min_volatility"]
+    MIN_TURNOVER_USD = config["min_turnover"]
+    RSI_MIN, RSI_MAX = config["rsi_range"]
+    ADX_MIN = config["adx_min"]
+    REQUIRE_SMC_BOS = config["require_smc"]
+    
+    return config
+
+# ==================== ПОИСК ПАР ====================
+
+def get_volatile_pairs(quote_coin: str, top_n: int) -> List[str]:
+    """Возвращает топ-N волатильных пар."""
+    try:
+        pairs_resp = requests.get(f"{BASE_URL}/AssetPairs", timeout=20)
+        pairs_resp.raise_for_status()
+        pairs_data = pairs_resp.json()
+        
+        if pairs_data.get("error"):
+            logger.error(f"Kraken API error: {pairs_data['error']}")
+            return []
+        
+        all_pairs = pairs_data.get("result", {})
+        logger.info(f"Получено {len(all_pairs)} пар от Kraken")
+        
+    except Exception as e:
+        logger.error(f"Ошибка получения списка пар: {e}")
+        return []
 
     candidates_names = []
     for kraken_name, info in all_pairs.items():
         wsname = info.get("wsname", "")
         if "/" not in wsname:
             continue
+        
         base, quote = wsname.split("/")
         if quote != quote_coin:
             continue
@@ -130,138 +239,287 @@ def get_volatile_pairs(quote_coin: str, top_n: int) -> list:
             continue
         candidates_names.append(kraken_name)
 
+    logger.info(f"Найдено {len(candidates_names)} кандидатов после фильтрации")
+
     scored = []
     chunk_size = 50
+    
     for i in range(0, len(candidates_names), chunk_size):
         chunk = candidates_names[i:i + chunk_size]
         try:
-            tick_resp = requests.get(f"{BASE_URL}/Ticker", params={"pair": ",".join(chunk)}, timeout=20)
+            tick_resp = requests.get(
+                f"{BASE_URL}/Ticker", 
+                params={"pair": ",".join(chunk)}, 
+                timeout=20
+            )
             tick_resp.raise_for_status()
             tick_data = tick_resp.json()
-        except Exception:
-            time.sleep(0.3)
+            
+            if tick_data.get("error"):
+                logger.warning(f"Ошибка в данных Ticker: {tick_data['error']}")
+                time.sleep(0.5)
+                continue
+                
+        except Exception as e:
+            logger.warning(f"Ошибка получения Ticker для чанка: {e}")
+            time.sleep(0.5)
             continue
-        if tick_data.get("error"):
-            time.sleep(0.3)
-            continue
+
         for pair_name, t in tick_data.get("result", {}).items():
             try:
-                high_24h = float(t["h"][1])
-                low_24h = float(t["l"][1])
-                last = float(t["c"][0])
-                vwap_24h = float(t["p"][1])
-                vol_24h = float(t["v"][1])
+                high_24h = safe_float(t.get("h", [0, 0])[1])
+                low_24h = safe_float(t.get("l", [0, 0])[1])
+                vwap_24h = safe_float(t.get("p", [0, 0])[1])
+                vol_24h = safe_float(t.get("v", [0, 0])[1])
+                
                 turnover = vwap_24h * vol_24h
                 if turnover < MIN_TURNOVER_USD or low_24h <= 0:
                     continue
+                    
                 volatility_pct = (high_24h - low_24h) / low_24h * 100
                 if volatility_pct < MIN_VOLATILITY_PCT:
                     continue
+                    
                 scored.append((pair_name, volatility_pct, turnover))
+                
             except (KeyError, ValueError, TypeError, ZeroDivisionError):
                 continue
+
         time.sleep(0.3)
 
     scored.sort(key=lambda x: x[1], reverse=True)
-    return [s[0] for s in scored[:top_n]]
+    result = [s[0] for s in scored[:top_n]]
+    logger.info(f"Отобрано {len(result)} самых волатильных пар")
+    
+    return result
 
+# ==================== ЗАПРОС ДАННЫХ ====================
 
-def fetch_klines(pair: str, interval_minutes: int, min_bars: int) -> pd.DataFrame:
-    resp = requests.get(f"{BASE_URL}/OHLC", params={"pair": pair, "interval": interval_minutes}, timeout=20)
-    resp.raise_for_status()
-    payload = resp.json()
-    if payload.get("error"):
-        raise RuntimeError(f"Kraken API error: {payload['error']}")
+def fetch_klines(pair: str, interval_minutes: int, min_bars: int, retries: int = 3) -> pd.DataFrame:
+    """Загружает исторические OHLC данные с Kraken с повторными попытками."""
+    for attempt in range(retries):
+        try:
+            resp = requests.get(
+                f"{BASE_URL}/OHLC",
+                params={"pair": pair, "interval": interval_minutes},
+                timeout=20
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            
+            if payload.get("error"):
+                logger.warning(f"Kraken OHLC error for {pair}: {payload['error']}, attempt {attempt+1}")
+                if attempt < retries - 1:
+                    time.sleep(1 * (attempt + 1))
+                    continue
+                return pd.DataFrame()
 
-    result = payload["result"]
-    rows = None
-    for key, val in result.items():
-        if key != "last":
-            rows = val
+            result = payload.get("result", {})
+            rows = None
+            
+            for key, val in result.items():
+                if key != "last":
+                    rows = val
+                    break
+                    
+            if not rows:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(
+                rows,
+                columns=["start", "open", "high", "low", "close", "vwap", "volume", "count"]
+            )
+            
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+                
+            df["start"] = pd.to_numeric(df["start"], errors='coerce')
+            df = df.dropna()
+            df = df.drop_duplicates(subset="start").sort_values("start").reset_index(drop=True)
+            
+            return df.tail(min_bars + 10).reset_index(drop=True)
+            
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Request error for {pair}: {e}, attempt {attempt+1}")
+            if attempt < retries - 1:
+                time.sleep(1 * (attempt + 1))
+            else:
+                logger.error(f"Failed to fetch data for {pair} after {retries} attempts")
+                
+        except Exception as e:
+            logger.error(f"Unexpected error for {pair}: {e}")
             break
-    if not rows:
-        return pd.DataFrame()
+            
+    return pd.DataFrame()
 
-    df = pd.DataFrame(rows, columns=["start", "open", "high", "low", "close", "vwap", "volume", "count"])
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = df[col].astype(float)
-    df["start"] = df["start"].astype(np.int64)
-    df = df.drop_duplicates(subset="start").sort_values("start").reset_index(drop=True)
-    return df.tail(min_bars + 10).reset_index(drop=True)
+# ==================== ИНДИКАТОРЫ ====================
 
-
-# ---------------------------------------------------------------------------
-# Индикаторы
-# ---------------------------------------------------------------------------
-
-def ema(series, length):
+def ema(series: pd.Series, length: int) -> pd.Series:
+    """Экспоненциальная скользящая средняя."""
     return series.ewm(span=length, adjust=False).mean()
 
-
-def macd(series, fast=12, slow=26, signal=9):
+def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series]:
+    """MACD индикатор."""
     macd_line = ema(series, fast) - ema(series, slow)
     signal_line = ema(macd_line, signal)
     return macd_line, signal_line
 
-
-def atr(df, length=14):
+def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    """Средний истинный диапазон (ATR)."""
     high, low, close = df["high"], df["low"], df["close"]
     prev_close = close.shift(1)
-    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     return tr.rolling(length).mean()
 
-
-def rsi(series, length=RSI_LENGTH):
+def rsi(series: pd.Series, length: int = RSI_LENGTH) -> pd.Series:
+    """Индекс относительной силы (RSI)."""
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / length, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / length, adjust=False).mean()
+    
+    avg_gain = gain.ewm(alpha=1/length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/length, adjust=False).mean()
+    
     rs = avg_gain / avg_loss.replace(0, np.nan)
     result = 100 - (100 / (1 + rs))
     return result.fillna(50)
 
-
-def adx(df, length=ADX_LENGTH):
+def adx(df: pd.DataFrame, length: int = ADX_LENGTH) -> pd.Series:
+    """Индекс среднего направления (ADX)."""
     high, low, close = df["high"], df["low"], df["close"]
+    
     up_move = high.diff()
     down_move = -low.diff()
+    
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    
     prev_close = close.shift(1)
-    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    atr_w = tr.ewm(alpha=1 / length, adjust=False).mean()
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / length, adjust=False).mean() / atr_w.replace(0, np.nan)
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / length, adjust=False).mean() / atr_w.replace(0, np.nan)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    
+    atr_w = tr.ewm(alpha=1/length, adjust=False).mean()
+    
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1/length, adjust=False).mean() / atr_w.replace(0, np.nan)
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1/length, adjust=False).mean() / atr_w.replace(0, np.nan)
+    
     dx = (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan) * 100
-    adx_val = dx.ewm(alpha=1 / length, adjust=False).mean()
+    adx_val = dx.ewm(alpha=1/length, adjust=False).mean()
+    
     return adx_val.fillna(0)
 
-
-def find_recent_swing_high(df: pd.DataFrame, window: int = SMC_SWING_WINDOW, exclude_last: int = 2):
-    """
-    Smart Money Concepts (упрощённо): находит последний ПОДТВЕРЖДЁННЫЙ swing high —
-    локальный максимум, у которого есть window баров слева и справа ниже него.
-    exclude_last исключает последние бары — им ещё не хватает "будущих" баров
-    для подтверждения, что это действительно локальный пик, а не текущий рост.
-    """
-    highs = df["high"]
-    if len(highs) < window * 2 + 1 + exclude_last:
+def find_recent_swing_high(df: pd.DataFrame, window: int = 5, exclude_last: int = 2) -> Optional[float]:
+    """Находит последний подтверждённый swing high."""
+    if len(df) < window * 2 + 1 + exclude_last:
         return None
+    
+    highs = df["high"]
     rolling_max = highs.rolling(window * 2 + 1, center=True).max()
     is_swing = highs == rolling_max
+    
+    if not is_swing.any():
+        return None
+        
     candidates = is_swing.iloc[:-exclude_last]
     idx = candidates[candidates].index
+    
     if len(idx) == 0:
         return None
+        
     return float(highs.loc[idx[-1]])
 
+def check_divergence(df: pd.DataFrame) -> bool:
+    """Проверяет бычью дивергенцию между ценой и RSI."""
+    if len(df) < 20:
+        return False
+        
+    close = df["close"]
+    rsi_values = rsi(close)
+    
+    price_min_idx = close.iloc[-20:].idxmin()
+    rsi_at_price_min = rsi_values.loc[price_min_idx]
+    
+    rsi_recent_min = rsi_values.iloc[-10:].min()
+    rsi_recent_min_idx = rsi_values.iloc[-10:].idxmin()
+    price_at_rsi_min = close.loc[rsi_recent_min_idx]
+    
+    price_lower = close.iloc[-1] < price_at_rsi_min
+    rsi_higher = rsi_values.iloc[-1] > rsi_recent_min
+    
+    return price_lower and rsi_higher
 
-def analyze_timeframe(df: pd.DataFrame, params: dict) -> dict:
+def fibonacci_levels(df: pd.DataFrame) -> Dict[str, float]:
+    """Расчет уровней Фибоначчи."""
+    high = df["high"].max()
+    low = df["low"].min()
+    diff = high - low
+    
+    if diff <= 0:
+        return {}
+        
+    return {
+        "0.236": high - diff * 0.236,
+        "0.382": high - diff * 0.382,
+        "0.5": high - diff * 0.5,
+        "0.618": high - diff * 0.618,
+        "0.786": high - diff * 0.786,
+    }
+
+def check_fibonacci_support(df: pd.DataFrame, current_price: float, tolerance: float = 0.005) -> bool:
+    """Проверяет, находится ли цена на уровне Фибоначчи."""
+    fibs = fibonacci_levels(df)
+    for level, price in fibs.items():
+        if abs(current_price - price) / price < tolerance:
+            return True
+    return False
+
+def analyze_volume(df: pd.DataFrame) -> bool:
+    """Анализ объема для подтверждения сигнала."""
+    if len(df) < 20:
+        return False
+        
+    volume = df["volume"]
+    avg_volume = volume.rolling(20).mean()
+    
+    recent_volume = volume.iloc[-1]
+    return recent_volume > avg_volume.iloc[-1] * 1.5
+
+def calculate_rr_ratio(results: Dict[str, Any], entry_result: Dict[str, Any]) -> float:
+    """Расчет соотношения риск/прибыль."""
+    close = entry_result["close"]
+    daily_atr = results["1d"]["atr"]
+    
+    stop = close - daily_atr * ATR_MULT_SL
+    target = close + daily_atr * ATR_MULT_TP
+    
+    risk = close - stop
+    reward = target - close
+    
+    if risk <= 0:
+        return 0.0
+        
+    return reward / risk
+
+# ==================== АНАЛИЗ ТАЙМФРЕЙМА ====================
+
+def analyze_timeframe(df: pd.DataFrame, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Анализирует один таймфрейм и возвращает индикаторы."""
     if df.empty or len(df) < params["min_bars"]:
         return None
 
+    last_row = df.iloc[-1]
+    if pd.isna(last_row[["open", "high", "low", "close"]]).any():
+        return None
+
     df = df.copy()
+    
     df["ema_fast"] = ema(df["close"], params["ema_fast"])
     df["ema_slow"] = ema(df["close"], params["ema_slow"])
     df["macd_line"], df["macd_signal"] = macd(df["close"])
@@ -269,16 +527,38 @@ def analyze_timeframe(df: pd.DataFrame, params: dict) -> dict:
     df["rsi"] = rsi(df["close"])
     df["adx"] = adx(df)
 
-    last = df.iloc[-2]   # последняя ЗАКРЫТАЯ свеча
+    if len(df) < 3:
+        return None
+        
+    last = df.iloc[-2]
     prev = df.iloc[-3]
+    
+    if last is None or prev is None:
+        return None
+
+    if any(pd.isna([last["ema_fast"], last["ema_slow"], last["rsi"], last["adx"]])):
+        return None
 
     trend_up = bool(last["ema_fast"] > last["ema_slow"])
-    macd_cross_up = bool((prev["macd_line"] <= prev["macd_signal"]) and (last["macd_line"] > last["macd_signal"]))
-    macd_cross_down = bool((prev["macd_line"] >= prev["macd_signal"]) and (last["macd_line"] < last["macd_signal"]))
-    ema_cross_down = bool((prev["ema_fast"] >= prev["ema_slow"]) and (last["ema_fast"] < last["ema_slow"]))
+    
+    macd_cross_up = bool(
+        prev["macd_line"] <= prev["macd_signal"] and 
+        last["macd_line"] > last["macd_signal"]
+    )
+    macd_cross_down = bool(
+        prev["macd_line"] >= prev["macd_signal"] and 
+        last["macd_line"] < last["macd_signal"]
+    )
+    ema_cross_down = bool(
+        prev["ema_fast"] >= prev["ema_slow"] and 
+        last["ema_fast"] < last["ema_slow"]
+    )
+    ema_cross_up = bool(
+        prev["ema_fast"] <= prev["ema_slow"] and 
+        last["ema_fast"] > last["ema_slow"]
+    )
 
-    # Smart Money Concepts: пробила ли цена последний подтверждённый swing high
-    swing_high = find_recent_swing_high(df.iloc[:-1], window=SMC_SWING_WINDOW)
+    swing_high = find_recent_swing_high(df.iloc[:-1], window=5)
     bos_up = bool(swing_high is not None and last["close"] > swing_high)
 
     return {
@@ -286,39 +566,98 @@ def analyze_timeframe(df: pd.DataFrame, params: dict) -> dict:
         "macd_cross_up": macd_cross_up,
         "macd_cross_down": macd_cross_down,
         "ema_cross_down": ema_cross_down,
+        "ema_cross_up": ema_cross_up,
         "bos_up": bos_up,
         "rsi": float(last["rsi"]),
         "adx": float(last["adx"]),
         "close": float(last["close"]),
-        "atr": float(last["atr"]) if not np.isnan(last["atr"]) else 0.0,
-        "bar_time": str(int(last["start"])),
+        "open": float(last["open"]),
+        "high": float(last["high"]),
+        "low": float(last["low"]),
+        "atr": float(last["atr"]) if not pd.isna(last["atr"]) else 0.0,
+        "bar_time": str(safe_int(last["start"])),
+        "ema_fast": float(last["ema_fast"]),
+        "ema_slow": float(last["ema_slow"]),
     }
 
+# ==================== ЛОГИКА ВХОДА ====================
 
-def check_confluence_entry(results: dict, entry_result: dict) -> bool:
-    """
-    results       — тренд-контекст на 4h/1d/1w (направление, должно совпасть на всех трёх)
-    entry_result  — точный триггер на 15m (момент входа: MACD-кросс, RSI, BOS)
-    """
+def check_confluence_entry(results: Dict[str, Any], entry_results: Dict[str, Any], 
+                          config: Dict[str, Any], df15: pd.DataFrame) -> Tuple[bool, str, Optional[Dict]]:
+    """Проверяет условия входа."""
     if any(results.get(tf) is None for tf in TIMEFRAME_ORDER):
-        return False
-    if entry_result is None:
-        return False
-    trend_all_up = all(results[tf]["trend_up"] for tf in TIMEFRAME_ORDER)
-    if not trend_all_up:
-        return False
-    trigger = entry_result["macd_cross_up"]
-    rsi_ok = RSI_MIN <= entry_result["rsi"] <= RSI_MAX
-    adx_ok = results[ADX_REF_TF]["adx"] >= ADX_MIN
-    smc_ok = (not REQUIRE_SMC_BOS) or entry_result["bos_up"]
-    return trigger and rsi_ok and adx_ok and smc_ok
+        return False, "Нет данных по трендовым ТФ", None
 
+    if config["require_trend_all"]:
+        trend_all_up = all(results[tf]["trend_up"] for tf in TIMEFRAME_ORDER)
+        if not trend_all_up:
+            return False, "Тренд не совпадает на всех ТФ", None
+    else:
+        trend_score = sum(1 for tf in TIMEFRAME_ORDER if results[tf]["trend_up"])
+        if trend_score < 2:
+            return False, f"Тренд совпадает только на {trend_score}/3 ТФ", None
 
-def check_exit(results: dict, pos: dict) -> tuple:
-    """Возвращает (exit_now: bool, reason: str)."""
+    best_trigger = None
+    best_score = 0
+    
+    for tf, entry_result in entry_results.items():
+        if entry_result is None:
+            continue
+            
+        if not (entry_result["macd_cross_up"] or entry_result["ema_cross_up"]):
+            continue
+            
+        score = 0
+        if entry_result["macd_cross_up"]:
+            score += 2
+        if entry_result["ema_cross_up"]:
+            score += 1
+        if entry_result["bos_up"]:
+            score += 1
+            
+        if score > best_score:
+            best_score = score
+            best_trigger = entry_result
+            best_trigger["tf"] = tf
+
+    if best_trigger is None:
+        return False, "Нет триггера на вход", None
+
+    if not (config["rsi_range"][0] <= best_trigger["rsi"] <= config["rsi_range"][1]):
+        return False, f"RSI вне диапазона ({best_trigger['rsi']:.1f})", None
+
+    if results[ADX_REF_TF]["adx"] < config["adx_min"]:
+        return False, f"ADX слишком низкий ({results[ADX_REF_TF]['adx']:.1f})", None
+
+    if config["require_smc"] and not best_trigger["bos_up"]:
+        return False, "Нет BOS", None
+
+    if config["require_volume"]:
+        if not analyze_volume(df15):
+            return False, "Недостаточный объем", None
+
+    if config["require_divergence"]:
+        if not check_divergence(df15):
+            return False, "Нет дивергенции", None
+
+    if config["require_fibonacci"]:
+        if not check_fibonacci_support(df15, best_trigger["close"]):
+            return False, "Нет поддержки Фибоначчи", None
+
+    rr_ratio = calculate_rr_ratio(results, best_trigger)
+    if rr_ratio < config["min_rr_ratio"]:
+        return False, f"RR < минимального ({rr_ratio:.2f})", None
+
+    return True, f"✅ Все условия выполнены (TF: {best_trigger['tf']})", best_trigger
+
+# ==================== ЛОГИКА ВЫХОДА ====================
+
+def check_exit(results: Dict[str, Any], pos: Dict[str, Any]) -> Tuple[bool, str]:
+    """Проверяет условия выхода."""
     r4h = results.get(TRIGGER_TF)
     if r4h is None:
         return False, ""
+
     if r4h["close"] <= pos["stop"]:
         if pos.get("trailing_active"):
             reason = "Трейлинг-стоп"
@@ -327,81 +666,90 @@ def check_exit(results: dict, pos: dict) -> tuple:
         else:
             reason = "Stop-Loss"
         return True, reason
+
     if r4h["close"] >= pos["target"]:
         return True, "Take-Profit"
+
     if r4h["ema_cross_down"] or r4h["macd_cross_down"]:
         return True, "Сигнал разворота (4h)"
+
     return False, ""
 
-
-def maybe_move_to_breakeven(pos: dict, current_close: float) -> bool:
-    """
-    Если цена прошла в прибыль >= BREAKEVEN_TRIGGER_ATR x ATR от входа —
-    подтягивает стоп к цене входа (+небольшой буфер). Возвращает True, если стоп был передвинут.
-    """
+def maybe_move_to_breakeven(pos: Dict[str, Any], current_close: float, breakeven_trigger_atr: float) -> bool:
+    """Перемещает стоп в безубыток."""
     if pos.get("breakeven_moved"):
         return False
+        
     atr_entry = pos.get("atr_entry", 0)
     if atr_entry <= 0:
         return False
 
     profit_in_atr = (current_close - pos["entry_price"]) / atr_entry
-    if profit_in_atr >= BREAKEVEN_TRIGGER_ATR:
+    
+    if profit_in_atr >= breakeven_trigger_atr:
         new_stop = pos["entry_price"] * (1 + BREAKEVEN_BUFFER_PCT / 100)
         if new_stop > pos["stop"]:
             pos["stop"] = new_stop
             pos["breakeven_moved"] = True
             return True
+            
     return False
 
-
-def maybe_trail_stop(pos: dict, current_close: float, current_atr: float) -> bool:
-    """
-    Трейлинг включается ТОЛЬКО после того, как стоп уже переведён в безубыток —
-    поэтому дальше стоп только подтягивается вверх и никогда не опускается ниже
-    уровня безубытка (это "пол", который трейлинг не может пробить).
-    Возвращает True, если стоп был передвинут.
-    """
+def maybe_trail_stop(pos: Dict[str, Any], current_close: float, current_atr: float, trailing_atr_mult: float) -> bool:
+    """Трейлинг-стоп (только после безубытка)."""
     if not pos.get("breakeven_moved"):
         return False
+        
     if current_atr <= 0:
         return False
 
-    candidate_stop = current_close - current_atr * TRAILING_ATR_MULT
+    candidate_stop = current_close - current_atr * trailing_atr_mult
+    
     if candidate_stop > pos["stop"]:
         pos["stop"] = candidate_stop
         pos["trailing_active"] = True
         return True
+        
     return False
 
+# ==================== TELEGRAM ====================
 
-# ---------------------------------------------------------------------------
-# Telegram: подписчики и рассылка
-# ---------------------------------------------------------------------------
-
-def load_subscribers() -> dict:
+def load_subscribers() -> Dict[str, Any]:
+    """Загружает список подписчиков."""
     if os.path.exists(SUBSCRIBERS_FILE):
-        with open(SUBSCRIBERS_FILE) as f:
-            return json.load(f)
+        try:
+            with open(SUBSCRIBERS_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
     return {"offset": 0, "chat_ids": []}
 
+def save_subscribers(data: Dict[str, Any]) -> None:
+    """Сохраняет список подписчиков."""
+    try:
+        with open(SUBSCRIBERS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except IOError as e:
+        logger.error(f"Ошибка сохранения подписчиков: {e}")
 
-def save_subscribers(data: dict):
-    with open(SUBSCRIBERS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-def poll_new_subscribers():
+def poll_new_subscribers() -> None:
+    """Обрабатывает новых подписчиков в Telegram."""
     if not TELEGRAM_BOT_TOKEN:
         return
+        
     data = load_subscribers()
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    
     try:
-        resp = requests.get(url, params={"offset": data["offset"] + 1, "timeout": 0}, timeout=15)
+        resp = requests.get(
+            url, 
+            params={"offset": data["offset"] + 1, "timeout": 0}, 
+            timeout=15
+        )
         resp.raise_for_status()
         updates = resp.json().get("result", [])
     except Exception as e:
-        print(f"Не удалось получить обновления Telegram: {e}")
+        logger.error(f"Не удалось получить обновления Telegram: {e}")
         return
 
     for update in updates:
@@ -409,295 +757,48 @@ def poll_new_subscribers():
         msg = update.get("message") or update.get("channel_post")
         if not msg:
             continue
+            
         chat_id = msg["chat"]["id"]
         text = (msg.get("text") or "").strip().lower()
+        
         if text.startswith("/start") and chat_id not in data["chat_ids"]:
             data["chat_ids"].append(chat_id)
             try:
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                              json={"chat_id": chat_id, "text": WELCOME_TEXT}, timeout=15)
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": chat_id, "text": WELCOME_TEXT},
+                    timeout=15
+                )
             except Exception as e:
-                print(f"Не удалось отправить приветствие {chat_id}: {e}")
+                logger.error(f"Не удалось отправить приветствие {chat_id}: {e}")
+                
         if text.startswith("/stop") and chat_id in data["chat_ids"]:
             data["chat_ids"].remove(chat_id)
 
     save_subscribers(data)
-    print(f"Подписчиков: {len(data['chat_ids'])}")
+    logger.info(f"Подписчиков: {len(data['chat_ids'])}")
 
-
-def send_telegram(text: str):
+def send_telegram(text: str) -> None:
+    """Отправляет сообщение всем подписчикам."""
     if not TELEGRAM_BOT_TOKEN:
-        print("[NO TELEGRAM CONFIG]", text)
+        logger.info(f"[NO TELEGRAM CONFIG] {text}")
         return
+        
     data = load_subscribers()
     chat_ids = set(data.get("chat_ids", []))
+    
     if TELEGRAM_CHAT_ID:
         chat_ids.add(TELEGRAM_CHAT_ID)
+        
     if not chat_ids:
-        print("[NO SUBSCRIBERS]", text)
+        logger.info(f"[NO SUBSCRIBERS] {text}")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     still_active = []
+    
     for chat_id in chat_ids:
         try:
-            r = requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=15)
-            if r.status_code == 403:
-                continue
-            r.raise_for_status()
-            still_active.append(chat_id)
-        except Exception as e:
-            print(f"Не удалось отправить сообщение {chat_id}: {e}")
-            still_active.append(chat_id)
-
-    data["chat_ids"] = [c for c in data.get("chat_ids", []) if c in still_active or c == TELEGRAM_CHAT_ID]
-    save_subscribers(data)
-
-
-# ---------------------------------------------------------------------------
-# Состояние открытых позиций и журнал сделок
-# ---------------------------------------------------------------------------
-
-def load_json(path, default):
-    if os.path.exists(path):
-        with open(path) as f:
-            return json.load(f)
-    return default
-
-
-def save_json(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-def log_trade(symbol, entry_price, exit_price, entry_time, exit_time, reason):
-    trades = load_json(TRADES_LOG_FILE, [])
-    pnl_pct = (exit_price - entry_price) / entry_price * 100
-    trades.append({
-        "symbol": symbol,
-        "entry_price": entry_price,
-        "exit_price": exit_price,
-        "entry_time": entry_time,
-        "exit_time": exit_time,
-        "pnl_pct": round(pnl_pct, 2),
-        "result": "win" if pnl_pct > 0 else "loss",
-        "reason": reason,
-    })
-    save_json(TRADES_LOG_FILE, trades)
-    return pnl_pct
-
-
-# ---------------------------------------------------------------------------
-# Режим SCAN: вход по confluence + проверка выходов
-# ---------------------------------------------------------------------------
-
-def run_scan(args):
-    state = load_json(STATE_FILE, {})
-    poll_new_subscribers()
-
-    # Гарантируем, что файлы существуют физически, даже если пока пусты —
-    # иначе `git add` в workflow падает с "pathspec did not match any files"
-    if not os.path.exists(TRADES_LOG_FILE):
-        save_json(TRADES_LOG_FILE, [])
-    if not os.path.exists(STATE_FILE):
-        save_json(STATE_FILE, {})
-
-    pairs = get_volatile_pairs(args.quote_coin, args.top_n)
-    print(f"Отслеживаю {len(pairs)} самых волатильных пар Kraken Spot (мин. волатильность {MIN_VOLATILITY_PCT}%)...")
-
-    found_buy, found_sell = 0, 0
-    now_iso = datetime.now(timezone.utc).isoformat()
-    scan_summary = []  # для итогового статус-сообщения
-
-    for pair in pairs:
-        results = {}
-        try:
-            for tf in TIMEFRAME_ORDER:
-                params = TIMEFRAME_PARAMS[tf]
-                df = fetch_klines(pair, params["kraken_interval"], params["min_bars"] + 5)
-                results[tf] = analyze_timeframe(df, params)
-                time.sleep(args.request_delay)
-        except Exception as e:
-            print(f"[{pair}] ошибка получения данных: {e}")
-            continue
-
-        if all(results.get(tf) is not None for tf in TIMEFRAME_ORDER):
-            trend_score = sum(1 for tf in TIMEFRAME_ORDER if results[tf]["trend_up"])
-            scan_summary.append({
-                "pair": pair,
-                "trend_score": trend_score,
-                "rsi_4h": results["4h"]["rsi"],
-                "adx_1d": results["1d"]["adx"],
-            })
-
-        pos = state.get(pair, {"position": "closed"})
-
-        if pos["position"] == "open":
-            if results.get(TRIGGER_TF) is None or results.get("1d") is None:
-                print(f"[{pair}] недостаточно данных ({TRIGGER_TF}/1d) для проверки открытой позиции, пропуск")
-                continue
-
-            moved = maybe_move_to_breakeven(pos, results[TRIGGER_TF]["close"])
-            if moved:
-                send_telegram(
-                    f"🔒 <b>Стоп переведён в безубыток</b>\nПара: <b>{pair}</b>\nНовый стоп: {pos['stop']:.6g}"
-                )
-                print(f"[{pair}] стоп переведён в безубыток: {pos['stop']:.6g}")
-
-            # Трейлинг — только после безубытка, поэтому ниже безубытка стоп уже не опустится
-            trailed = maybe_trail_stop(pos, results[TRIGGER_TF]["close"], results["1d"]["atr"])
-            if trailed:
-                print(f"[{pair}] трейлинг-стоп подтянут: {pos['stop']:.6g}")
-
-            exit_now, reason = check_exit(results, pos)
-            if exit_now:
-                exit_price = results[TRIGGER_TF]["close"]
-                pnl_pct = log_trade(pair, pos["entry_price"], exit_price, pos["entry_time"], now_iso, reason)
-                text = (
-                    f"🔴 <b>ВЫХОД (SELL)</b>\n"
-                    f"Пара: <b>{pair}</b>\n"
-                    f"Цена выхода: <b>{exit_price:.6g}</b>\n"
-                    f"Причина: {reason}\n"
-                    f"Результат: <b>{pnl_pct:+.2f}%</b>"
-                )
-                send_telegram(text)
-                print(text)
-                state[pair] = {"position": "closed"}
-                found_sell += 1
-        else:
-            has_all_data = all(results.get(tf) is not None for tf in TIMEFRAME_ORDER)
-            trend_all_up = has_all_data and all(results[tf]["trend_up"] for tf in TIMEFRAME_ORDER)
-            entry_result = None
-            if trend_all_up:
-                # Тянем точный триггер входа с 15m ТОЛЬКО если старшие ТФ уже совпали —
-                # экономим запросы к API на парах, где дальше проверять всё равно бессмысленно
-                try:
-                    entry_params = TIMEFRAME_PARAMS[ENTRY_TRIGGER_TF]
-                    df15 = fetch_klines(pair, entry_params["kraken_interval"], entry_params["min_bars"] + 5)
-                    entry_result = analyze_timeframe(df15, entry_params)
-                    time.sleep(args.request_delay)
-                except Exception as e:
-                    print(f"[{pair}] ошибка получения 15m данных: {e}")
-
-            if check_confluence_entry(results, entry_result):
-                close = entry_result["close"]          # точная цена входа — с 15m, а не с 4h
-                daily_atr = results["1d"]["atr"]        # но стоп/тейк — от дневной волатильности
-                stop = close - daily_atr * ATR_MULT_SL
-                target = close + daily_atr * ATR_MULT_TP
-                text = (
-                    f"🟢 <b>ВХОД (BUY) — тренд 4h/1d/1w + точный триггер 15m</b>\n"
-                    f"Пара: <b>{pair}</b>\n"
-                    f"Цена входа: <b>{close:.6g}</b>\n"
-                    f"RSI(15m): {entry_result['rsi']:.1f}  ADX(1d): {results['1d']['adx']:.1f}\n"
-                    f"Smart Money BOS: {'✅ пробит swing high (15m)' if entry_result['bos_up'] else '—'}\n"
-                    f"Stop-Loss: {stop:.6g}\n"
-                    f"Take-Profit: {target:.6g}"
-                )
-                send_telegram(text)
-                print(text)
-                state[pair] = {
-                    "position": "open",
-                    "entry_price": close,
-                    "entry_time": now_iso,
-                    "stop": stop,
-                    "target": target,
-                    "atr_entry": daily_atr,
-                    "breakeven_moved": False,
-                    "trailing_active": False,
-                }
-                found_buy += 1
-
-    save_json(STATE_FILE, state)
-    print(f"Готово. Новых входов: {found_buy}, выходов: {found_sell}")
-
-    open_positions = sum(1 for p in state.values() if p.get("position") == "open")
-    send_status_message(scan_summary, len(pairs), open_positions, found_buy, found_sell)
-
-
-def send_status_message(scan_summary: list, pairs_count: int, open_positions: int, found_buy: int, found_sell: int):
-    """Отправляет статус даже если сделок не было — чтобы было видно, что бот жив и что-то анализирует."""
-    now_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
-    lines = [
-        f"📡 <b>Статус сканирования</b> — {now_str}",
-        f"Отслеживается пар: {pairs_count}",
-        f"Открытых позиций: {open_positions}",
-        f"Входов за этот цикл: {found_buy}, выходов: {found_sell}",
-    ]
-
-    # Ближе всего к сигналу — тренд совпал на 2-3 из 3 таймфреймов
-    close_calls = [s for s in scan_summary if s["trend_score"] >= 2]
-    close_calls.sort(key=lambda s: (s["trend_score"], s["adx_1d"]), reverse=True)
-
-    if close_calls:
-        lines.append("\nБлиже всего к сигналу:")
-        for s in close_calls[:3]:
-            lines.append(
-                f"• {s['pair']}: тренд {s['trend_score']}/3, RSI(4h) {s['rsi_4h']:.0f}, ADX(1d) {s['adx_1d']:.0f}"
-            )
-    else:
-        lines.append("\nСейчас ни одна пара не близка к полному совпадению тренда.")
-
-    send_telegram("\n".join(lines))
-    print("Статус-сообщение отправлено.")
-
-
-# ---------------------------------------------------------------------------
-# Режим REPORT: сводка за 3 дня / месяц
-# ---------------------------------------------------------------------------
-
-def run_report(args):
-    poll_new_subscribers()
-    if not os.path.exists(TRADES_LOG_FILE):
-        save_json(TRADES_LOG_FILE, [])
-    trades = load_json(TRADES_LOG_FILE, [])
-
-    days = 3 if args.period == "3d" else 30
-    since = datetime.now(timezone.utc) - timedelta(days=days)
-
-    period_trades = [t for t in trades if datetime.fromisoformat(t["exit_time"]) >= since]
-
-    if not period_trades:
-        text = f"📊 <b>Отчёт за {'3 дня' if args.period == '3d' else '30 дней'}</b>\nЗакрытых сделок не было."
-        send_telegram(text)
-        print(text)
-        return
-
-    wins = [t for t in period_trades if t["result"] == "win"]
-    losses = [t for t in period_trades if t["result"] == "loss"]
-    win_rate = len(wins) / len(period_trades) * 100
-    total_pnl = sum(t["pnl_pct"] for t in period_trades)
-    avg_win = sum(t["pnl_pct"] for t in wins) / len(wins) if wins else 0
-    avg_loss = sum(t["pnl_pct"] for t in losses) / len(losses) if losses else 0
-
-    text = (
-        f"📊 <b>Отчёт за {'3 дня' if args.period == '3d' else '30 дней'}</b>\n"
-        f"Всего сделок: {len(period_trades)}\n"
-        f"✅ Прибыльных: {len(wins)} ({win_rate:.1f}%)\n"
-        f"❌ Убыточных: {len(losses)} ({100 - win_rate:.1f}%)\n"
-        f"Средняя прибыль: {avg_win:+.2f}%\n"
-        f"Средний убыток: {avg_loss:+.2f}%\n"
-        f"Суммарный результат: <b>{total_pnl:+.2f}%</b>"
-    )
-    send_telegram(text)
-    print(text)
-
-
-# ---------------------------------------------------------------------------
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["scan", "report"], default="scan")
-    parser.add_argument("--period", choices=["3d", "month"], default="3d")
-    parser.add_argument("--top-n", type=int, default=60)
-    parser.add_argument("--quote-coin", default="USD")
-    parser.add_argument("--request-delay", type=float, default=0.3)
-    args = parser.parse_args()
-
-    if args.mode == "scan":
-        run_scan(args)
-    else:
-        run_report(args)
-
-
-if __name__ == "__main__":
-    main()
+            r = requests.post(
+                url,
+                json={"chat_id": chat_id, "
