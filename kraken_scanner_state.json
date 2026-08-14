@@ -95,15 +95,6 @@
     "position": "closed",
     "last_bar_processed": "1786320000"
   },
-  "USDGUSD_1d": {
-    "position": "open",
-    "entry_price": 1.0,
-    "stop": 0.9995,
-    "target": 1.001,
-    "last_bar_processed": "1786320000",
-    "strategy": "unknown",
-    "entry_time": "\u043d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u043e"
-  },
   "WLDUSD_1d": {
     "position": "closed",
     "last_bar_processed": "1786320000"
@@ -283,15 +274,6 @@
   "LITUSD_1d": {
     "position": "closed",
     "last_bar_processed": "1786320000"
-  },
-  "JTOUSD_1d": {
-    "position": "open",
-    "entry_price": 0.5193,
-    "stop": 0.4519642857142857,
-    "target": 0.6539714285714286,
-    "last_bar_processed": "1786233600",
-    "strategy": "unknown",
-    "entry_time": "\u043d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u043e"
   },
   "CVXUSD_1d": {
     "position": "closed",
@@ -477,15 +459,6 @@
     "position": "closed",
     "last_bar_processed": "1786449600"
   },
-  "ENAUSD_4h": {
-    "position": "open",
-    "entry_price": 0.0908,
-    "stop": 0.08805714285714286,
-    "target": 0.0962857142857143,
-    "last_bar_processed": "1786449600",
-    "strategy": "unknown",
-    "entry_time": "\u043d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u043e"
-  },
   "NEARUSD_4h": {
     "position": "closed",
     "last_bar_processed": "1786449600"
@@ -533,15 +506,6 @@
   "TRXUSD_4h": {
     "position": "closed",
     "last_bar_processed": "1786449600"
-  },
-  "BNBUSD_4h": {
-    "position": "open",
-    "entry_price": 607.78,
-    "stop": 600.2574999999999,
-    "target": 622.8249999999999,
-    "last_bar_processed": "1786449600",
-    "strategy": "unknown",
-    "entry_time": "\u043d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u043e"
   },
   "UNIUSD_4h": {
     "position": "closed",
@@ -739,15 +703,6 @@
     "position": "closed",
     "last_bar_processed": "1786449600"
   },
-  "ATOMUSD_4h": {
-    "position": "open",
-    "entry_price": 1.4071,
-    "stop": 1.3827464285714286,
-    "target": 1.4558071428571429,
-    "last_bar_processed": "1786449600",
-    "strategy": "unknown",
-    "entry_time": "\u043d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u043e"
-  },
   "COTIUSD_4h": {
     "position": "closed",
     "last_bar_processed": "1786435200"
@@ -843,24 +798,6 @@
   "BILLUSD_4h": {
     "position": "closed",
     "last_bar_processed": "1786449600"
-  },
-  "BTRUSD_4h": {
-    "position": "open",
-    "entry_price": 0.03022,
-    "stop": 0.027177142857142858,
-    "target": 0.03630571428571429,
-    "last_bar_processed": "1786449600",
-    "strategy": "unknown",
-    "entry_time": "\u043d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u043e"
-  },
-  "VELVETUSD_4h": {
-    "position": "open",
-    "entry_price": 0.6964,
-    "stop": 0.6161821428571429,
-    "target": 0.8568357142857144,
-    "last_bar_processed": "1786449600",
-    "strategy": "unknown",
-    "entry_time": "\u043d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043d\u043e"
   },
   "OOBUSD_4h": {
     "position": "closed",
