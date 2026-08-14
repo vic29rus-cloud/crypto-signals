@@ -4,7 +4,7 @@
   1. Confluence (тренд 4h/1d/1w + MACD) – на топ-200 волатильных пар
   2. Breakout из боковика (консолидация >30 дней) – на всех доступных парах (без фильтров)
 
-Версия 4.6.4 – исправлено дублирование статусов, гарантированный поиск боковиков на всех парах.
+Версия 4.6.5 – цветные сообщения, улучшенная защита от дублей.
 """
 
 import argparse
@@ -31,7 +31,7 @@ SCANNER_LOG_FILE = "kraken_scanner.log"
 LAST_STATUS_FILE = "last_status_time.json"
 
 WELCOME_TEXT = (
-    "✅ Вы подписались на сигналы Kraken Scanner v4.6.4\n"
+    "✅ Вы подписались на сигналы Kraken Scanner v4.6.5\n"
     "Основной поиск: 200 пар. Боковики: все доступные пары (без фильтров)."
 )
 
@@ -162,6 +162,7 @@ CONSOLIDATION_ADX_THRESHOLD = 20
 
 # ---------- Защита от дублирования статусов ----------
 _STATUS_SENT = False
+_LAST_STATUS_TIME = None
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 
@@ -845,17 +846,26 @@ def should_send_status() -> bool:
 # ==================== ОТПРАВКА СТАТУСА (С ЗАЩИТОЙ ОТ ДУБЛЕЙ) ====================
 
 _STATUS_SENT = False
+_LAST_STATUS_TIME = None
 
 def send_status_message(scan_summary: list, pairs_count: int, open_positions: int,
                         found_buy: int, found_sell: int, consolidation_list: list,
                         open_positions_list: list, extra_pairs_count: int) -> None:
-    global _STATUS_SENT
+    global _STATUS_SENT, _LAST_STATUS_TIME
+
+    # Защита от дублей в течение 5 минут
+    now = datetime.now(timezone.utc)
     if _STATUS_SENT:
         logger.debug("Статус уже отправлен в этом запуске, пропускаем дубль.")
         return
-    _STATUS_SENT = True
+    if _LAST_STATUS_TIME and (now - _LAST_STATUS_TIME).total_seconds() < 300:
+        logger.debug("Статус отправлен менее 5 минут назад, пропускаем.")
+        return
 
-    now_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+    _STATUS_SENT = True
+    _LAST_STATUS_TIME = now
+
+    now_str = now.strftime("%d.%m.%Y %H:%M UTC")
     lines = [
         f"📡 <b>Статус сканирования</b> — {now_str}",
         f"━━━━━━━━━━━━━━━━━━━━━",
@@ -1038,7 +1048,7 @@ def run_scan(args: argparse.Namespace) -> None:
                 pnl_pct = log_trade(pair, pos["entry_price"], exit_price,
                                     pos["entry_time"], now_iso, reason, strategy)
                 msg = (
-                    f"🔴 <b>ВЫХОД (SELL)</b>\n"
+                    f"<font color=\"red\"><b>🔴 ВЫХОД (SELL)</b></font>\n"
                     f"Пара: <b>{pair}</b>\n"
                     f"Стратегия: {strategy}\n"
                     f"Цена выхода: <b>{exit_price:.6g}</b>\n"
@@ -1085,7 +1095,7 @@ def run_scan(args: argparse.Namespace) -> None:
                 strategy_name = "confluence"
 
                 msg = (
-                    f"🟢 <b>ВХОД (BUY) — {strategy_name}</b>\n"
+                    f"<font color=\"green\"><b>🟢 ВХОД (BUY) — {strategy_name}</b></font>\n"
                     f"Пара: <b>{pair}</b>\n"
                     f"Цена входа: <b>{close:.6g}</b>\n"
                     f"RSI(15m): {trigger_conf['rsi']:.1f}  ADX(1d): {results['1d']['adx']:.1f}\n"
@@ -1125,7 +1135,7 @@ def run_scan(args: argparse.Namespace) -> None:
                     strategy_name = "breakout"
 
                     msg = (
-                        f"🟢 <b>ВХОД (BUY) — {strategy_name}</b>\n"
+                        f"<font color=\"green\"><b>🟢 ВХОД (BUY) — {strategy_name}</b></font>\n"
                         f"Пара: <b>{pair}</b>\n"
                         f"Цена входа: <b>{close:.6g}</b>\n"
                         f"Боковик: {trigger_break['cons_days']} дн. | RSI: {trigger_break['rsi']:.1f}\n"
@@ -1281,7 +1291,7 @@ def run_report(args: argparse.Namespace) -> None:
 # ==================== НЕПРЕРЫВНЫЙ РЕЖИМ ====================
 
 def run_forever():
-    logger.info("🚀 Запуск сканера в НЕПРЕРЫВНОМ режиме (v4.6.4)...")
+    logger.info("🚀 Запуск сканера в НЕПРЕРЫВНОМ режиме (v4.6.5)...")
     logger.info(f"⏱️ Интервал между сканированиями: {SCAN_INTERVAL_SECONDS // 3600} час(ов)")
     logger.info(f"📊 Статус будет отправляться не чаще {STATUS_INTERVAL_MINUTES // 60} час(ов)")
 
@@ -1310,7 +1320,7 @@ def run_forever():
 # ==================== MAIN ====================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Kraken Signal Scanner v4.6.4 – исправление дублей и поиск боковиков на всех парах")
+    parser = argparse.ArgumentParser(description="Kraken Signal Scanner v4.6.5 – цветные сообщения, защита от дублей")
     parser.add_argument("--mode", choices=["scan", "report"], default=None,
                         help="Режим работы (если не указан – непрерывный режим)")
     parser.add_argument("--period", choices=["3d", "month"], default="3d", help="Период отчёта")
