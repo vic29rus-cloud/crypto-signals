@@ -760,9 +760,11 @@ def send_telegram(text: str) -> None:
         logger.info(f"[NO TELEGRAM CONFIG] {text}")
         return
     data = load_subscribers()
-    chat_ids = set(data.get("chat_ids", []))
+    # Приводим ВСЕ id к строке — иначе int (из /start) и str (TELEGRAM_CHAT_ID из secrets)
+    # считаются разными элементами set(), и один и тот же человек получает сообщение дважды.
+    chat_ids = set(str(c) for c in data.get("chat_ids", []))
     if TELEGRAM_CHAT_ID:
-        chat_ids.add(TELEGRAM_CHAT_ID)
+        chat_ids.add(str(TELEGRAM_CHAT_ID))
     if not chat_ids:
         logger.info(f"[NO SUBSCRIBERS] {text}")
         return
@@ -784,7 +786,7 @@ def send_telegram(text: str) -> None:
             logger.error(f"Не удалось отправить сообщение {chat_id}: {e}")
             still_active.append(chat_id)
 
-    data["chat_ids"] = [c for c in data.get("chat_ids", []) if c in still_active or c == TELEGRAM_CHAT_ID]
+    data["chat_ids"] = [c for c in data.get("chat_ids", []) if str(c) in still_active or str(c) == str(TELEGRAM_CHAT_ID)]
     save_subscribers(data)
 
 # ==================== УПРАВЛЕНИЕ СОСТОЯНИЕМ И СТАТУСАМИ ====================
@@ -1236,6 +1238,24 @@ def run_report(args: argparse.Namespace) -> None:
     avg_win = sum(t["pnl_pct"] for t in wins) / len(wins) if wins else 0
     avg_loss = sum(t["pnl_pct"] for t in losses) / len(losses) if losses else 0
 
+    def strategy_stats_block(strategy_key: str, title: str) -> list:
+        """Полная статистика (win rate, средняя прибыль/убыток) по одной стратегии отдельно."""
+        strat_trades = [t for t in period_trades if t.get("strategy", "unknown") == strategy_key]
+        if not strat_trades:
+            return [f"\n{title}: сделок не было"]
+        s_wins = [t for t in strat_trades if t["result"] == "win"]
+        s_losses = [t for t in strat_trades if t["result"] == "loss"]
+        s_win_rate = len(s_wins) / len(strat_trades) * 100
+        s_total_pnl = sum(t["pnl_pct"] for t in strat_trades)
+        s_avg_win = sum(t["pnl_pct"] for t in s_wins) / len(s_wins) if s_wins else 0
+        s_avg_loss = sum(t["pnl_pct"] for t in s_losses) / len(s_losses) if s_losses else 0
+        return [
+            f"\n{title}:",
+            f"  Сделок: {len(strat_trades)} | ✅ {len(s_wins)} ({s_win_rate:.1f}%) | ❌ {len(s_losses)} ({100 - s_win_rate:.1f}%)",
+            f"  Ср. прибыль: {s_avg_win:+.2f}% | Ср. убыток: {s_avg_loss:+.2f}%",
+            f"  Итого: {s_total_pnl:+.2f}%",
+        ]
+
     strategies = {}
     for t in period_trades:
         strat = t.get("strategy", "unknown")
@@ -1251,7 +1271,12 @@ def run_report(args: argparse.Namespace) -> None:
         f"Средняя прибыль: {avg_win:+.2f}%",
         f"Средний убыток: {avg_loss:+.2f}%",
         f"Суммарный результат: <b>{total_pnl:+.2f}%</b>",
-        f"Стратегии: {strat_line}",
+        f"━━━━━━━━━━━━━━━━━━━━━",
+        f"📈 <b>По стратегиям:</b>",
+    ]
+    header_lines += strategy_stats_block("confluence", "🎯 Confluence (тренд)")
+    header_lines += strategy_stats_block("breakout", "📦 Боковики (памп)")
+    header_lines += [
         f"━━━━━━━━━━━━━━━━━━━━━",
         f"📋 <b>Все сделки ({len(period_trades)}):</b>"
     ]
