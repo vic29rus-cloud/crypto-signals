@@ -2,9 +2,9 @@
 """
 Сканер сигналов Kraken Spot – две стратегии:
   1. Confluence (тренд 4h/1d/1w + MACD) – на топ-200 волатильных пар
-  2. Breakout из боковика (консолидация >30 дней) – на отдельном списке до 400 пар (только по ликвидности, без фильтра волатильности)
+  2. Breakout из боковика (консолидация >30 дней) – на всех доступных парах (без фильтров)
 
-Версия 4.6.3 – для боковиков убран фильтр ликвидности, чтобы гарантировать наличие дополнительных пар.
+Версия 4.6.4 – исправлено дублирование статусов, гарантированный поиск боковиков на всех парах.
 """
 
 import argparse
@@ -31,8 +31,8 @@ SCANNER_LOG_FILE = "kraken_scanner.log"
 LAST_STATUS_FILE = "last_status_time.json"
 
 WELCOME_TEXT = (
-    "✅ Вы подписались на сигналы Kraken Scanner v4.6.3\n"
-    "Основной поиск: 200 пар. Боковики: отдельный список до 400 пар (без фильтра ликвидности)."
+    "✅ Вы подписались на сигналы Kraken Scanner v4.6.4\n"
+    "Основной поиск: 200 пар. Боковики: все доступные пары (без фильтров)."
 )
 
 BASE_URL = "https://api.kraken.com/0/public"
@@ -140,7 +140,7 @@ STRATEGY_CONFIGS = {
     }
 }
 
-# ---------- Глобальные переменные (переопределяются стратегией) ----------
+# ---------- Глобальные переменные ----------
 ATR_MULT_SL = 2.0
 ATR_MULT_TP = 4.0
 BREAKEVEN_TRIGGER_ATR = 1.0
@@ -153,12 +153,15 @@ REQUIRE_SMC_BOS = True
 BREAKOUT_VOLUME_MULT = 2.0
 BREAKOUT_RANGE_DAYS = 30
 
-STATUS_INTERVAL_MINUTES = 180   # текст "через 3 ч."
-SCAN_INTERVAL_SECONDS = 14400   # для VPS
+STATUS_INTERVAL_MINUTES = 180
+SCAN_INTERVAL_SECONDS = 14400
 
 CONSOLIDATION_DAYS_MIN = 30
 CONSOLIDATION_RANGE_PCT = 15.0
 CONSOLIDATION_ADX_THRESHOLD = 20
+
+# ---------- Защита от дублирования статусов ----------
+_STATUS_SENT = False
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 
@@ -193,14 +196,12 @@ def get_strategy_config(strategy_name: str) -> Dict[str, Any]:
     BREAKOUT_RANGE_DAYS = config["breakout_range_days"]
     return config
 
-# ==================== ПОЛУЧЕНИЕ СПИСКА ПАР ====================
+# ==================== ПОЛУЧЕНИЕ СПИСКОВ ПАР ====================
 
-def get_candidates(quote_coin: str, max_candidates: int = 1000,
-                   apply_volatility_filter: bool = True,
-                   apply_turnover_filter: bool = True) -> List[str]:
+def get_volatile_candidates(quote_coin: str, max_candidates: int = 1000) -> List[str]:
     """
-    Возвращает список пар, отфильтрованных по ликвидности (опционально) и волатильности (опционально).
-    Сортировка всегда по волатильности (убывание).
+    Возвращает список пар, отфильтрованных по ликвидности и волатильности, отсортированных по волатильности.
+    Используется для основного поиска Confluence.
     """
     try:
         pairs_resp = requests.get(f"{BASE_URL}/AssetPairs", timeout=20)
@@ -255,10 +256,10 @@ def get_candidates(quote_coin: str, max_candidates: int = 1000,
                 vwap_24h = safe_float(t.get("p", [0,0])[1])
                 vol_24h = safe_float(t.get("v", [0,0])[1])
                 turnover = vwap_24h * vol_24h
-                if apply_turnover_filter and (turnover < MIN_TURNOVER_USD or low_24h <= 0):
+                if turnover < MIN_TURNOVER_USD or low_24h <= 0:
                     continue
                 volatility_pct = (high_24h - low_24h) / low_24h * 100
-                if apply_volatility_filter and volatility_pct < MIN_VOLATILITY_PCT:
+                if volatility_pct < MIN_VOLATILITY_PCT:
                     continue
                 scored.append((pair_name, volatility_pct, turnover))
             except (KeyError, ValueError, TypeError, ZeroDivisionError):
@@ -267,8 +268,43 @@ def get_candidates(quote_coin: str, max_candidates: int = 1000,
 
     scored.sort(key=lambda x: x[1], reverse=True)
     result = [s[0] for s in scored[:max_candidates]]
-    logger.info(f"Отобрано {len(result)} пар (фильтр волатильности: {apply_volatility_filter}, фильтр ликвидности: {apply_turnover_filter})")
+    logger.info(f"Отобрано {len(result)} волатильных пар (фильтры: ликвидность ≥{MIN_TURNOVER_USD}, волатильность ≥{MIN_VOLATILITY_PCT}%)")
     return result
+
+def get_all_pairs(quote_coin: str, max_candidates: int = 2000) -> List[str]:
+    """
+    Возвращает ВСЕ пары (без фильтров по ликвидности и волатильности), кроме стейблкоинов и производных.
+    Используется для поиска боковиков.
+    """
+    try:
+        pairs_resp = requests.get(f"{BASE_URL}/AssetPairs", timeout=20)
+        pairs_resp.raise_for_status()
+        pairs_data = pairs_resp.json()
+        if pairs_data.get("error"):
+            logger.error(f"Kraken API error: {pairs_data['error']}")
+            return []
+        all_pairs = pairs_data.get("result", {})
+        logger.info(f"Получено {len(all_pairs)} пар от Kraken")
+    except Exception as e:
+        logger.error(f"Ошибка получения списка пар: {e}")
+        return []
+
+    result = []
+    for kraken_name, info in all_pairs.items():
+        wsname = info.get("wsname", "")
+        if "/" not in wsname:
+            continue
+        base, quote = wsname.split("/")
+        if quote != quote_coin:
+            continue
+        if any(x in base for x in EXCLUDE_BASE_SUBSTRINGS):
+            continue
+        if base in STABLECOINS:
+            continue
+        result.append(kraken_name)
+
+    logger.info(f"Всего доступных пар (без фильтров): {len(result)}")
+    return result[:max_candidates]
 
 # ==================== ЗАПРОС ДАННЫХ ====================
 
@@ -806,18 +842,27 @@ def should_send_status() -> bool:
         pass
     return True
 
-# ==================== ОТПРАВКА СТАТУСА ====================
+# ==================== ОТПРАВКА СТАТУСА (С ЗАЩИТОЙ ОТ ДУБЛЕЙ) ====================
+
+_STATUS_SENT = False
 
 def send_status_message(scan_summary: list, pairs_count: int, open_positions: int,
                         found_buy: int, found_sell: int, consolidation_list: list,
-                        open_positions_list: list) -> None:
+                        open_positions_list: list, extra_pairs_count: int) -> None:
+    global _STATUS_SENT
+    if _STATUS_SENT:
+        logger.debug("Статус уже отправлен в этом запуске, пропускаем дубль.")
+        return
+    _STATUS_SENT = True
+
     now_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
     lines = [
         f"📡 <b>Статус сканирования</b> — {now_str}",
         f"━━━━━━━━━━━━━━━━━━━━━",
         f"📊 <b>Общая статистика:</b>",
         f"• Отслеживается пар (Confluence): {pairs_count}",
-        f"• Проверено на боковик (всего): {len(consolidation_list)} (включая дополнительные)",
+        f"• Дополнительно проверено на боковик: {extra_pairs_count}",
+        f"• Всего в боковике найдено: {len(consolidation_list)}",
         f"• Открытых позиций: {open_positions}",
         f"• Входов за цикл: {found_buy}",
         f"• Выходов за цикл: {found_sell}",
@@ -876,14 +921,16 @@ def send_status_message(scan_summary: list, pairs_count: int, open_positions: in
         lines.append("🔄 Статус при каждом запуске.")
     send_telegram("\n".join(lines))
 
-# ==================== РЕЖИМ SCAN (ОСНОВНОЙ) ====================
+# ==================== РЕЖИМ SCAN ====================
 
 def run_scan(args: argparse.Namespace) -> None:
+    global _STATUS_SENT
+    _STATUS_SENT = False  # сбрасываем флаг при новом сканировании
+
     config = get_strategy_config(args.strategy)
     logger.info(f"Стратегия: {config['name']} — {config['description']}")
 
     state = load_json(STATE_FILE, {})
-    # Миграция старых позиций
     for pair, pos in state.items():
         if pos.get("position") == "open":
             if "strategy" not in pos:
@@ -899,31 +946,22 @@ def run_scan(args: argparse.Namespace) -> None:
     if not os.path.exists(STATE_FILE):
         save_json(STATE_FILE, {})
 
-    # 1. Основной список (Confluence) – с фильтрами
-    volatile_candidates = get_candidates(args.quote_coin, max_candidates=1000,
-                                         apply_volatility_filter=True,
-                                         apply_turnover_filter=True)
-    logger.info(f"Всего кандидатов (по волатильности + ликвидности): {len(volatile_candidates)}")
-
+    # 1. Основной список (Confluence) – фильтры по ликвидности и волатильности
+    volatile_pairs = get_volatile_candidates(args.quote_coin, max_candidates=1000)
     top_n = config["top_n"]
-    pairs = volatile_candidates[:top_n]
+    pairs = volatile_pairs[:top_n]
     logger.info(f"Основной список (Confluence): {len(pairs)} пар")
 
-    # 2. Дополнительный список для боковиков – без фильтра ликвидности, только волатильность (можно и без волатильности, но оставим)
-    # Мы хотим получить максимум пар, поэтому отключаем оба фильтра (или только ликвидность)
-    liquidity_candidates = get_candidates(args.quote_coin, max_candidates=2000,
-                                          apply_volatility_filter=False,   # не фильтруем по волатильности
-                                          apply_turnover_filter=False)     # не фильтруем по ликвидности
-    logger.info(f"Всего кандидатов (без фильтров): {len(liquidity_candidates)}")
-
+    # 2. Все пары для боковиков (без фильтров)
+    all_pairs = get_all_pairs(args.quote_coin, max_candidates=2000)
     # Исключаем уже взятые в основной список
-    additional = [p for p in liquidity_candidates if p not in pairs]
+    extra_pairs = [p for p in all_pairs if p not in pairs]
     cons_top_n = config.get("consolidation_top_n", 400)
-    consolidation_extra = additional[:cons_top_n]
-    logger.info(f"Дополнительные пары для боковиков: {len(consolidation_extra)} пар")
+    consolidation_extra = extra_pairs[:cons_top_n]
+    logger.info(f"Дополнительные пары для боковиков: {len(consolidation_extra)}")
 
     if not pairs:
-        logger.warning("Не найдено подходящих пар!")
+        logger.warning("Не найдено подходящих пар для основного списка!")
         return
 
     found_buy, found_sell = 0, 0
@@ -931,7 +969,7 @@ def run_scan(args: argparse.Namespace) -> None:
     scan_summary = []
     consolidation_list = []
 
-    # ---------- 1. Обработка основного списка (Confluence + боковик) ----------
+    # ---------- 1. Обработка основного списка ----------
     for pair in pairs:
         results = {}
         df_cache = {}
@@ -1113,7 +1151,7 @@ def run_scan(args: argparse.Namespace) -> None:
                     save_json(STATE_FILE, state)
                     continue
 
-    # ---------- 2. Дополнительный проход по парам только для боковиков ----------
+    # ---------- 2. Дополнительный проход по парам для боковиков ----------
     for pair in consolidation_extra:
         try:
             daily_params = TIMEFRAME_PARAMS["1d"]
@@ -1159,7 +1197,7 @@ def run_scan(args: argparse.Namespace) -> None:
 
     if should_send_status():
         send_status_message(scan_summary, len(pairs), open_positions, found_buy, found_sell,
-                            consolidation_list, open_positions_list)
+                            consolidation_list, open_positions_list, len(consolidation_extra))
     else:
         logger.info(f"Статусное сообщение пропущено (интервал {STATUS_INTERVAL_MINUTES} мин)")
 
@@ -1240,10 +1278,10 @@ def run_report(args: argparse.Namespace) -> None:
         if chunk:
             send_telegram("\n".join(chunk))
 
-# ==================== НЕПРЕРЫВНЫЙ РЕЖИМ (не используется в GitHub Actions) ====================
+# ==================== НЕПРЕРЫВНЫЙ РЕЖИМ ====================
 
 def run_forever():
-    logger.info("🚀 Запуск сканера в НЕПРЕРЫВНОМ режиме (v4.6.3)...")
+    logger.info("🚀 Запуск сканера в НЕПРЕРЫВНОМ режиме (v4.6.4)...")
     logger.info(f"⏱️ Интервал между сканированиями: {SCAN_INTERVAL_SECONDS // 3600} час(ов)")
     logger.info(f"📊 Статус будет отправляться не чаще {STATUS_INTERVAL_MINUTES // 60} час(ов)")
 
@@ -1272,7 +1310,7 @@ def run_forever():
 # ==================== MAIN ====================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Kraken Signal Scanner v4.6.3 – гарантированные боковики (без фильтра ликвидности)")
+    parser = argparse.ArgumentParser(description="Kraken Signal Scanner v4.6.4 – исправление дублей и поиск боковиков на всех парах")
     parser.add_argument("--mode", choices=["scan", "report"], default=None,
                         help="Режим работы (если не указан – непрерывный режим)")
     parser.add_argument("--period", choices=["3d", "month"], default="3d", help="Период отчёта")
