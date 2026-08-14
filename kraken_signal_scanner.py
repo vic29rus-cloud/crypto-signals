@@ -472,7 +472,7 @@ def check_consolidation(df_daily: pd.DataFrame) -> Optional[int]:
     for i in range(len(df)-1, max(0, len(df)-90), -1):
         window = df.iloc[i:]
         if len(window) < CONSOLIDATION_DAYS_MIN:
-            break
+            continue  # окно ещё не доросло до минимума — растим дальше, а не обрываем цикл
 
         if (window["adx"] >= CONSOLIDATION_ADX_THRESHOLD).any():
             break
