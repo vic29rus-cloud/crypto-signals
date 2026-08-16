@@ -825,7 +825,14 @@ def log_trade(symbol: str, entry_price: float, exit_price: float,
     save_json(TRADES_LOG_FILE, trades)
     return pnl_pct
 
-def should_send_status() -> bool:
+def should_send_status(force: bool = False) -> bool:
+    if force:
+        try:
+            with open(LAST_STATUS_FILE, "w") as f:
+                json.dump({"last_status_time": datetime.now(timezone.utc).isoformat()}, f)
+        except Exception:
+            pass
+        return True
     if STATUS_INTERVAL_MINUTES <= 0:
         return True
     try:
@@ -1207,7 +1214,7 @@ def run_scan(args: argparse.Namespace) -> None:
                 "strategy": pos.get("strategy", "unknown")
             })
 
-    if should_send_status():
+    if should_send_status(force=getattr(args, "force_status", False)):
         send_status_message(scan_summary, len(pairs), open_positions, found_buy, found_sell,
                             consolidation_list, open_positions_list, len(consolidation_extra))
     else:
@@ -1354,6 +1361,8 @@ def main() -> None:
     parser.add_argument("--request-delay", type=float, default=0.3, help="Задержка между запросами (сек)")
     parser.add_argument("--strategy", choices=["aggressive", "balanced", "conservative"],
                         default="balanced", help="Стратегия сканирования")
+    parser.add_argument("--force-status", action="store_true",
+                        help="Отправить статус сразу, игнорируя троттлинг (для ручных запусков)")
     args = parser.parse_args()
 
     if args.mode is None:
