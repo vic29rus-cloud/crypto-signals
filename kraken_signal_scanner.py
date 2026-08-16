@@ -153,7 +153,7 @@ REQUIRE_SMC_BOS = True
 BREAKOUT_VOLUME_MULT = 2.0
 BREAKOUT_RANGE_DAYS = 30
 
-STATUS_INTERVAL_MINUTES = 180
+STATUS_INTERVAL_MINUTES = 150  # 2.5ч вместо 3 — запас на возможные задержки GitHub Actions
 SCAN_INTERVAL_SECONDS = 14400
 
 CONSOLIDATION_DAYS_MIN = 30
@@ -550,6 +550,8 @@ def analyze_timeframe(df: pd.DataFrame, params: Dict[str, Any]) -> Optional[Dict
         "bar_time": str(safe_int(last["start"])),
         "ema_fast": float(last["ema_fast"]),
         "ema_slow": float(last["ema_slow"]),
+        "macd_line": float(last["macd_line"]),
+        "macd_signal": float(last["macd_signal"]),
     }
 
 # ==================== ЛОГИКА ВХОДА (Confluence) ====================
@@ -906,17 +908,27 @@ def send_status_message(scan_summary: list, pairs_count: int, open_positions: in
     else:
         lines.append(f"\n💰 <b>Открытых позиций нет.</b>")
 
+    # Кандидаты = тренд совпал на 2+ ТФ. Сортируем по БЛИЗОСТИ MACD к пересечению
+    # (macd_gap_pct ближе к 0 снизу = вот-вот будет свежий кросс), а не по силе тренда —
+    # иначе монеты со старым, давно случившимся кроссом "зависают" в списке навсегда,
+    # хотя новый вход по ним маловероятен в ближайшее время.
     close_calls = [s for s in scan_summary if s["trend_score"] >= 2]
-    close_calls.sort(key=lambda s: (s["trend_score"], s["adx_1d"]), reverse=True)
+    close_calls.sort(key=lambda s: abs(s.get("macd_gap_pct", 999)))
 
     if close_calls:
         lines.append(f"\n🎯 <b>Топ кандидатов на вход (Confluence):</b>")
         for i, s in enumerate(close_calls[:3], 1):
-            strength = "🟢 Strong" if s["trend_score"] == 3 else "🟡 Moderate" if s["adx_1d"] > 20 else "🔴 Weak"
+            gap = s.get("macd_gap_pct", 0)
+            if gap < 0:
+                proximity = "⏳ Близко к кроссу (ждём)"
+            elif gap < 0.5:
+                proximity = "🟡 Кросс недавно, ещё актуально"
+            else:
+                proximity = "⚠️ Кросс был давно, вход маловероятен скоро"
             lines.append(
                 f"{i}. <b>{s['pair']}</b>\n"
                 f"   Тренд: {s['trend_score']}/3 | ADX: {s['adx_1d']:.0f} | RSI(4h): {s['rsi_4h']:.0f}\n"
-                f"   Сила: {strength}"
+                f"   {proximity}"
             )
     else:
         lines.append(f"\n😴 <b>Кандидатов на вход (Confluence) нет</b>")
@@ -924,12 +936,10 @@ def send_status_message(scan_summary: list, pairs_count: int, open_positions: in
     if consolidation_list:
         lines.append(f"\n📦 <b>Монеты в длительном боковике (> {CONSOLIDATION_DAYS_MIN} дней):</b>")
         consolidation_list.sort(key=lambda x: x["days"], reverse=True)
-        for i, item in enumerate(consolidation_list[:5], 1):
+        for i, item in enumerate(consolidation_list, 1):
             lines.append(
                 f"{i}. <b>{item['pair']}</b> – {item['days']} дн. | Диапазон: {item['range_pct']:.1f}% | ADX: {item['adx']:.0f}"
             )
-        if len(consolidation_list) > 5:
-            lines.append(f"   ... и ещё {len(consolidation_list)-5} монет в боковике")
     else:
         lines.append(f"\n📦 <b>Монет в длительном боковике не найдено.</b>")
 
@@ -1026,11 +1036,17 @@ def run_scan(args: argparse.Namespace) -> None:
 
         if all(results.get(tf) is not None for tf in TIMEFRAME_ORDER):
             trend_score = sum(1 for tf in TIMEFRAME_ORDER if results[tf]["trend_up"])
+            r4h = results["4h"]
+            # Насколько MACD близок к пересечению сигнальной линии на 4h (в % от цены).
+            # Отрицательное значение = MACD ещё НИЖЕ сигнальной линии, ждём кросса вверх (это и нужно).
+            # Положительное и большое = кросс был давно, тренд уже "старый", новый вход маловероятен скоро.
+            macd_gap_pct = (r4h["macd_line"] - r4h["macd_signal"]) / r4h["close"] * 100 if r4h["close"] else 0.0
             scan_summary.append({
                 "pair": pair,
                 "trend_score": trend_score,
-                "rsi_4h": results["4h"]["rsi"],
+                "rsi_4h": r4h["rsi"],
                 "adx_1d": results["1d"]["adx"],
+                "macd_gap_pct": macd_gap_pct,
             })
 
         pos = state.get(pair, {"position": "closed"})
