@@ -22,10 +22,6 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: kraken-scanner
-  cancel-in-progress: false
-
 jobs:
   scan:
     if: github.event.schedule == '5 */3 * * *' || github.event.inputs.mode == 'scan'
@@ -40,7 +36,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python kraken_signal_scanner.py --mode scan
+        run: python kraken_signal_scanner.py --mode scan ${{ github.event_name == 'workflow_dispatch' && '--force-status' || '' }}
       - name: Сохранить состояние
         run: |
           git config user.name "signal-bot"
