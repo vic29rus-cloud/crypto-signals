@@ -928,9 +928,11 @@ def send_status_message(scan_summary: list, pairs_count: int, open_positions: in
                 proximity = "🟡 Кросс недавно, ещё актуально"
             else:
                 proximity = "⚠️ Кросс был давно, вход маловероятен скоро"
+            close_price = s.get("close_price", 0)
             lines.append(
                 f"{i}. <b>{s['pair']}</b>\n"
                 f"   Тренд: {s['trend_score']}/3 | ADX: {s['adx_1d']:.0f} | RSI(4h): {s['rsi_4h']:.0f}\n"
+                f"   Ориентир входа (тек. цена): ~{close_price:.6g}\n"
                 f"   {proximity}"
             )
     else:
@@ -940,8 +942,10 @@ def send_status_message(scan_summary: list, pairs_count: int, open_positions: in
         lines.append(f"\n📦 <b>Монеты в длительном боковике (> {CONSOLIDATION_DAYS_MIN} дней):</b>")
         consolidation_list.sort(key=lambda x: x["days"], reverse=True)
         for i, item in enumerate(consolidation_list, 1):
+            level = item.get("breakout_level", 0)
+            level_str = f" | Пробой выше: {level:.6g}" if level else ""
             lines.append(
-                f"{i}. <b>{item['pair']}</b> – {item['days']} дн. | Диапазон: {item['range_pct']:.1f}% | ADX: {item['adx']:.0f}"
+                f"{i}. <b>{item['pair']}</b> – {item['days']} дн. | Диапазон: {item['range_pct']:.1f}% | ADX: {item['adx']:.0f}{level_str}"
             )
     else:
         lines.append(f"\n📦 <b>Монет в длительном боковике не найдено.</b>")
@@ -1030,7 +1034,8 @@ def run_scan(args: argparse.Namespace) -> None:
                         "pair": pair,
                         "days": cons_days,
                         "range_pct": range_pct,
-                        "adx": adx_val
+                        "adx": adx_val,
+                        "breakout_level": float(high) if len(df_daily) >= 30 else 0.0,
                     })
 
         except Exception as e:
@@ -1050,6 +1055,7 @@ def run_scan(args: argparse.Namespace) -> None:
                 "rsi_4h": r4h["rsi"],
                 "adx_1d": results["1d"]["adx"],
                 "macd_gap_pct": macd_gap_pct,
+                "close_price": r4h["close"],
             })
 
         pos = state.get(pair, {"position": "closed"})
@@ -1114,6 +1120,10 @@ def run_scan(args: argparse.Namespace) -> None:
                     df15 = pd.DataFrame()
 
             ok_conf, reason_conf, trigger_conf = check_confluence_entry(results, entry_results, config, df15)
+
+            if not ok_conf and trend_all_up:
+                # Тренд совпал на всех ТФ, но что-то ещё блокирует вход — логируем, чтобы было видно, что именно
+                logger.info(f"[{pair}] тренд совпал, но вход отклонён: {reason_conf}")
 
             if ok_conf and trigger_conf is not None:
                 close = trigger_conf["close"]
@@ -1209,7 +1219,8 @@ def run_scan(args: argparse.Namespace) -> None:
                     "pair": pair,
                     "days": cons_days,
                     "range_pct": range_pct,
-                    "adx": adx_val
+                    "adx": adx_val,
+                    "breakout_level": float(high) if not df_daily.empty and len(df_daily) >= 30 else 0.0,
                 })
             time.sleep(args.request_delay)
         except Exception as e:
