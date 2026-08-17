@@ -27,6 +27,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SUBSCRIBERS_FILE = "telegram_subscribers.json"
 STATE_FILE = "kraken_scanner_state.json"
 TRADES_LOG_FILE = "trades_log.json"
+SCAN_STATS_FILE = "scan_stats.json"
 SCANNER_LOG_FILE = "kraken_scanner.log"
 LAST_STATUS_FILE = "last_status_time.json"
 
@@ -610,7 +611,9 @@ def check_confluence_entry(results: Dict[str, Any], entry_results: Dict[str, Any
         return False, "Нет поддержки Фибоначчи", None
 
     rr = calculate_rr_ratio(results, best_trigger)
-    if rr < config["min_rr_ratio"]:
+    # ATR_MULT_TP/ATR_MULT_SL математически равно min_rr_ratio во многих конфигурациях (напр. 4.0/2.0=2.0) —
+    # без допуска на погрешность округления с плавающей точкой (1e-6) почти каждая сделка отбраковывалась.
+    if rr < config["min_rr_ratio"] - 1e-6:
         return False, f"RR < минимального ({rr:.2f})", None
 
     return True, f"✅ Confluence (TF: {best_trigger['tf']})", best_trigger
@@ -641,7 +644,7 @@ def check_breakout_entry(results: Dict[str, Any], df_daily: pd.DataFrame,
     if risk <= 0:
         return False, "Риск = 0", None
     rr = reward / risk
-    if rr < config["min_rr_ratio"]:
+    if rr < config["min_rr_ratio"] - 1e-6:
         return False, f"RR {rr:.2f} < {config['min_rr_ratio']}", None
 
     trigger = {
@@ -1217,6 +1220,18 @@ def run_scan(args: argparse.Namespace) -> None:
     save_json(STATE_FILE, state)
     logger.info(f"Готово. Новых входов: {found_buy}, выходов: {found_sell}")
 
+    # Копим статистику каждого запуска — отчёт потом суммирует её за период
+    scan_stats = load_json(SCAN_STATS_FILE, [])
+    scan_stats.append({
+        "time": datetime.now(timezone.utc).isoformat(),
+        "pairs_confluence": len(pairs),
+        "pairs_breakout": len(consolidation_extra),
+        "entries": found_buy,
+        "exits": found_sell,
+    })
+    scan_stats = scan_stats[-500:]  # не даём файлу расти бесконечно
+    save_json(SCAN_STATS_FILE, scan_stats)
+
     open_positions = sum(1 for p in state.values() if p.get("position") == "open")
     open_positions_list = []
     for pair, pos in state.items():
@@ -1243,13 +1258,49 @@ def run_report(args: argparse.Namespace) -> None:
     if not os.path.exists(TRADES_LOG_FILE):
         save_json(TRADES_LOG_FILE, [])
     trades = load_json(TRADES_LOG_FILE, [])
+    scan_stats = load_json(SCAN_STATS_FILE, [])
+    state = load_json(STATE_FILE, {})
 
     days = 3 if args.period == "3d" else 30
     since = datetime.now(timezone.utc) - timedelta(days=days)
+    period_label = "3 дня" if args.period == "3d" else "30 дней"
+
     period_trades = [t for t in trades if datetime.fromisoformat(t["exit_time"]) >= since]
 
+    # --- Диагностика: сколько раз сканировали и сколько пар проверяли за период ---
+    period_scans = [s for s in scan_stats if datetime.fromisoformat(s["time"]) >= since]
+    scans_count = len(period_scans)
+    total_entries = sum(s.get("entries", 0) for s in period_scans)
+    total_exits = sum(s.get("exits", 0) for s in period_scans)
+    avg_confluence_pairs = (sum(s.get("pairs_confluence", 0) for s in period_scans) / scans_count) if scans_count else 0
+    avg_breakout_pairs = (sum(s.get("pairs_breakout", 0) for s in period_scans) / scans_count) if scans_count else 0
+
+    header_lines = [
+        f"📊 <b>Отчёт за {period_label}</b>",
+        f"━━━━━━━━━━━━━━━━━━━━━",
+        f"🔍 <b>Диагностика сканирования:</b>",
+        f"  Запусков сканера: {scans_count}",
+        f"  В среднем пар (confluence): {avg_confluence_pairs:.0f}",
+        f"  В среднем пар (боковик): {avg_breakout_pairs:.0f}",
+        f"  Входов за период: {total_entries}",
+        f"  Выходов за период: {total_exits}",
+    ]
+
+    # --- Открытые позиции ПРЯМО СЕЙЧАС, на момент отчёта ---
+    open_now = [(pair, pos) for pair, pos in state.items() if pos.get("position") == "open"]
+    header_lines.append(f"━━━━━━━━━━━━━━━━━━━━━")
+    header_lines.append(f"💼 <b>Открыто сейчас: {len(open_now)}</b>")
+    if open_now:
+        for pair, pos in open_now:
+            entry_time = str(pos.get("entry_time", "?")).replace("T", " ")[:16]
+            header_lines.append(
+                f"  • <b>{pair}</b> ({pos.get('strategy', 'unknown')}) | вход {pos.get('entry_price', 0):.6g} | {entry_time}"
+            )
+
     if not period_trades:
-        text = f"📊 <b>Отчёт за {'3 дня' if args.period == '3d' else '30 дней'}</b>\nЗакрытых сделок не было."
+        header_lines.append(f"━━━━━━━━━━━━━━━━━━━━━")
+        header_lines.append("Закрытых сделок за период не было.")
+        text = "\n".join(header_lines)
         send_telegram(text)
         print(text)
         return
@@ -1279,16 +1330,9 @@ def run_report(args: argparse.Namespace) -> None:
             f"  Итого: {s_total_pnl:+.2f}%",
         ]
 
-    strategies = {}
-    for t in period_trades:
-        strat = t.get("strategy", "unknown")
-        strategies[strat] = strategies.get(strat, 0) + 1
-    strat_line = " | ".join([f"{k}: {v}" for k, v in strategies.items()]) if strategies else "—"
-
-    header_lines = [
-        f"📊 <b>Отчёт за {'3 дня' if args.period == '3d' else '30 дней'}</b>",
+    header_lines += [
         f"━━━━━━━━━━━━━━━━━━━━━",
-        f"Всего сделок: {len(period_trades)}",
+        f"Всего закрытых сделок: {len(period_trades)}",
         f"✅ Прибыльных: {len(wins)} ({win_rate:.1f}%)",
         f"❌ Убыточных: {len(losses)} ({100 - win_rate:.1f}%)",
         f"Средняя прибыль: {avg_win:+.2f}%",
@@ -1301,7 +1345,7 @@ def run_report(args: argparse.Namespace) -> None:
     header_lines += strategy_stats_block("breakout", "📦 Боковики (памп)")
     header_lines += [
         f"━━━━━━━━━━━━━━━━━━━━━",
-        f"📋 <b>Все сделки ({len(period_trades)}):</b>"
+        f"📋 <b>Все закрытые сделки ({len(period_trades)}):</b>"
     ]
     header_text = "\n".join(header_lines)
 
@@ -1348,7 +1392,7 @@ def run_forever():
         period="3d",
         top_n=200,
         quote_coin="USD",
-        request_delay=0.3,
+        request_delay=0.5,
         strategy="balanced"
     )
 
@@ -1374,7 +1418,7 @@ def main() -> None:
     parser.add_argument("--period", choices=["3d", "month"], default="3d", help="Период отчёта")
     parser.add_argument("--top-n", type=int, default=200, help="Количество пар для основного поиска")
     parser.add_argument("--quote-coin", default="USD", help="Базовая валюта")
-    parser.add_argument("--request-delay", type=float, default=0.3, help="Задержка между запросами (сек)")
+    parser.add_argument("--request-delay", type=float, default=0.5, help="Задержка между запросами (сек)")
     parser.add_argument("--strategy", choices=["aggressive", "balanced", "conservative"],
                         default="balanced", help="Стратегия сканирования")
     parser.add_argument("--force-status", action="store_true",
