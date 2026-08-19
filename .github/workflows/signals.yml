@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Режим для ручного теста (scan / report)'
+        description: 'Режим для ручного теста (scan / trigger / report)'
         required: false
         default: 'scan'
       period:
@@ -12,8 +12,10 @@ on:
         required: false
         default: '3d'
   schedule:
-    # Сканирование входов/выходов каждые 3 часа
+    # Полный скан (тренд 4h/1d/1w по всем парам + боковики) — раз в 3 часа
     - cron: '5 */3 * * *'
+    # Быстрая проверка триггера входа/выхода — каждые 15 минут
+    - cron: '*/15 * * * *'
     # Отчёт каждые 3 дня в 09:00 UTC
     - cron: '0 9 */3 * *'
     # Отчёт раз в месяц, 1 числа в 09:30 UTC
@@ -32,7 +34,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install requests pandas numpy
-      - name: Сканировать волатильные пары (confluence + боковики)
+      - name: Полный скан (confluence + боковики, обновление тренд-контекста)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -41,8 +43,32 @@ jobs:
         run: |
           git config user.name "signal-bot"
           git config user.email "signal-bot@users.noreply.github.com"
-          git add kraken_scanner_state.json telegram_subscribers.json trades_log.json last_status_time.json scan_stats.json
-          git diff --staged --quiet || git commit -m "chore: update scanner state"
+          git add kraken_scanner_state.json telegram_subscribers.json trades_log.json last_status_time.json scan_stats.json qualified_pairs.json
+          git diff --staged --quiet || git commit -m "chore: update scanner state (full scan)"
+          git pull --rebase --autostash || true
+          git push || true
+
+  trigger:
+    if: github.event.schedule == '*/15 * * * *' || github.event.inputs.mode == 'trigger'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install requests pandas numpy
+      - name: Быстрая проверка триггера (только квалифицированные пары + открытые позиции)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python kraken_signal_scanner.py --mode trigger
+      - name: Сохранить состояние
+        run: |
+          git config user.name "signal-bot"
+          git config user.email "signal-bot@users.noreply.github.com"
+          git add kraken_scanner_state.json telegram_subscribers.json trades_log.json scan_stats.json
+          git diff --staged --quiet || git commit -m "chore: update scanner state (trigger)"
+          git pull --rebase --autostash || true
           git push || true
 
   report-3d:
@@ -65,6 +91,7 @@ jobs:
           git config user.email "signal-bot@users.noreply.github.com"
           git add telegram_subscribers.json
           git diff --staged --quiet || git commit -m "chore: update subscribers (3d report)"
+          git pull --rebase --autostash || true
           git push || true
 
   report-monthly:
@@ -87,4 +114,5 @@ jobs:
           git config user.email "signal-bot@users.noreply.github.com"
           git add telegram_subscribers.json
           git diff --staged --quiet || git commit -m "chore: update subscribers (monthly report)"
+          git pull --rebase --autostash || true
           git push || true
