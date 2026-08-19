@@ -28,6 +28,7 @@ SUBSCRIBERS_FILE = "telegram_subscribers.json"
 STATE_FILE = "kraken_scanner_state.json"
 TRADES_LOG_FILE = "trades_log.json"
 SCAN_STATS_FILE = "scan_stats.json"
+QUALIFIED_PAIRS_FILE = "qualified_pairs.json"  # пары, где тренд уже совпал — для быстрой 15-мин проверки
 SCANNER_LOG_FILE = "kraken_scanner.log"
 LAST_STATUS_FILE = "last_status_time.json"
 
@@ -1243,6 +1244,13 @@ def run_scan(args: argparse.Namespace) -> None:
     scan_stats = scan_stats[-500:]  # не даём файлу расти бесконечно
     save_json(SCAN_STATS_FILE, scan_stats)
 
+    # Пары, где тренд СОВПАЛ на всех 3 ТФ — только их будет проверять быстрый 15-минутный job.
+    # Это и есть ключевая оптимизация: полный тяжёлый скан не нужен каждые 15 минут,
+    # а лёгкая проверка (15m + вход) по маленькому подсписку — безопасна по нагрузке на Kraken.
+    qualified = [s["pair"] for s in scan_summary if s.get("trend_score") == 3]
+    save_json(QUALIFIED_PAIRS_FILE, {"time": datetime.now(timezone.utc).isoformat(), "pairs": qualified})
+    logger.info(f"Квалифицированных пар (тренд 3/3) для быстрой проверки: {len(qualified)}")
+
     open_positions = sum(1 for p in state.values() if p.get("position") == "open")
     open_positions_list = []
     for pair, pos in state.items():
@@ -1261,6 +1269,146 @@ def run_scan(args: argparse.Namespace) -> None:
                             consolidation_list, open_positions_list, len(consolidation_extra))
     else:
         logger.info(f"Статусное сообщение пропущено (интервал {STATUS_INTERVAL_MINUTES} мин)")
+
+# ==================== РЕЖИМ TRIGGER (быстрая проверка каждые 15 минут) ====================
+
+def run_trigger(args: argparse.Namespace) -> None:
+    """
+    Лёгкая проверка входа/выхода каждые 15 минут — БЕЗ полного пересканирования 600 пар.
+    Использует список "квалифицированных" пар (тренд 3/3), сохранённый последним полным
+    сканом (--mode scan), и проверяет только их + уже открытые позиции.
+    Полный тренд-контекст (4h/1d/1w) обновляется здесь же, свежо, но только для этого
+    маленького подсписка — поэтому нагрузка на Kraken остаётся безопасной.
+    """
+    config = get_strategy_config(args.strategy)
+    poll_new_subscribers()
+
+    state = load_json(STATE_FILE, {})
+    qualified_data = load_json(QUALIFIED_PAIRS_FILE, {"time": None, "pairs": []})
+    qualified_pairs = qualified_data.get("pairs", [])
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    found_buy, found_sell = 0, 0
+
+    # --- 1. Проверяем ВЫХОДЫ по уже открытым позициям (их обычно немного — дёшево) ---
+    open_pairs = [pair for pair, pos in state.items() if pos.get("position") == "open"]
+    for pair in open_pairs:
+        pos = state[pair]
+        try:
+            results = {}
+            for tf in TIMEFRAME_ORDER:
+                params = TIMEFRAME_PARAMS[tf]
+                fetch_min_bars = params["min_bars"] + (60 if tf == "1d" else 5)
+                df = fetch_klines(pair, params["kraken_interval"], fetch_min_bars)
+                results[tf] = analyze_timeframe(df, params)
+                time.sleep(args.request_delay)
+        except Exception as e:
+            logger.error(f"[{pair}] ошибка получения данных (trigger, выход): {e}")
+            continue
+
+        if results.get(TRIGGER_TF) is None or results.get("1d") is None:
+            continue
+
+        moved = maybe_move_to_breakeven(pos, results[TRIGGER_TF]["close"])
+        if moved:
+            send_telegram(f"🔒 <b>Стоп переведён в безубыток</b>\nПара: <b>{pair}</b>\nНовый стоп: {pos['stop']:.6g}")
+            logger.info(f"[{pair}] стоп переведён в безубыток: {pos['stop']:.6g}")
+
+        trailed = maybe_trail_stop(pos, results[TRIGGER_TF]["close"], results["1d"]["atr"])
+        if trailed:
+            logger.info(f"[{pair}] трейлинг-стоп подтянут: {pos['stop']:.6g}")
+
+        exit_now, reason = check_exit(results, pos)
+        if exit_now:
+            exit_price = results[TRIGGER_TF]["close"]
+            strategy = pos.get("strategy", "unknown")
+            pnl_pct = log_trade(pair, pos["entry_price"], exit_price, pos["entry_time"], now_iso, reason, strategy)
+            send_telegram(
+                f"🔴 <b>ВЫХОД (SELL)</b>\nПара: <b>{pair}</b>\nСтратегия: {strategy}\n"
+                f"Цена выхода: <b>{exit_price:.6g}</b>\nПричина: {reason}\nРезультат: <b>{pnl_pct:+.2f}%</b>"
+            )
+            state[pair] = {"position": "closed"}
+            found_sell += 1
+        else:
+            state[pair] = pos
+        save_json(STATE_FILE, state)
+
+    # --- 2. Проверяем ТОЧНЫЙ ТРИГГЕР входа по квалифицированным парам (тренд уже 3/3) ---
+    for pair in qualified_pairs:
+        if state.get(pair, {}).get("position") == "open":
+            continue  # уже в позиции, только что проверили выше
+
+        try:
+            results = {}
+            for tf in TIMEFRAME_ORDER:
+                params = TIMEFRAME_PARAMS[tf]
+                fetch_min_bars = params["min_bars"] + (60 if tf == "1d" else 5)
+                df = fetch_klines(pair, params["kraken_interval"], fetch_min_bars)
+                results[tf] = analyze_timeframe(df, params)
+                time.sleep(args.request_delay)
+        except Exception as e:
+            logger.error(f"[{pair}] ошибка получения данных (trigger, вход): {e}")
+            continue
+
+        if any(results.get(tf) is None for tf in TIMEFRAME_ORDER):
+            continue
+        if not all(results[tf]["trend_up"] for tf in TIMEFRAME_ORDER):
+            continue  # тренд уже мог перестать совпадать с момента полного скана — пропускаем
+
+        try:
+            entry_params = TIMEFRAME_PARAMS["15m"]
+            df15 = fetch_klines(pair, entry_params["kraken_interval"], entry_params["min_bars"] + 5)
+            entry_result = analyze_timeframe(df15, entry_params)
+            time.sleep(args.request_delay)
+        except Exception as e:
+            logger.error(f"[{pair}] ошибка получения 15m данных (trigger): {e}")
+            continue
+
+        entry_results = {"15m": entry_result}
+        ok_conf, reason_conf, trigger_conf = check_confluence_entry(results, entry_results, config, df15)
+
+        if not ok_conf and trigger_conf is None and entry_result is not None:
+            logger.info(f"[{pair}] (trigger) тренд совпал, но вход отклонён: {reason_conf}")
+            continue
+
+        if ok_conf and trigger_conf is not None:
+            close = trigger_conf["close"]
+            daily_atr = results["1d"]["atr"]
+            stop = close - daily_atr * ATR_MULT_SL
+            target = close + daily_atr * ATR_MULT_TP
+            send_telegram(
+                f"🟢 <b>ВХОД (BUY) — confluence (trigger 15мин)</b>\nПара: <b>{pair}</b>\n"
+                f"Цена входа: <b>{close:.6g}</b>\n"
+                f"RSI(15m): {trigger_conf['rsi']:.1f}  ADX(1d): {results['1d']['adx']:.1f}\n"
+                f"Smart Money BOS: {'✅ пробит swing high' if trigger_conf['bos_up'] else '—'}\n"
+                f"Stop-Loss: {stop:.6g}\nTake-Profit: {target:.6g}\nПричина: {reason_conf}"
+            )
+            state[pair] = {
+                "position": "open",
+                "entry_price": close,
+                "entry_time": now_iso,
+                "stop": stop,
+                "target": target,
+                "atr_entry": daily_atr,
+                "breakeven_moved": False,
+                "trailing_active": False,
+                "strategy": "confluence",
+            }
+            found_buy += 1
+            save_json(STATE_FILE, state)
+
+    logger.info(f"[trigger] Проверено квалифицированных пар: {len(qualified_pairs)}. Входов: {found_buy}, выходов: {found_sell}")
+
+    scan_stats = load_json(SCAN_STATS_FILE, [])
+    scan_stats.append({
+        "time": now_iso,
+        "pairs_confluence": len(qualified_pairs),
+        "pairs_breakout": 0,
+        "entries": found_buy,
+        "exits": found_sell,
+    })
+    save_json(SCAN_STATS_FILE, scan_stats[-500:])
+
 
 # ==================== РЕЖИМ REPORT ====================
 
@@ -1423,8 +1571,8 @@ def run_forever():
 # ==================== MAIN ====================
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Kraken Signal Scanner v4.6.5 – цветные сообщения, защита от дублей")
-    parser.add_argument("--mode", choices=["scan", "report"], default=None,
+    parser = argparse.ArgumentParser(description="Kraken Signal Scanner v4.7 – двухуровневое сканирование (scan + trigger)")
+    parser.add_argument("--mode", choices=["scan", "report", "trigger"], default=None,
                         help="Режим работы (если не указан – непрерывный режим)")
     parser.add_argument("--period", choices=["3d", "month"], default="3d", help="Период отчёта")
     parser.add_argument("--top-n", type=int, default=200, help="Количество пар для основного поиска")
@@ -1442,6 +1590,8 @@ def main() -> None:
         run_scan(args)
     elif args.mode == "report":
         run_report(args)
+    elif args.mode == "trigger":
+        run_trigger(args)
 
 if __name__ == "__main__":
     main()
