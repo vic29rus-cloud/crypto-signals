@@ -1,1 +1,13 @@
-{}
+{
+  "ASTERUSD": {
+    "position": "open",
+    "entry_price": 0.65818,
+    "entry_time": "2026-08-20T09:43:21.724170+00:00",
+    "stop": 0.6304542857142856,
+    "target": 0.7136314285714286,
+    "atr_entry": 0.013862857142857152,
+    "breakeven_moved": false,
+    "trailing_active": false,
+    "strategy": "breakout"
+  }
+}
