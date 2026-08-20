@@ -492,13 +492,19 @@ def check_consolidation(df_daily: pd.DataFrame) -> Optional[int]:
             return days
     return None
 
-def check_breakout(df_daily: pd.DataFrame, current_price: float, volume_mult: float) -> bool:
-    if df_daily.empty or len(df_daily) < BREAKOUT_RANGE_DAYS:
+def check_breakout(historical_df: pd.DataFrame, current_price: float, volume_mult: float,
+                    full_df: Optional[pd.DataFrame] = None) -> bool:
+    """
+    historical_df — данные БЕЗ сегодняшнего дня, по ним считаем уровень пробоя (30-дневный максимум).
+    full_df — полные данные (с сегодняшним днём), по ним проверяем объём — он должен быть свежим.
+    """
+    if historical_df.empty or len(historical_df) < BREAKOUT_RANGE_DAYS:
         return False
 
-    window = df_daily.tail(BREAKOUT_RANGE_DAYS)
+    window = historical_df.tail(BREAKOUT_RANGE_DAYS)
     high_max = window["high"].max()
-    vol_ok = analyze_volume(df_daily.tail(30), mult=volume_mult)
+    volume_source = full_df if full_df is not None and not full_df.empty else historical_df
+    vol_ok = analyze_volume(volume_source.tail(30), mult=volume_mult)
     return current_price > high_max and vol_ok
 
 # ==================== АНАЛИЗ ТАЙМФРЕЙМА ====================
@@ -623,11 +629,18 @@ def check_confluence_entry(results: Dict[str, Any], entry_results: Dict[str, Any
 
 def check_breakout_entry(results: Dict[str, Any], df_daily: pd.DataFrame,
                          current_price: float, config: Dict[str, Any]) -> Tuple[bool, str, Optional[Dict]]:
-    cons_days = check_consolidation(df_daily)
+    # КРИТИЧНО: боковик и уровень пробоя считаем по ИСТОРИЧЕСКИМ дням (до сегодня),
+    # НЕ включая текущую /последнюю свечу. Если включить сегодняшний день — то в момент
+    # реального сильного пробоя именно он взрывает ADX/диапазон и разрушает "боковик",
+    # а заодно поднимает сам уровень пробоя вслед за ценой — вход становится невозможен
+    # ровно тогда, когда он должен был случиться.
+    historical_df = df_daily.iloc[:-1] if len(df_daily) > 1 else df_daily
+
+    cons_days = check_consolidation(historical_df)
     if cons_days is None or cons_days < CONSOLIDATION_DAYS_MIN:
         return False, "Не в боковике", None
 
-    if not check_breakout(df_daily, current_price, BREAKOUT_VOLUME_MULT):
+    if not check_breakout(historical_df, current_price, BREAKOUT_VOLUME_MULT, df_daily):
         return False, "Нет пробоя или слабый объём", None
 
     rsi_val = rsi(df_daily["close"]).iloc[-1]
