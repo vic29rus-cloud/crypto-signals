@@ -1,18 +1,19 @@
 {
-  "time": "2026-08-21T19:54:28.502102+00:00",
+  "time": "2026-08-21T21:46:03.934922+00:00",
   "pairs": [
     "AVAAIUSD",
-    "DRVUSD",
-    "MUBARAKUSD",
     "XZECZUSD",
+    "DRVUSD",
+    "VELVETUSD",
+    "MUBARAKUSD",
     "ZEREBROUSD",
-    "PUMPUSD",
     "SYNUSD",
+    "PUMPUSD",
     "VVVUSD",
+    "JTOUSD",
     "METUSD",
     "XNYUSD",
     "MORPHOUSD",
-    "JTOUSD",
     "AKEUSD"
   ]
 }
