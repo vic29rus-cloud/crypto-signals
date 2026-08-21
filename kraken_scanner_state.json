@@ -34,5 +34,16 @@
     "breakeven_moved": false,
     "trailing_active": false,
     "strategy": "breakout"
+  },
+  "XLTCZUSD": {
+    "position": "open",
+    "entry_price": 51.79,
+    "entry_time": "2026-08-21T19:42:56.507330+00:00",
+    "stop": 49.15428571428571,
+    "target": 57.061428571428564,
+    "atr_entry": 1.3178571428571415,
+    "breakeven_moved": false,
+    "trailing_active": false,
+    "strategy": "breakout"
   }
 }
