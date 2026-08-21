@@ -23,5 +23,16 @@
     "breakeven_moved": true,
     "trailing_active": false,
     "strategy": "breakout"
+  },
+  "HBARUSD": {
+    "position": "open",
+    "entry_price": 0.07564,
+    "entry_time": "2026-08-21T13:03:36.612491+00:00",
+    "stop": 0.07110571428571429,
+    "target": 0.08470857142857142,
+    "atr_entry": 0.0022671428571428573,
+    "breakeven_moved": false,
+    "trailing_active": false,
+    "strategy": "breakout"
   }
 }
