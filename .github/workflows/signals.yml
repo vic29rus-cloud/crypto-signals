@@ -24,6 +24,14 @@ on:
 permissions:
   contents: write
 
+# КРИТИЧНО: scan и trigger оба читают/пишут kraken_scanner_state.json. Без этой
+# блокировки они могут выполниться одновременно и затереть данные друг друга —
+# именно так "пропадали" открытые позиции без единого сообщения о продаже.
+# Общая группа гарантирует: пока один job работает с состоянием, второй ждёт в очереди.
+concurrency:
+  group: kraken-state
+  cancel-in-progress: false
+
 jobs:
   scan:
     if: github.event.schedule == '5 */3 * * *' || github.event.inputs.mode == 'scan'
