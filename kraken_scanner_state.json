@@ -9,25 +9,9 @@
     "position": "closed"
   },
   "HBARUSD": {
-    "position": "open",
-    "entry_price": 0.07564,
-    "entry_time": "2026-08-21T13:03:36.612491+00:00",
-    "stop": 0.07919035714285715,
-    "target": 0.08470857142857142,
-    "atr_entry": 0.0022671428571428573,
-    "breakeven_moved": true,
-    "trailing_active": true,
-    "strategy": "breakout"
+    "position": "closed"
   },
   "XLTCZUSD": {
-    "position": "open",
-    "entry_price": 51.79,
-    "entry_time": "2026-08-21T19:42:56.507330+00:00",
-    "stop": 52.05285714285714,
-    "target": 57.061428571428564,
-    "atr_entry": 1.3178571428571415,
-    "breakeven_moved": true,
-    "trailing_active": true,
-    "strategy": "breakout"
+    "position": "closed"
   }
 }

@@ -31,5 +31,27 @@
     "result": "win",
     "reason": "Take-Profit",
     "strategy": "breakout"
+  },
+  {
+    "symbol": "HBARUSD",
+    "entry_price": 0.07564,
+    "exit_price": 0.07846,
+    "entry_time": "2026-08-21T13:03:36.612491+00:00",
+    "exit_time": "2026-08-22T08:00:09.090317+00:00",
+    "pnl_pct": 3.73,
+    "result": "win",
+    "reason": "\u0422\u0440\u0435\u0439\u043b\u0438\u043d\u0433-\u0441\u0442\u043e\u043f",
+    "strategy": "breakout"
+  },
+  {
+    "symbol": "XLTCZUSD",
+    "entry_price": 51.79,
+    "exit_price": 51.91,
+    "entry_time": "2026-08-21T19:42:56.507330+00:00",
+    "exit_time": "2026-08-22T08:00:09.090317+00:00",
+    "pnl_pct": 0.23,
+    "result": "win",
+    "reason": "\u0422\u0440\u0435\u0439\u043b\u0438\u043d\u0433-\u0441\u0442\u043e\u043f",
+    "strategy": "breakout"
   }
 ]
