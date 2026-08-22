@@ -9,5 +9,27 @@
     "result": "win",
     "reason": "Take-Profit",
     "strategy": "breakout"
+  },
+  {
+    "symbol": "POPCATUSD",
+    "entry_price": 0.0463,
+    "exit_price": 0.0577,
+    "entry_time": "2026-08-20T21:36:02.863571+00:00",
+    "exit_time": "2026-08-22T04:36:47.636197+00:00",
+    "pnl_pct": 24.62,
+    "result": "win",
+    "reason": "Take-Profit",
+    "strategy": "breakout"
+  },
+  {
+    "symbol": "VETUSD",
+    "entry_price": 0.005107,
+    "exit_price": 0.006028,
+    "entry_time": "2026-08-20T21:36:02.863571+00:00",
+    "exit_time": "2026-08-22T04:36:47.636197+00:00",
+    "pnl_pct": 18.03,
+    "result": "win",
+    "reason": "Take-Profit",
+    "strategy": "breakout"
   }
 ]
