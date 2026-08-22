@@ -52,9 +52,18 @@ jobs:
           git config user.name "signal-bot"
           git config user.email "signal-bot@users.noreply.github.com"
           git add kraken_scanner_state.json telegram_subscribers.json trades_log.json last_status_time.json scan_stats.json qualified_pairs.json
-          git diff --staged --quiet || git commit -m "chore: update scanner state (full scan)"
-          git pull --rebase --autostash || true
-          git push || true
+          if git diff --staged --quiet; then echo "Нечего сохранять"; exit 0; fi
+          git commit -m "chore: update scanner state (full scan)"
+          for i in 1 2 3 4 5; do
+            if git pull --rebase --autostash && git push; then
+              echo "Сохранено успешно (попытка $i)"; exit 0
+            fi
+            echo "Попытка $i не удалась, повтор..."
+            git rebase --abort 2>/dev/null || true
+            sleep $((5 + RANDOM % 10))
+          done
+          echo "::error::Не удалось сохранить состояние после 5 попыток — данные этого запуска ПОТЕРЯНЫ"
+          exit 1
 
   trigger:
     if: github.event.schedule == '*/15 * * * *' || github.event.inputs.mode == 'trigger'
@@ -75,9 +84,18 @@ jobs:
           git config user.name "signal-bot"
           git config user.email "signal-bot@users.noreply.github.com"
           git add kraken_scanner_state.json telegram_subscribers.json trades_log.json scan_stats.json
-          git diff --staged --quiet || git commit -m "chore: update scanner state (trigger)"
-          git pull --rebase --autostash || true
-          git push || true
+          if git diff --staged --quiet; then echo "Нечего сохранять"; exit 0; fi
+          git commit -m "chore: update scanner state (trigger)"
+          for i in 1 2 3 4 5; do
+            if git pull --rebase --autostash && git push; then
+              echo "Сохранено успешно (попытка $i)"; exit 0
+            fi
+            echo "Попытка $i не удалась, повтор..."
+            git rebase --abort 2>/dev/null || true
+            sleep $((5 + RANDOM % 10))
+          done
+          echo "::error::Не удалось сохранить состояние после 5 попыток — данные этого запуска ПОТЕРЯНЫ"
+          exit 1
 
   report-3d:
     if: github.event.schedule == '0 9 */3 * *' || (github.event.inputs.mode == 'report' && github.event.inputs.period == '3d')
@@ -98,9 +116,18 @@ jobs:
           git config user.name "signal-bot"
           git config user.email "signal-bot@users.noreply.github.com"
           git add telegram_subscribers.json
-          git diff --staged --quiet || git commit -m "chore: update subscribers (3d report)"
-          git pull --rebase --autostash || true
-          git push || true
+          if git diff --staged --quiet; then echo "Нечего сохранять"; exit 0; fi
+          git commit -m "chore: update subscribers (3d report)"
+          for i in 1 2 3 4 5; do
+            if git pull --rebase --autostash && git push; then
+              echo "Сохранено успешно (попытка $i)"; exit 0
+            fi
+            echo "Попытка $i не удалась, повтор..."
+            git rebase --abort 2>/dev/null || true
+            sleep $((5 + RANDOM % 10))
+          done
+          echo "::error::Не удалось сохранить подписчиков после 5 попыток"
+          exit 1
 
   report-monthly:
     if: github.event.schedule == '30 9 1 * *' || (github.event.inputs.mode == 'report' && github.event.inputs.period == 'month')
@@ -121,6 +148,15 @@ jobs:
           git config user.name "signal-bot"
           git config user.email "signal-bot@users.noreply.github.com"
           git add telegram_subscribers.json
-          git diff --staged --quiet || git commit -m "chore: update subscribers (monthly report)"
-          git pull --rebase --autostash || true
-          git push || true
+          if git diff --staged --quiet; then echo "Нечего сохранять"; exit 0; fi
+          git commit -m "chore: update subscribers (monthly report)"
+          for i in 1 2 3 4 5; do
+            if git pull --rebase --autostash && git push; then
+              echo "Сохранено успешно (попытка $i)"; exit 0
+            fi
+            echo "Попытка $i не удалась, повтор..."
+            git rebase --abort 2>/dev/null || true
+            sleep $((5 + RANDOM % 10))
+          done
+          echo "::error::Не удалось сохранить подписчиков после 5 попыток"
+          exit 1
