@@ -1096,7 +1096,7 @@ def run_scan(args: argparse.Namespace) -> None:
                 pnl_pct = log_trade(pair, pos["entry_price"], exit_price,
                                     pos["entry_time"], now_iso, reason, strategy)
                 msg = (
-                    f"<font color=\"red\"><b>🔴 ВЫХОД (SELL)</b></font>\n"
+                    f"🔴 <b>ВЫХОД (SELL)</b>\n"
                     f"Пара: <b>{pair}</b>\n"
                     f"Стратегия: {strategy}\n"
                     f"Цена выхода: <b>{exit_price:.6g}</b>\n"
@@ -1147,7 +1147,7 @@ def run_scan(args: argparse.Namespace) -> None:
                 strategy_name = "confluence"
 
                 msg = (
-                    f"<font color=\"green\"><b>🟢 ВХОД (BUY) — {strategy_name}</b></font>\n"
+                    f"🟢 <b>ВХОД (BUY) — {strategy_name}</b>\n"
                     f"Пара: <b>{pair}</b>\n"
                     f"Цена входа: <b>{close:.6g}</b>\n"
                     f"RSI(15m): {trigger_conf['rsi']:.1f}  ADX(1d): {results['1d']['adx']:.1f}\n"
@@ -1187,7 +1187,7 @@ def run_scan(args: argparse.Namespace) -> None:
                     strategy_name = "breakout"
 
                     msg = (
-                        f"<font color=\"green\"><b>🟢 ВХОД (BUY) — {strategy_name}</b></font>\n"
+                        f"🟢 <b>ВХОД (BUY) — {strategy_name}</b>\n"
                         f"Пара: <b>{pair}</b>\n"
                         f"Цена входа: <b>{close:.6g}</b>\n"
                         f"Боковик: {trigger_break['cons_days']} дн. | RSI: {trigger_break['rsi']:.1f}\n"
