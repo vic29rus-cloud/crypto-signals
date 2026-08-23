@@ -4,7 +4,7 @@
   1. Confluence (тренд 4h/1d/1w + MACD) – на топ-200 волатильных пар
   2. Breakout из боковика (консолидация >30 дней) – на всех доступных парах (без фильтров)
 
-Версия 4.6.5 – исправлена сортировка кандидатов по MACD gap, добавлена проверка свежести qualified_pairs.
+Версия 4.6.5 – исправлена сортировка кандидатов по MACD gap, проверка свежести qualified_pairs, max_candidates=3000.
 """
 
 import argparse
@@ -28,7 +28,7 @@ SUBSCRIBERS_FILE = "telegram_subscribers.json"
 STATE_FILE = "kraken_scanner_state.json"
 TRADES_LOG_FILE = "trades_log.json"
 SCAN_STATS_FILE = "scan_stats.json"
-QUALIFIED_PAIRS_FILE = "qualified_pairs.json"  # пары, где тренд уже совпал — для быстрой 15-мин проверки
+QUALIFIED_PAIRS_FILE = "qualified_pairs.json"
 SCANNER_LOG_FILE = "kraken_scanner.log"
 LAST_STATUS_FILE = "last_status_time.json"
 
@@ -274,7 +274,7 @@ def get_volatile_candidates(quote_coin: str, max_candidates: int = 1000) -> List
     logger.info(f"Отобрано {len(result)} волатильных пар (фильтры: ликвидность ≥{MIN_TURNOVER_USD}, волатильность ≥{MIN_VOLATILITY_PCT}%)")
     return result
 
-def get_all_pairs(quote_coin: str, max_candidates: int = 2000) -> List[str]:
+def get_all_pairs(quote_coin: str, max_candidates: int = 3000) -> List[str]:
     """
     Возвращает ВСЕ пары (без фильтров по ликвидности и волатильности), кроме стейблкоинов и производных.
     Используется для поиска боковиков.
@@ -1003,8 +1003,8 @@ def run_scan(args: argparse.Namespace) -> None:
     pairs = volatile_pairs[:top_n]
     logger.info(f"Основной список (Confluence): {len(pairs)} пар")
 
-    # 2. Все пары для боковиков (без фильтров)
-    all_pairs = get_all_pairs(args.quote_coin, max_candidates=2000)
+    # 2. Все пары для боковиков (без фильтров) – теперь до 3000
+    all_pairs = get_all_pairs(args.quote_coin, max_candidates=3000)
     # Исключаем уже взятые в основной список
     extra_pairs = [p for p in all_pairs if p not in pairs]
     cons_top_n = config.get("consolidation_top_n", 400)
