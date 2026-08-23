@@ -4,7 +4,7 @@
   1. Confluence (тренд 4h/1d/1w + MACD) – на топ-200 волатильных пар
   2. Breakout из боковика (консолидация >30 дней) – на всех доступных парах (без фильтров)
 
-Версия 4.6.5 – цветные сообщения, улучшенная защита от дублей.
+Версия 4.6.5 – исправлена сортировка кандидатов по MACD gap, добавлена проверка свежести qualified_pairs.
 """
 
 import argparse
@@ -930,7 +930,8 @@ def send_status_message(scan_summary: list, pairs_count: int, open_positions: in
     # иначе монеты со старым, давно случившимся кроссом "зависают" в списке навсегда,
     # хотя новый вход по ним маловероятен в ближайшее время.
     close_calls = [s for s in scan_summary if s["trend_score"] >= 2]
-    close_calls.sort(key=lambda s: abs(s.get("macd_gap_pct", 999)))
+    # Исправленная сортировка: без abs, чтобы в топе были отрицательные значения (MACD ниже сигнальной)
+    close_calls.sort(key=lambda s: s.get("macd_gap_pct", 999))
 
     if close_calls:
         lines.append(f"\n🎯 <b>Топ кандидатов на вход (Confluence):</b>")
@@ -1299,6 +1300,23 @@ def run_trigger(args: argparse.Namespace) -> None:
     state = load_json(STATE_FILE, {})
     qualified_data = load_json(QUALIFIED_PAIRS_FILE, {"time": None, "pairs": []})
     qualified_pairs = qualified_data.get("pairs", [])
+
+    # Проверка свежести квалифицированных пар
+    if qualified_data.get("time"):
+        try:
+            last_time = datetime.fromisoformat(qualified_data["time"])
+            if (datetime.now(timezone.utc) - last_time) > timedelta(hours=3):
+                logger.warning("Квалифицированные пары устарели (>3ч), запускаю полный scan для обновления.")
+                run_scan(args)
+                return
+        except Exception as e:
+            logger.error(f"Ошибка проверки свежести qualified_pairs: {e}, запускаю полный scan.")
+            run_scan(args)
+            return
+    else:
+        logger.warning("Файл qualified_pairs.json отсутствует или пуст, запускаю полный scan для инициализации.")
+        run_scan(args)
+        return
 
     now_iso = datetime.now(timezone.utc).isoformat()
     found_buy, found_sell = 0, 0
