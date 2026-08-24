@@ -54,9 +54,32 @@ jobs:
           git add kraken_scanner_state.json telegram_subscribers.json trades_log.json last_status_time.json scan_stats.json qualified_pairs.json
           if git diff --staged --quiet; then echo "Нечего сохранять"; exit 0; fi
           git commit -m "chore: update scanner state (full scan)"
+          CRITICAL_FILES="kraken_scanner_state.json trades_log.json"
           for i in 1 2 3 4 5; do
-            if git pull --rebase --autostash && git push; then
-              echo "Сохранено успешно (попытка $i)"; exit 0
+            if git pull --rebase --autostash; then
+              if git push; then echo "Сохранено успешно (попытка $i)"; exit 0; fi
+            else
+              UNMERGED=$(git diff --name-only --diff-filter=U)
+              echo "Конфликт в файлах: $UNMERGED"
+              CRITICAL_HIT=0
+              for f in $UNMERGED; do
+                for cf in $CRITICAL_FILES; do
+                  [ "$f" = "$cf" ] && CRITICAL_HIT=1
+                done
+              done
+              if [ "$CRITICAL_HIT" = "1" ]; then
+                echo "::error::Конфликт в торговых данных ($UNMERGED) — нужно ручное вмешательство"
+                git rebase --abort 2>/dev/null || true
+                exit 1
+              fi
+              # конфликт только в служебных файлах (статус/кэш/статистика) — берём свою свежую версию
+              for f in $UNMERGED; do
+                git checkout --ours -- "$f" 2>/dev/null || true
+                git add "$f" 2>/dev/null || true
+              done
+              if git rebase --continue --no-edit && git push; then
+                echo "Сохранено, конфликт авторазрешён (попытка $i)"; exit 0
+              fi
             fi
             echo "Попытка $i не удалась, повтор..."
             git rebase --abort 2>/dev/null || true
@@ -86,9 +109,31 @@ jobs:
           git add kraken_scanner_state.json telegram_subscribers.json trades_log.json scan_stats.json
           if git diff --staged --quiet; then echo "Нечего сохранять"; exit 0; fi
           git commit -m "chore: update scanner state (trigger)"
+          CRITICAL_FILES="kraken_scanner_state.json trades_log.json"
           for i in 1 2 3 4 5; do
-            if git pull --rebase --autostash && git push; then
-              echo "Сохранено успешно (попытка $i)"; exit 0
+            if git pull --rebase --autostash; then
+              if git push; then echo "Сохранено успешно (попытка $i)"; exit 0; fi
+            else
+              UNMERGED=$(git diff --name-only --diff-filter=U)
+              echo "Конфликт в файлах: $UNMERGED"
+              CRITICAL_HIT=0
+              for f in $UNMERGED; do
+                for cf in $CRITICAL_FILES; do
+                  [ "$f" = "$cf" ] && CRITICAL_HIT=1
+                done
+              done
+              if [ "$CRITICAL_HIT" = "1" ]; then
+                echo "::error::Конфликт в торговых данных ($UNMERGED) — нужно ручное вмешательство"
+                git rebase --abort 2>/dev/null || true
+                exit 1
+              fi
+              for f in $UNMERGED; do
+                git checkout --ours -- "$f" 2>/dev/null || true
+                git add "$f" 2>/dev/null || true
+              done
+              if git rebase --continue --no-edit && git push; then
+                echo "Сохранено, конфликт авторазрешён (попытка $i)"; exit 0
+              fi
             fi
             echo "Попытка $i не удалась, повтор..."
             git rebase --abort 2>/dev/null || true
