@@ -1,14 +1,14 @@
 {
-  "time": "2026-08-25T04:07:04.090935+00:00",
+  "time": "2026-08-25T07:12:06.238683+00:00",
   "pairs": [
     "DRVUSD",
     "PUMPUSD",
-    "MORPHOUSD",
     "JTOUSD",
+    "METUSD",
+    "MORPHOUSD",
     "AKEUSD",
     "VVVUSD",
     "XZECZUSD",
-    "XXMRZUSD",
-    "METUSD"
+    "XXMRZUSD"
   ]
 }
