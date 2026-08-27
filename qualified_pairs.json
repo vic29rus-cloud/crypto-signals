@@ -1,13 +1,26 @@
 {
-  "time": "2026-08-26T20:08:20.624905+00:00",
+  "time": "2026-08-27T00:50:56.409022+00:00",
   "pairs": [
     "AKEUSD",
+    "NPCUSD",
+    "CVXUSD",
     "DRVUSD",
+    "LITUSD",
+    "SPXUSD",
+    "DOGUSD",
     "BLESSUSD",
     "PUMPUSD",
     "VVVUSD",
-    "MORPHOUSD",
     "XZECZUSD",
-    "XXMRZUSD"
+    "INJUSD",
+    "CRVUSD",
+    "MORPHOUSD",
+    "UNIUSD",
+    "ONDOUSD",
+    "AEROUSD",
+    "LINKUSD",
+    "XXMRZUSD",
+    "ETHFIUSD",
+    "TRXUSD"
   ]
 }
