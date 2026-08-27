@@ -2378,5 +2378,12 @@
     "pairs_breakout": 400,
     "entries": 0,
     "exits": 0
+  },
+  {
+    "time": "2026-08-27T14:16:01.181580+00:00",
+    "pairs_confluence": 198,
+    "pairs_breakout": 400,
+    "entries": 0,
+    "exits": 1
   }
 ]

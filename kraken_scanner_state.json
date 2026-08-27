@@ -15,14 +15,6 @@
     "position": "closed"
   },
   "DRVUSD": {
-    "position": "open",
-    "entry_price": 0.17147,
-    "entry_time": "2026-08-27T01:03:47.073271+00:00",
-    "stop": 0.13733571428571428,
-    "target": 0.23973857142857144,
-    "atr_entry": 0.017067142857142857,
-    "breakeven_moved": false,
-    "trailing_active": false,
-    "strategy": "confluence"
+    "position": "closed"
   }
 }

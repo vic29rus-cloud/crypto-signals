@@ -53,5 +53,16 @@
     "result": "win",
     "reason": "\u0422\u0440\u0435\u0439\u043b\u0438\u043d\u0433-\u0441\u0442\u043e\u043f",
     "strategy": "breakout"
+  },
+  {
+    "symbol": "DRVUSD",
+    "entry_price": 0.17147,
+    "exit_price": 0.15729,
+    "entry_time": "2026-08-27T01:03:47.073271+00:00",
+    "exit_time": "2026-08-27T14:04:21.435491+00:00",
+    "pnl_pct": -8.27,
+    "result": "loss",
+    "reason": "\u0421\u0438\u0433\u043d\u0430\u043b \u0440\u0430\u0437\u0432\u043e\u0440\u043e\u0442\u0430 (4h)",
+    "strategy": "confluence"
   }
 ]
