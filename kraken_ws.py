@@ -17,13 +17,11 @@ from collections import deque
 from datetime import datetime, timezone
 
 # ==================== КОНФИГУРАЦИЯ ====================
-# Безопасное хранение токена через переменные окружения (для Git)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8884457853:AAHXfn5ZxGDyyaaNeUNcdcbt30f7r9JQmtZC")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "762494040")
 BASE_URL = "https://api.kraken.com/0/public"
 WS_URL = "wss://ws.kraken.com/v2"
 
-# Список пар для мониторинга (заменили MATIC на POL)
 PAIRS = [
     "BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ADA/USD",
     "DOT/USD", "LINK/USD", "UNI/USD", "POL/USD", "AVAX/USD"
@@ -36,14 +34,9 @@ ADX_LENGTH = 14
 RSI_MIN, RSI_MAX = 40, 75
 ADX_MIN = 20
 ATR_MULT_SL, ATR_MULT_TP = 2.0, 4.0
-BREAKEVEN_TRIGGER_ATR = 1.0
-TRAILING_ATR_MULT = 1.5
-BREAKEVEN_BUFFER_PCT = 0.1
 
 STATE_FILE = "/opt/kraken-scanner/kraken_ws_state.json"
-TRADES_LOG = "/opt/kraken-scanner/trades_log.json"
 
-# Буфер для хранения свечей (последние 100 свечей на каждую пару)
 ohlc_buffers = {pair: deque(maxlen=100) for pair in PAIRS}
 state = {}
 
@@ -101,7 +94,7 @@ def adx(df, length=ADX_LENGTH):
     dx = (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan) * 100
     return dx.ewm(alpha=1/length, adjust=False).mean().fillna(0)
 
-# ==================== АНАЛИЗ (на последнем закрытом баре) ====================
+# ==================== АНАЛИЗ ====================
 def analyze_timeframe(df):
     if df.empty or len(df) < MIN_BARS:
         return None
@@ -114,7 +107,6 @@ def analyze_timeframe(df):
     df['rsi'] = rsi(df['close'])
     df['adx'] = adx(df)
 
-    # Берем последний ЗАКРЫТЫЙ бар ([-2] - предпоследний, так как [-1] еще формируется)
     last = df.iloc[-2]
     prev = df.iloc[-3]
     if any(pd.isna([last['ema_fast'], last['ema_slow'], last['rsi'], last['adx']])):
@@ -157,7 +149,7 @@ def save_state(state):
     with open(STATE_FILE, 'w') as f:
         json.dump(state, f, indent=2)
 
-# ==================== ЗАГРУЗКА ИСТОРИИ (для старта буфера) ====================
+# ==================== ЗАГРУЗКА ИСТОРИИ ====================
 def fetch_klines(pair):
     pair_name = pair.replace('/', '')
     try:
@@ -192,12 +184,13 @@ def on_open(ws):
     ws.send(json.dumps(subscribe_msg))
     logger.info(f"Подписка отправлена для {len(PAIRS)} пар")
 
+# ==================== ИСПРАВЛЕННАЯ ФУНКЦИЯ on_message ====================
 def on_message(ws, message):
     global state
     try:
         data = json.loads(message)
         
-        # Игнорируем системные сообщения (каналы heartbeat, status)
+        # Игнорируем системные сообщения
         if data.get("channel") != "ohlc" or data.get("type") != "update":
             return
         
@@ -206,32 +199,30 @@ def on_message(ws, message):
             if symbol not in ohlc_buffers:
                 continue
             
-            # Формат свечи: [time, open, high, low, close, vwap, volume, count]
-            # В WebSocket Kraken в начале идет времени, затем числа
+            # Исправление: Kraken v2 присылает СЛОВАРЬ, а не список!
             new_candle = {
-                'start': item[0],
-                'open': float(item[1]),
-                'high': float(item[2]),
-                'low': float(item[3]),
-                'close': float(item[4]),
-                'vwap': float(item[5]),
-                'volume': float(item[6]),
-                'count': item[7]
+                'start': item.get('time'), # Время в мс
+                'open': float(item.get('open')),
+                'high': float(item.get('high')),
+                'low': float(item.get('low')),
+                'close': float(item.get('close')),
+                'vwap': float(item.get('vwap')),
+                'volume': float(item.get('volume')),
+                'count': item.get('count')
             }
             
             # Проверяем, новая ли это свеча
             if ohlc_buffers[symbol] and ohlc_buffers[symbol][-1]['start'] == new_candle['start']:
-                ohlc_buffers[symbol][-1] = new_candle # Обновляем текущую формирующуюся свечу
+                ohlc_buffers[symbol][-1] = new_candle # Обновляем текущую
             else:
-                ohlc_buffers[symbol].append(new_candle) # Добавляем новую свечу
+                ohlc_buffers[symbol].append(new_candle) # Добавляем новую
             
-            # Если свечей больше 80, можно проводить анализ (на закрытых барах)
+            # Анализируем, если данных достаточно
             if len(ohlc_buffers[symbol]) >= MIN_BARS:
                 df = pd.DataFrame(list(ohlc_buffers[symbol]))
                 res = analyze_timeframe(df)
                 
                 if res:
-                    # Проверяем условия для входа/выхода (копия логики из прошлого скрипта)
                     if (res['macd_cross_up'] and res['trend_up'] and
                         RSI_MIN <= res['rsi'] <= RSI_MAX and res['adx'] >= ADX_MIN):
                         
@@ -275,16 +266,14 @@ def main():
     logger.info("Запуск НАСТОЯЩЕГО WebSocket-бота Kraken v2")
     state = load_state()
 
-    # Заранее подгружаем историю, чтобы индикаторы посчитались сразу
     logger.info("Загрузка истории свечей для инициализации буферов...")
     for pair in PAIRS:
         history = fetch_klines(pair)
         if history:
             ohlc_buffers[pair].extend(history)
             logger.info(f"Загружено {len(history)} свечей для {pair}")
-        time.sleep(0.3) # Небольшая пауза, чтобы не забанили
+        time.sleep(0.3)
 
-    # Запускаем бесконечное соединение
     ws = websocket.WebSocketApp(
         WS_URL,
         on_open=on_open,
@@ -293,7 +282,6 @@ def main():
         on_close=on_close
     )
     
-    # run_forever автоматически переподключается
     while True:
         try:
             ws.run_forever(ping_interval=30, ping_timeout=10)
