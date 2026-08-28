@@ -24,7 +24,7 @@ WS_URL = "wss://ws.kraken.com/v2"
 # Список пар для мониторинга (можно расширить)
 PAIRS = [
     "BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ADA/USD",
-    "DOT/USD", "LINK/USD", "UNI/USD", "MATIC/USD", "AVAX/USD"
+    "DOT/USD", "LINK/USD", "UNI/USD", "POL/USD", "AVAX/USD"
 ]
 
 TIMEFRAME = 15  # 15 минут
