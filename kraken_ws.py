@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """
-УНИВЕРСАЛЬНЫЙ БОТ: WebSocket + REST сканер (VPS)
-1. WebSocket слушает ТОП-200 пар в реальном времени (вход по MACD на 15м).
-2. Фоновый поток каждые 2 часа сканирует 700 пар на боковики (Breakout > 30 дней),
-   проверяет тренды (Confluence), открытые позиции и отправляет статус в Telegram.
-Работает полностью автономно без GitHub Actions.
+Универсальный бот (VPS): WebSocket + REST сканер.
+Исправлена гонка данных: добавлена блокировка threading.Lock для state.json.
 """
 
 import json
@@ -19,7 +16,7 @@ import websocket
 from collections import deque
 from datetime import datetime, timezone
 
-# ==================== КОНФИГУРАЦИЯ (МОЖНО МЕНЯТЬ) ====================
+# ==================== КОНФИГУРАЦИЯ ====================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8884457853:AAHXfn5ZxGDyyaaNeUNcdcbt30f7r9JQmtZC")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "762494040")
 BASE_URL = "https://api.kraken.com/0/public"
@@ -35,20 +32,15 @@ ATR_MULT_SL, ATR_MULT_TP = 2.0, 4.0
 BREAKEVEN_TRIGGER_ATR = 1.0
 TRAILING_ATR_MULT = 1.5
 
-# *** НАСТРОЙКИ КОЛИЧЕСТВА ПАР ***
-TOP_N = 200          # Пар в WebSocket (мгновенные сигналы)
-TOTAL_PAIRS = 700    # Всего пар для фонового сканирования (включая боковики)
-BREAKOUT_PAIRS = 500 # Дополнительно пар для боковиков (700 - 200)
-
-# *** НАСТРОЙКИ ПЕРИОДОВ ***
-STATUS_INTERVAL_MINUTES = 120   # Статус в Telegram каждые 2 часа
-SCAN_INTERVAL_SECONDS = 7200    # Полное сканирование каждые 2 часа (2 * 60 * 60)
+TOP_N = 200
+TOTAL_PAIRS = 700
+STATUS_INTERVAL_MINUTES = 120
+SCAN_INTERVAL_SECONDS = 7200
 
 STATE_FILE = "/opt/kraken-scanner/kraken_ws_state.json"
 TRADES_LOG_FILE = "/opt/kraken-scanner/trades_log.json"
 QUALIFIED_PAIRS_FILE = "/opt/kraken-scanner/qualified_pairs.json"
 
-# Параметры таймфреймов для фонового анализа
 TIMEFRAME_PARAMS = {
     "15m": {"kraken_interval": 15,   "ema_fast": 9,  "ema_slow": 21, "min_bars": 80},
     "4h":  {"kraken_interval": 240,  "ema_fast": 21, "ema_slow": 55, "min_bars": 120},
@@ -72,14 +64,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
-PAIRS_WS = []               # Топ-200 для WebSocket
-PAIRS_ALL = []              # Все 700 пар
-ohlc_buffers = {}           # Буферы для WebSocket
-state = {}                  # Открытые позиции
+PAIRS_WS = []
+PAIRS_ALL = []
+ohlc_buffers = {}
+state = {}
+
+# КРИТИЧНО: Блокировка для защиты state.json от гонок между потоками
+state_lock = threading.Lock()
 
 # ==================== ФУНКЦИИ ПОЛУЧЕНИЯ СПИСКА ПАР ====================
 def get_all_filtered_pairs(max_pairs=TOTAL_PAIRS):
-    """Получает список всех пар, фильтрует по ликвидности и волатильности."""
     try:
         pairs_resp = requests.get(f"{BASE_URL}/AssetPairs", timeout=20)
         pairs_data = pairs_resp.json()
@@ -210,9 +204,9 @@ def check_breakout(df_daily, current_price):
     
     high = window['high'].max(); low = window['low'].min(); mean = window['close'].mean()
     range_pct = (high - low) / mean * 100 if mean > 0 else 100
-    if range_pct > 15.0: return None  # слишком широкий диапазон - не боковик
+    if range_pct > 15.0: return None
     
-    if current_price < high: return None  # не пробил уровень
+    if current_price < high: return None
     
     vol_ok = df_daily['volume'].iloc[-1] > df_daily['volume'].rolling(20).mean().iloc[-1] * 1.8
     if not vol_ok: return None
@@ -234,7 +228,7 @@ def check_exit(results, pos):
     if r4h['macd_cross_up'] is False and r4h.get('ema_cross_down', False): return True, "Разворот"
     return False, ""
 
-# ==================== TELEGRAM И СОСТОЯНИЕ ====================
+# ==================== TELEGRAM И СОСТОЯНИЕ (С БЛОКИРОВКОЙ) ====================
 def send_telegram(text):
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -243,28 +237,36 @@ def send_telegram(text):
         logger.error(f"Ошибка Telegram: {e}")
 
 def load_state():
-    try:
-        with open(STATE_FILE, 'r') as f: return json.load(f)
-    except: return {}
+    # Захватываем замок при чтении
+    with state_lock:
+        try:
+            with open(STATE_FILE, 'r') as f: return json.load(f)
+        except: return {}
 
 def save_state(state):
-    with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
+    # Захватываем замок при записи (предотвращает гонку)
+    with state_lock:
+        try:
+            with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
+        except IOError as e:
+            logger.error(f"Ошибка сохранения: {e}")
 
 def log_trade(symbol, entry, exit, reason, strategy):
-    trades = []
-    if os.path.exists(TRADES_LOG_FILE):
-        try:
-            with open(TRADES_LOG_FILE, 'r') as f: trades = json.load(f)
-        except: trades = []
-    pnl = (exit - entry) / entry * 100
-    trades.append({
-        "symbol": symbol, "entry_price": entry, "exit_price": exit,
-        "entry_time": datetime.now(timezone.utc).isoformat(),
-        "exit_time": datetime.now(timezone.utc).isoformat(),
-        "pnl_pct": round(pnl, 2), "result": "win" if pnl > 0 else "loss",
-        "reason": reason, "strategy": strategy
-    })
-    with open(TRADES_LOG_FILE, 'w') as f: json.dump(trades, f, indent=2)
+    with state_lock:
+        trades = []
+        if os.path.exists(TRADES_LOG_FILE):
+            try:
+                with open(TRADES_LOG_FILE, 'r') as f: trades = json.load(f)
+            except: trades = []
+        pnl = (exit - entry) / entry * 100
+        trades.append({
+            "symbol": symbol, "entry_price": entry, "exit_price": exit,
+            "entry_time": datetime.now(timezone.utc).isoformat(),
+            "exit_time": datetime.now(timezone.utc).isoformat(),
+            "pnl_pct": round(pnl, 2), "result": "win" if pnl > 0 else "loss",
+            "reason": reason, "strategy": strategy
+        })
+        with open(TRADES_LOG_FILE, 'w') as f: json.dump(trades, f, indent=2)
 
 # ==================== WEB SOCKET ====================
 def on_open(ws):
@@ -301,10 +303,13 @@ def on_message(ws, message):
                 if (prev['macd_line'] <= prev['macd_signal'] and last['macd_line'] > last['macd_signal'] and
                     last['ema_fast'] > last['ema_slow'] and RSI_MIN <= last['rsi'] <= RSI_MAX and last['adx'] >= ADX_MIN):
                     close = last['close']; stop = close - last['atr'] * ATR_MULT_SL; target = close + last['atr'] * ATR_MULT_TP
-                    if state.get(symbol, {}).get('position') != 'open':
-                        send_telegram(f"🟢 <b>МГНОВЕННЫЙ ВХОД (WebSocket)</b>\nПара: {symbol}\nЦена: {close:.4f}\nSL: {stop:.4f}\nTP: {target:.4f}")
-                        state[symbol] = {'position': 'open', 'entry_price': close, 'stop': stop, 'target': target, 'entry_time': datetime.now(timezone.utc).isoformat()}
-                        save_state(state)
+                    
+                    # КРИТИЧНО: Читаем и пишем через замок!
+                    with state_lock:
+                        if state.get(symbol, {}).get('position') != 'open':
+                            send_telegram(f"🟢 <b>МГНОВЕННЫЙ ВХОД (WebSocket)</b>\nПара: {symbol}\nЦена: {close:.4f}\nSL: {stop:.4f}\nTP: {target:.4f}")
+                            state[symbol] = {'position': 'open', 'entry_price': close, 'stop': stop, 'target': target, 'entry_time': datetime.now(timezone.utc).isoformat()}
+                            save_state(state)
     except Exception as e:
         logger.error(f"Ошибка WebSocket: {e}")
 
@@ -318,7 +323,7 @@ def run_websocket():
         try: ws.run_forever(ping_interval=30, ping_timeout=10)
         except Exception as e: logger.error(f"WS Критическая ошибка: {e}"); time.sleep(5)
 
-# ==================== ФОНОВОЕ СКАНИРОВАНИЕ (2 ЧАСА) ====================
+# ==================== ФОНОВОЕ СКАНИРОВАНИЕ ====================
 def fetch_klines(pair, interval, min_bars):
     pair_name = pair.replace('/', '')
     try:
@@ -334,7 +339,6 @@ def fetch_klines(pair, interval, min_bars):
     except: return []
 
 def background_scan_loop():
-    """Главный цикл, который работает каждые 2 часа."""
     global state
     while True:
         logger.info("=== Запуск фонового сканирования (700 пар) ===")
@@ -347,60 +351,53 @@ def background_scan_loop():
         consolidation_list = []
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        # 1. Проверяем боковики и тренды для всех пар
         for idx, pair in enumerate(all_pairs):
             try:
-                # 1.1 Берем дневные данные для боковика
                 df_daily = pd.DataFrame(fetch_klines(pair, 1440, 100))
                 
-                # 1.2 Берем трендовые таймфреймы
                 results = {}
                 for tf in TIMEFRAME_ORDER:
                     params = TIMEFRAME_PARAMS[tf]
                     df_tf = pd.DataFrame(fetch_klines(pair, params['kraken_interval'], params['min_bars']))
                     results[tf] = analyze_timeframe(df_tf, params)
-                    time.sleep(0.1) # защита от банов
+                    time.sleep(0.1)
                 
-                # 1.3 Поиск боковика (если есть дневные данные)
                 if not df_daily.empty and len(df_daily) > 30:
                     close_price = df_daily['close'].iloc[-1]
                     breakout = check_breakout(df_daily, close_price)
                     if breakout:
                         consolidation_list.append({"pair": pair, "days": breakout['days']})
-                        # Отправляем сигнал на пробой!
-                        if state.get(pair, {}).get('position') != 'open':
-                            send_telegram(f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>\nПара: {pair}\nЦена: {close_price:.4f}\nSL: {breakout['stop']:.4f}\nTP: {breakout['target']:.4f}\nДней в боковике: {breakout['days']}")
-                            state[pair] = {'position': 'open', 'entry_price': close_price, 'stop': breakout['stop'], 'target': breakout['target'], 'entry_time': now_iso, 'strategy': 'breakout'}
-                            save_state(state); found_buy += 1
+                        # КРИТИЧНО: Используем замок при обращении к state
+                        with state_lock:
+                            if state.get(pair, {}).get('position') != 'open':
+                                send_telegram(f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>\nПара: {pair}\nЦена: {close_price:.4f}\nSL: {breakout['stop']:.4f}\nTP: {breakout['target']:.4f}\nДней в боковике: {breakout['days']}")
+                                state[pair] = {'position': 'open', 'entry_price': close_price, 'stop': breakout['stop'], 'target': breakout['target'], 'entry_time': now_iso, 'strategy': 'breakout'}
+                                save_state(state); found_buy += 1
 
-                # 1.4 Проверяем открытую позицию на выход (если есть)
                 pos = state.get(pair)
                 if pos and pos.get('position') == 'open' and results.get(TRIGGER_TF) and results.get('1d'):
-                    # Переводим в безубыток
-                    if pos.get('entry_price') and results[TRIGGER_TF]['close'] > pos['entry_price'] * 1.02 and not pos.get('breakeven_moved'):
-                        pos['stop'] = pos['entry_price'] * 1.001; pos['breakeven_moved'] = True
-                    
-                    # Трейлинг
-                    if pos.get('breakeven_moved') and results['1d']['atr'] > 0:
-                        new_stop = results[TRIGGER_TF]['close'] - results['1d']['atr'] * TRAILING_ATR_MULT
-                        if new_stop > pos['stop']: pos['stop'] = new_stop; pos['trailing_active'] = True
-                    
-                    # Выход
-                    exit_now, reason = check_exit(results, pos)
-                    if exit_now:
-                        exit_price = results[TRIGGER_TF]['close']
-                        log_trade(pair, pos['entry_price'], exit_price, reason, pos.get('strategy', 'unknown'))
-                        send_telegram(f"🔴 <b>ВЫХОД</b>\nПара: {pair}\nЦена: {exit_price:.4f}\nПричина: {reason}")
-                        state[pair] = {'position': 'closed'}; save_state(state); found_sell += 1
-
-                # 1.5 Формируем статистику для отчета
+                    # Проверяем выходы через замок
+                    with state_lock:
+                        if pos.get('entry_price') and results[TRIGGER_TF]['close'] > pos['entry_price'] * 1.02 and not pos.get('breakeven_moved'):
+                            pos['stop'] = pos['entry_price'] * 1.001; pos['breakeven_moved'] = True
+                        
+                        if pos.get('breakeven_moved') and results['1d']['atr'] > 0:
+                            new_stop = results[TRIGGER_TF]['close'] - results['1d']['atr'] * TRAILING_ATR_MULT
+                            if new_stop > pos['stop']: pos['stop'] = new_stop; pos['trailing_active'] = True
+                        
+                        exit_now, reason = check_exit(results, pos)
+                        if exit_now:
+                            exit_price = results[TRIGGER_TF]['close']
+                            log_trade(pair, pos['entry_price'], exit_price, reason, pos.get('strategy', 'unknown'))
+                            send_telegram(f"🔴 <b>ВЫХОД</b>\nПара: {pair}\nЦена: {exit_price:.4f}\nПричина: {reason}")
+                            state[pair] = {'position': 'closed'}; save_state(state); found_sell += 1
+                
                 if all(results.get(tf) is not None for tf in TIMEFRAME_ORDER):
                     scan_summary.append({"pair": pair, "trend_score": sum(1 for tf in TIMEFRAME_ORDER if results[tf]['trend_up'])})
             except Exception as e:
                 logger.error(f"Ошибка в {pair}: {e}")
                 continue
 
-        # 2. Отправляем статус каждые 2 часа
         open_pos = sum(1 for p in state.values() if p.get('position') == 'open')
         text = (f"📊 <b>Статус сканирования</b>\n"
                 f"Всего пар: {len(all_pairs)}\n"
@@ -423,21 +420,17 @@ def main():
     logger.info("Инициализация универсального бота (VPS)...")
     state = load_state()
 
-    # Получаем 700 пар
     logger.info(f"Запрос списка {TOTAL_PAIRS} пар...")
     PAIRS_ALL = get_all_filtered_pairs(TOTAL_PAIRS)
     if not PAIRS_ALL:
         logger.error("Не удалось получить пары. Проверьте сеть или токен API.")
         return
     
-    # Делим на ТОП-200 для WebSocket и остальные
     PAIRS_WS = PAIRS_ALL[:TOP_N]
     logger.info(f"Топ-200 для WebSocket: {len(PAIRS_WS)} пар")
 
-    # Инициализируем буферы для WebSocket
     ohlc_buffers = {pair: deque(maxlen=100) for pair in PAIRS_WS}
     
-    # Загружаем историю для WebSocket (иначе индикаторы не будут работать сразу)
     logger.info("Загрузка истории для WebSocket...")
     for pair in PAIRS_WS:
         history = fetch_klines(pair, TIMEFRAME, 80)
@@ -445,12 +438,10 @@ def main():
             ohlc_buffers[pair].extend(history)
         time.sleep(0.1)
 
-    # Запускаем фоновый сканер в отдельном потоке (каждые 2 часа)
     logger.info("Запуск фонового сканера (700 пар, каждые 2 часа)...")
     scanner_thread = threading.Thread(target=background_scan_loop, daemon=True)
     scanner_thread.start()
 
-    # Запускаем WebSocket в основном потоке (бесконечно)
     logger.info("Запуск WebSocket в реальном времени...")
     run_websocket()
 
