@@ -119,7 +119,7 @@ def get_all_filtered_pairs(max_pairs=TOTAL_PAIRS):
                 if volatility_pct < MIN_VOLATILITY_PCT: continue
                 scored.append((pair_name, volatility_pct, turnover))
             except: continue
-        time.sleep(0.2)
+        time.sleep(0.5)
 
     scored.sort(key=lambda x: x[1], reverse=True)
     final_pairs = []
