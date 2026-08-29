@@ -17,8 +17,8 @@ from collections import deque
 from datetime import datetime, timezone
 
 # ==================== КОНФИГУРАЦИЯ ====================
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8884457853:AAHXfn5ZxGDyyaaNeUNcdcbt30f7r9JQmtZC")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "762494040")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 BASE_URL = "https://api.kraken.com/0/public"
 WS_URL = "wss://ws.kraken.com/v2"
 
@@ -231,10 +231,18 @@ def check_exit(results, pos):
 # ==================== TELEGRAM И СОСТОЯНИЕ (С БЛОКИРОВКОЙ) ====================
 def send_telegram(text):
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                      json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=10
+        )
+        result = r.json()
+        if not result.get("ok"):
+            logger.error(f"Telegram отклонил сообщение: {result.get('description')}")
+        else:
+            logger.info("Сообщение успешно отправлено в Telegram!")
     except Exception as e:
-        logger.error(f"Ошибка Telegram: {e}")
+        logger.error(f"Ошибка отправки Telegram: {e}")
 
 def load_state():
     # Захватываем замок при чтении
