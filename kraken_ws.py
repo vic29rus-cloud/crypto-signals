@@ -178,7 +178,10 @@ def analyze_timeframe(df, params):
     
     if len(df) < 3: return None
     last = df.iloc[-2]; prev = df.iloc[-3]
-    if any(pd.isna([last['ema_fast'], last['ema_slow'], last['rsi'], last['adx']])): return None
+    
+    # ВАЖНО: Добавили проверку на NaN для macd_line и macd_signal
+    if any(pd.isna([last['ema_fast'], last['ema_slow'], last['rsi'], last['adx'], last['macd_line'], last['macd_signal']])): 
+        return None
     
     return {
         'trend_up': bool(last['ema_fast'] > last['ema_slow']),
@@ -186,7 +189,10 @@ def analyze_timeframe(df, params):
         'rsi': float(last['rsi']),
         'adx': float(last['adx']),
         'close': float(last['close']),
-        'atr': float(last['atr']) if not pd.isna(last['atr']) else 0.0
+        'atr': float(last['atr']) if not pd.isna(last['atr']) else 0.0,
+        # ВАЖНО: Вернули эти ключи!
+        'macd_line': float(last['macd_line']),
+        'macd_signal': float(last['macd_signal'])
     }
 
 def check_breakout(df_daily, current_price):
