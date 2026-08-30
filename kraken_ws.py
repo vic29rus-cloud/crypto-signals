@@ -3,8 +3,7 @@
 Универсальный бот (VPS): WebSocket + REST сканер.
 Отслеживает ТОП-200 пар в реальном времени (WebSocket)
 и сканирует 700 пар на боковики каждые 2 часа (REST).
-Полностью автономен, защищен от дедлоков (RLock).
-Добавлен мгновенный контроль стопов/тейков в WebSocket.
+Добавлен вывод PnL в % при закрытии сделок в Telegram.
 """
 
 import json
@@ -72,7 +71,6 @@ PAIRS_ALL = []
 ohlc_buffers = {}
 state = {}
 
-# RLock позволяет повторно захватывать блокировку в одном потоке (защита от дедлока)
 state_lock = threading.RLock()
 
 # ==================== ФУНКЦИИ ПОЛУЧЕНИЯ СПИСКА ПАР ====================
@@ -220,7 +218,6 @@ def check_exit(results, pos):
     r4h = results.get(TRIGGER_TF)
     if r4h is None: return False, ""
     
-    # Используем low/high, чтобы ловить "хвосты" внутри свечи
     if r4h['low'] <= pos['stop']:
         reason = "Трейлинг-стоп" if pos.get('trailing_active') else ("Безубыток" if pos.get('breakeven_moved') else "Stop-Loss")
         return True, reason
@@ -258,6 +255,7 @@ def save_state(state):
         except IOError as e:
             logger.error(f"Ошибка сохранения: {e}")
 
+# ИЗМЕНЕНИЕ: Теперь log_trade возвращает процент PnL
 def log_trade(symbol, entry, exit, reason, strategy):
     with state_lock:
         trades = []
@@ -274,6 +272,7 @@ def log_trade(symbol, entry, exit, reason, strategy):
             "reason": reason, "strategy": strategy
         })
         with open(TRADES_LOG_FILE, 'w') as f: json.dump(trades, f, indent=2)
+        return round(pnl, 2) # Возвращаем PnL для сообщения
 
 # ==================== WEB SOCKET ====================
 def on_open(ws):
@@ -298,26 +297,26 @@ def on_message(ws, message):
             else:
                 ohlc_buffers[symbol].append(new_candle)
             
-            # ---------- МГНОВЕННЫЙ КОНТРОЛЬ СТОПОВ/ТЕЙКОВ (Вариант B) ----------
+            # ---------- МГНОВЕННЫЙ КОНТРОЛЬ СТОПОВ/ТЕЙКОВ ----------
             with state_lock:
                 pos = state.get(symbol)
                 if pos and pos.get('position') == 'open':
-                    # Если low задел стоп
                     if new_candle['low'] <= pos['stop']:
                         exit_price = pos['stop']
-                        log_trade(symbol, pos['entry_price'], exit_price, "Stop-Loss (WebSocket)", pos.get('strategy', 'unknown'))
-                        send_telegram(f"🔴 <b>СТОП-ЛОСС (WebSocket)</b>\nПара: {symbol}\nЦена: {exit_price:.4f}")
+                        # ИЗМЕНЕНИЕ: получаем PnL
+                        pnl_pct = log_trade(symbol, pos['entry_price'], exit_price, "Stop-Loss (WebSocket)", pos.get('strategy', 'unknown'))
+                        send_telegram(f"🔴 <b>СТОП-ЛОСС (WebSocket)</b>\nПара: {symbol}\nЦена: {exit_price:.4f}\nРезультат: <b>{pnl_pct:+.2f}%</b>")
                         state[symbol] = {'position': 'closed'}
                         save_state(state)
-                    # Если high задел тейк
                     elif new_candle['high'] >= pos['target']:
                         exit_price = pos['target']
-                        log_trade(symbol, pos['entry_price'], exit_price, "Take-Profit (WebSocket)", pos.get('strategy', 'unknown'))
-                        send_telegram(f"🟢 <b>ТЕЙК-ПРОФИТ (WebSocket)</b>\nПара: {symbol}\nЦена: {exit_price:.4f}")
+                        # ИЗМЕНЕНИЕ: получаем PnL
+                        pnl_pct = log_trade(symbol, pos['entry_price'], exit_price, "Take-Profit (WebSocket)", pos.get('strategy', 'unknown'))
+                        send_telegram(f"🟢 <b>ТЕЙК-ПРОФИТ (WebSocket)</b>\nПара: {symbol}\nЦена: {exit_price:.4f}\nРезультат: <b>{pnl_pct:+.2f}%</b>")
                         state[symbol] = {'position': 'closed'}
                         save_state(state)
 
-            # ----- Анализ на вход (если позиции нет) -----
+            # ----- Анализ на вход -----
             if len(ohlc_buffers[symbol]) >= MIN_BARS:
                 df = pd.DataFrame(list(ohlc_buffers[symbol]))
                 df['ema_fast'] = ema(df['close'], 9); df['ema_slow'] = ema(df['close'], 21)
@@ -351,7 +350,6 @@ def run_websocket():
 
 # ==================== ФОНОВОЕ СКАНИРОВАНИЕ ====================
 def fetch_klines(pair, interval, min_bars):
-    """Загрузка свечей с подробным логированием ошибок."""
     pair_name = pair.replace('/', '')
     try:
         resp = requests.get(f"{BASE_URL}/OHLC", params={"pair": pair_name, "interval": interval}, timeout=20)
@@ -457,8 +455,9 @@ def background_scan_loop():
                         exit_now, reason = check_exit(results, pos)
                         if exit_now:
                             exit_price = results[TRIGGER_TF]['close']
-                            log_trade(pair, pos['entry_price'], exit_price, reason, pos.get('strategy', 'unknown'))
-                            send_telegram(f"🔴 <b>ВЫХОД</b>\nПара: {pair}\nЦена: {exit_price:.4f}\nПричина: {reason}")
+                            # ИЗМЕНЕНИЕ: получаем PnL
+                            pnl_pct = log_trade(pair, pos['entry_price'], exit_price, reason, pos.get('strategy', 'unknown'))
+                            send_telegram(f"🔴 <b>ВЫХОД</b>\nПара: {pair}\nЦена: {exit_price:.4f}\nПричина: {reason}\nРезультат: <b>{pnl_pct:+.2f}%</b>")
                             state[pair] = {'position': 'closed'}; save_state(state); found_sell += 1
             except Exception as e:
                 logger.error(f"Ошибка в {pair}: {e}")
