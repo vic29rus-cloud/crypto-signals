@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Универсальный бот (VPS): WebSocket + REST сканер.
-Исправление: Устранен Lookahead Bias (незакрытые свечи),
-добавлен корректный расчет боковика по закрытым данным + живая цена из Ticker.
+Исправления: RLock (без дедлоков), точные стопы/тейки по high/low,
+маппинг имен Kraken, вывод PnL в %.
 """
 
 import json
@@ -40,7 +40,6 @@ SCAN_INTERVAL_SECONDS = 7200
 
 STATE_FILE = "/opt/kraken-scanner/kraken_ws_state.json"
 TRADES_LOG_FILE = "/opt/kraken-scanner/trades_log.json"
-QUALIFIED_PAIRS_FILE = "/opt/kraken-scanner/qualified_pairs.json"
 
 TIMEFRAME_PARAMS = {
     "15m": {"kraken_interval": 15,   "ema_fast": 9,  "ema_slow": 21, "min_bars": 80},
@@ -56,7 +55,7 @@ STABLECOINS = {"USDC", "USDT", "DAI", "USD", "EUR", "GBP", "PYUSD", "TUSD", "FDU
 MIN_TURNOVER_USD = 50000
 MIN_VOLATILITY_PCT = 1.0
 
-# ==================== НАСТРОЙКА ЛОГИРОВАНИЯ ====================
+# ==================== ЛОГИРОВАНИЕ ====================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -70,6 +69,8 @@ PAIRS_ALL = []
 ohlc_buffers = {}
 state = {}
 REST_PAIR_BY_WSNAME = {}
+
+# ИСПРАВЛЕНИЕ ДЕДЛОКА: RLock вместо Lock!
 state_lock = threading.RLock()
 
 # ==================== МАППИНГ ИМЕН ПАР ====================
@@ -83,9 +84,9 @@ def build_asset_pairs():
             wsname = info.get("wsname")
             if wsname:
                 REST_PAIR_BY_WSNAME[wsname] = rest_name
-        logger.info(f"Построена карта пар: {len(REST_PAIR_BY_WSNAME)} пар.")
+        logger.info(f"Построена карта пар: {len(REST_PAIR_BY_WSNAME)}.")
     except Exception as e:
-        logger.error(f"Ошибка построения карты пар: {e}")
+        logger.error(f"Ошибка построения карты: {e}")
 
 # ==================== ПОЛУЧЕНИЕ СПИСКА ПАР ====================
 def get_all_filtered_pairs(max_pairs=TOTAL_PAIRS):
@@ -101,7 +102,7 @@ def get_all_filtered_pairs(max_pairs=TOTAL_PAIRS):
             wsname = info.get("wsname")
             if wsname: REST_PAIR_BY_WSNAME[wsname] = rest_name
     except Exception as e:
-        logger.error(f"Ошибка получения списка пар: {e}")
+        logger.error(f"Ошибка получения списка: {e}")
         return []
 
     candidates = []
@@ -137,7 +138,8 @@ def get_all_filtered_pairs(max_pairs=TOTAL_PAIRS):
                 if volatility_pct < MIN_VOLATILITY_PCT: continue
                 scored.append((pair_name, volatility_pct, turnover))
             except: continue
-        time.sleep(0.3)
+        
+        time.sleep(1.0)
 
     scored.sort(key=lambda x: x[1], reverse=True)
     final_pairs = []
@@ -146,9 +148,8 @@ def get_all_filtered_pairs(max_pairs=TOTAL_PAIRS):
         if ws_name: final_pairs.append(ws_name)
     return final_pairs
 
-# ==================== ПОЛУЧЕНИЕ ТЕКУЩИХ ЦЕН (для пробоя) ====================
+# ==================== ПОЛУЧЕНИЕ ТЕКУЩИХ ЦЕН ====================
 def fetch_current_prices(pairs):
-    """Получает текущие цены для списка пар через Ticker API."""
     prices = {}
     chunk_size = 50
     for i in range(0, len(pairs), chunk_size):
@@ -166,7 +167,7 @@ def fetch_current_prices(pairs):
                 if ws_name:
                     prices[ws_name] = float(t.get("c", [0])[0])
         except Exception as e:
-            logger.warning(f"Ошибка получения текущих цен: {e}")
+            logger.warning(f"Ошибка цен: {e}")
         time.sleep(0.1)
     return prices
 
@@ -213,7 +214,6 @@ def analyze_timeframe(df, params):
     
     if len(df) < 3: return None
     last = df.iloc[-2]; prev = df.iloc[-3]
-    
     if any(pd.isna([last['ema_fast'], last['ema_slow'], last['rsi'], last['adx'], last['macd_line'], last['macd_signal']])): 
         return None
     
@@ -230,31 +230,21 @@ def analyze_timeframe(df, params):
         'macd_signal': float(last['macd_signal'])
     }
 
-# ИСПРАВЛЕНИЕ: check_breakout теперь использует ТОЛЬКО закрытые свечи и живую цену
 def check_breakout(df_daily, current_price):
     if df_daily.empty or len(df_daily) < 60: return None
-
-    # Исключаем незакрытую свечу!
     closed = df_daily.iloc[:-1]
     if closed.empty or len(closed) < 60: return None
-
     window = closed.tail(30)
     if window.empty: return None
-
     high = window['high'].max(); low = window['low'].min(); mean = window['close'].mean()
     range_pct = (high - low) / mean * 100 if mean > 0 else 100
     if range_pct > 15.0: return None
-
-    # Проверяем пробой текущей живой ценой
     if current_price < high: return None
-
     vol_avg = closed['volume'].rolling(20).mean().iloc[-1]
     vol_ok = closed['volume'].iloc[-1] > vol_avg * 1.8
     if not vol_ok: return None
-
     adx_val = adx(closed).iloc[-1]
     atr_val = atr(closed).iloc[-1]
-
     stop = current_price - atr_val * ATR_MULT_SL
     target = current_price + atr_val * ATR_MULT_TP
     return {"close": current_price, "stop": stop, "target": target, "days": len(window)}
@@ -262,7 +252,7 @@ def check_breakout(df_daily, current_price):
 def check_exit(results, pos):
     r4h = results.get(TRIGGER_TF)
     if r4h is None: return False, ""
-    
+    # Проверяем по high/low! Это важно!
     if r4h['low'] <= pos['stop']:
         reason = "Трейлинг-стоп" if pos.get('trailing_active') else ("Безубыток" if pos.get('breakeven_moved') else "Stop-Loss")
         return True, reason
@@ -421,9 +411,7 @@ def background_scan_loop():
         if not all_pairs:
             logger.error("Не удалось получить пары!"); time.sleep(SCAN_INTERVAL_SECONDS); continue
         
-        # Заранее получаем живые цены для всех пар (чтобы не делать 700 запросов по одному)
         current_prices = fetch_current_prices(all_pairs)
-        
         found_buy, found_sell = 0, 0
         scan_summary = []
         consolidation_list = []
@@ -433,7 +421,7 @@ def background_scan_loop():
             try:
                 df_daily = pd.DataFrame(fetch_klines(pair, 1440, 100))
                 if df_daily.empty:
-                    logger.info(f"Пропуск {pair}: нет данных для проверки боковика")
+                    logger.info(f"Пропуск {pair}: нет данных")
                 
                 results = {}
                 for tf in TIMEFRAME_ORDER:
@@ -444,7 +432,6 @@ def background_scan_loop():
                     time.sleep(0.1)
                 
                 if not df_daily.empty and len(df_daily) > 30:
-                    # Используем живую цену из Ticker
                     current_price = current_prices.get(pair, df_daily['close'].iloc[-1])
                     breakout = check_breakout(df_daily, current_price)
                     
@@ -553,10 +540,7 @@ def background_scan_loop():
 def main():
     global PAIRS_WS, PAIRS_ALL, ohlc_buffers, state
     logger.info("Инициализация универсального бота (VPS)...")
-    
-    # Строим карту имен пар ДО запуска остальных функций
     build_asset_pairs()
-    
     state = load_state()
 
     logger.info(f"Запрос списка {TOTAL_PAIRS} пар...")
