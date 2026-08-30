@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Универсальный бот (VPS): WebSocket + REST сканер.
-Исправления: 
+Исправления:
 1. Добавлен расчет ema_cross_down/ema_cross_up.
 2. Устранен Lookahead Bias (незакрытые свечи).
 3. Отдельная функция detect_consolidation().
 4. Rate limit (задержки 0.3 сек).
 5. Точное время сделок.
 6. Atomic Write для защиты state.json.
+7. Безубыток (Break-even) теперь рассчитывается через ATR, а не через фиксированные 2%.
 """
 
 import json
@@ -221,7 +222,6 @@ def analyze_timeframe(df, params):
     if any(pd.isna([last['ema_fast'], last['ema_slow'], last['rsi'], last['adx'], last['macd_line'], last['macd_signal']])): 
         return None
     
-    # ИСПРАВЛЕНИЕ: Теперь считаем ema_cross_down и ema_cross_up!
     return {
         'trend_up': bool(last['ema_fast'] > last['ema_slow']),
         'macd_cross_up': bool(prev['macd_line'] <= prev['macd_signal'] and last['macd_line'] > last['macd_signal']),
@@ -237,7 +237,6 @@ def analyze_timeframe(df, params):
         'macd_signal': float(last['macd_signal'])
     }
 
-# НОВАЯ ФУНКЦИЯ: Ищем боковики по закрытым свечам
 def detect_consolidation(df_daily):
     closed = df_daily.iloc[:-1]
     if len(closed) < 60:
@@ -292,7 +291,6 @@ def check_exit(results, pos):
         return True, reason
     if r4h['high'] >= pos['target']:
         return True, "Take-Profit"
-    # ИСПРАВЛЕНИЕ: Теперь этот выход реально работает!
     if r4h['ema_cross_down']: 
         return True, "Разворот (4h)"
     return False, ""
@@ -454,7 +452,6 @@ def background_scan_loop():
         found_buy, found_sell = 0, 0
         scan_summary = []
         consolidation_list = []
-        # now_iso берется ПЕРЕД обработкой, но обновляется внутри цикла для точности
         now_iso = datetime.now(timezone.utc).isoformat()
 
         for idx, pair in enumerate(all_pairs):
@@ -511,7 +508,8 @@ def background_scan_loop():
                 pos = state.get(pair)
                 if pos and pos.get('position') == 'open' and results.get(TRIGGER_TF) and results.get('1d'):
                     with state_lock:
-                        if pos.get('entry_price') and results[TRIGGER_TF]['close'] > pos['entry_price'] * 1.02 and not pos.get('breakeven_moved'):
+                        # ИСПРАВЛЕНИЕ: Используем ATR вместо фиксированных 2%
+                        if pos.get('entry_price') and results[TRIGGER_TF]['close'] >= pos['entry_price'] + (BREAKEVEN_TRIGGER_ATR * results['1d']['atr']) and not pos.get('breakeven_moved'):
                             pos['stop'] = pos['entry_price'] * 1.001; pos['breakeven_moved'] = True
                         
                         if pos.get('breakeven_moved') and results['1d']['atr'] > 0:
