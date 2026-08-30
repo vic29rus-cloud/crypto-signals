@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
 """
 Универсальный бот (VPS): WebSocket + REST сканер.
-Исправления:
-1. Добавлен расчет ema_cross_down/ema_cross_up.
-2. Устранен Lookahead Bias (незакрытые свечи).
-3. Отдельная функция detect_consolidation().
-4. Rate limit (задержки 0.3 сек).
-5. Точное время сделок.
-6. Atomic Write для защиты state.json.
-7. Безубыток (Break-even) теперь рассчитывается через ATR, а не через фиксированные 2%.
+Финальная версия со всеми исправлениями.
 """
 
 import json
@@ -266,19 +259,28 @@ def detect_consolidation(df_daily):
 
 def check_breakout(df_daily, current_price):
     if df_daily.empty or len(df_daily) < 60: return None
+    
+    # Закрытые свечи для расчета диапазона и индикаторов (без lookahead bias)
     closed = df_daily.iloc[:-1]
     if closed.empty or len(closed) < 60: return None
     window = closed.tail(30)
     if window.empty: return None
+    
     high = window['high'].max(); low = window['low'].min(); mean = window['close'].mean()
     range_pct = (high - low) / mean * 100 if mean > 0 else 100
     if range_pct > 15.0: return None
+    
     if current_price < high: return None
+    
+    # ВАЖНО: Объём берем из текущего дня (df_daily), а не из закрытых!
     vol_avg = closed['volume'].rolling(20).mean().iloc[-1]
-    vol_ok = closed['volume'].iloc[-1] > vol_avg * 1.8
+    vol_ok = df_daily['volume'].iloc[-1] > vol_avg * 1.8
+    
     if not vol_ok: return None
+    
     adx_val = adx(closed).iloc[-1]
     atr_val = atr(closed).iloc[-1]
+    
     stop = current_price - atr_val * ATR_MULT_SL
     target = current_price + atr_val * ATR_MULT_TP
     return {"close": current_price, "stop": stop, "target": target, "days": len(window)}
@@ -508,7 +510,7 @@ def background_scan_loop():
                 pos = state.get(pair)
                 if pos and pos.get('position') == 'open' and results.get(TRIGGER_TF) and results.get('1d'):
                     with state_lock:
-                        # ИСПРАВЛЕНИЕ: Используем ATR вместо фиксированных 2%
+                        # Безубыток по ATR (корректно для любой волатильности)
                         if pos.get('entry_price') and results[TRIGGER_TF]['close'] >= pos['entry_price'] + (BREAKEVEN_TRIGGER_ATR * results['1d']['atr']) and not pos.get('breakeven_moved'):
                             pos['stop'] = pos['entry_price'] * 1.001; pos['breakeven_moved'] = True
                         
