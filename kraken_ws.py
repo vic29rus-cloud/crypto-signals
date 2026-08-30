@@ -3,7 +3,7 @@
 Универсальный бот (VPS): WebSocket + REST сканер.
 Отслеживает ТОП-200 пар в реальном времени (WebSocket)
 и сканирует 700 пар на боковики каждые 2 часа (REST).
-Исправлен DEADLOCK: state_lock теперь RLock (реентерабельный).
+Исправлено: логирование ошибок fetch_klines, RLock, защита от вылетов.
 """
 
 import json
@@ -71,7 +71,7 @@ PAIRS_ALL = []
 ohlc_buffers = {}
 state = {}
 
-# ИСПРАВЛЕНИЕ: RLock вместо Lock, чтобы избежать deadlock при повторном захвате
+# RLock позволяет повторно захватывать блокировку в одном потоке (защита от дедлока)
 state_lock = threading.RLock()
 
 # ==================== ФУНКЦИИ ПОЛУЧЕНИЯ СПИСКА ПАР ====================
@@ -105,7 +105,9 @@ def get_all_filtered_pairs(max_pairs=TOTAL_PAIRS):
         try:
             tick_resp = requests.get(f"{BASE_URL}/Ticker", params={"pair": ",".join(chunk)}, timeout=20)
             tick_data = tick_resp.json()
-            if tick_data.get("error"): continue
+            if tick_data.get("error"): 
+                logger.warning(f"Ошибка тикеров для чанка: {tick_data['error']}")
+                continue
         except Exception as e:
             logger.warning(f"Ошибка тикеров: {e}"); continue
 
@@ -244,7 +246,6 @@ def load_state():
         except: return {}
 
 def save_state(state):
-    # RLock позволяет взять блокировку повторно, если она уже взята этим же потоком
     with state_lock:
         try:
             with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
@@ -324,18 +325,30 @@ def run_websocket():
 
 # ==================== ФОНОВОЕ СКАНИРОВАНИЕ ====================
 def fetch_klines(pair, interval, min_bars):
+    """Загрузка свечей с подробным логированием ошибок."""
     pair_name = pair.replace('/', '')
     try:
         resp = requests.get(f"{BASE_URL}/OHLC", params={"pair": pair_name, "interval": interval}, timeout=20)
         data = resp.json()
-        if data.get('error'): return []
-        result = data['result']; key = [k for k in result.keys() if k != 'last'][0]
+        if data.get('error'):
+            logger.warning(f"Kraken вернул ошибку для {pair} ({interval}m): {data['error']}")
+            return []
+        result = data['result']
+        key = [k for k in result.keys() if k != 'last'][0]
         rows = result[key]
         df = pd.DataFrame(rows, columns=['start','open','high','low','close','vwap','volume','count'])
         for col in ['open','high','low','close','volume']: df[col] = pd.to_numeric(df[col], errors='coerce')
         df.dropna(inplace=True)
         return df.tail(min_bars).to_dict('records')
-    except: return []
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Сетевая ошибка для {pair} ({interval}m): {e}")
+        return []
+    except (KeyError, ValueError, TypeError) as e:
+        logger.error(f"Ошибка формата данных для {pair} ({interval}m): {e}")
+        return []
+    except Exception as e:
+        logger.error(f"Неизвестная ошибка для {pair} ({interval}m): {e}")
+        return []
 
 def background_scan_loop():
     global state
@@ -353,11 +366,15 @@ def background_scan_loop():
         for idx, pair in enumerate(all_pairs):
             try:
                 df_daily = pd.DataFrame(fetch_klines(pair, 1440, 100))
+                if df_daily.empty:
+                    logger.info(f"Пропуск {pair}: нет данных для проверки боковика (ошибка или rate limit, смотри логи выше)")
                 
                 results = {}
                 for tf in TIMEFRAME_ORDER:
                     params = TIMEFRAME_PARAMS[tf]
                     df_tf = pd.DataFrame(fetch_klines(pair, params['kraken_interval'], params['min_bars']))
+                    if df_tf.empty:
+                        logger.debug(f"[{pair}] Нет данных по {tf}")
                     results[tf] = analyze_timeframe(df_tf, params)
                     time.sleep(0.1)
                 
