@@ -3,7 +3,7 @@
 Универсальный бот (VPS): WebSocket + REST сканер.
 Отслеживает ТОП-200 пар в реальном времени (WebSocket)
 и сканирует 700 пар на боковики каждые 2 часа (REST).
-Полностью автономен, защищен от гонок потоков и от вылетов при сбоях API.
+Исправлен DEADLOCK: state_lock теперь RLock (реентерабельный).
 """
 
 import json
@@ -34,18 +34,15 @@ ATR_MULT_SL, ATR_MULT_TP = 2.0, 4.0
 BREAKEVEN_TRIGGER_ATR = 1.0
 TRAILING_ATR_MULT = 1.5
 
-# Настройки количества пар и интервалов
 TOP_N = 200
 TOTAL_PAIRS = 700
 STATUS_INTERVAL_MINUTES = 120
 SCAN_INTERVAL_SECONDS = 7200
 
-# Файлы состояния
 STATE_FILE = "/opt/kraken-scanner/kraken_ws_state.json"
 TRADES_LOG_FILE = "/opt/kraken-scanner/trades_log.json"
 QUALIFIED_PAIRS_FILE = "/opt/kraken-scanner/qualified_pairs.json"
 
-# Параметры таймфреймов
 TIMEFRAME_PARAMS = {
     "15m": {"kraken_interval": 15,   "ema_fast": 9,  "ema_slow": 21, "min_bars": 80},
     "4h":  {"kraken_interval": 240,  "ema_fast": 21, "ema_slow": 55, "min_bars": 120},
@@ -74,8 +71,8 @@ PAIRS_ALL = []
 ohlc_buffers = {}
 state = {}
 
-# Блокировка для защиты state.json от гонок между потоками
-state_lock = threading.Lock()
+# ИСПРАВЛЕНИЕ: RLock вместо Lock, чтобы избежать deadlock при повторном захвате
+state_lock = threading.RLock()
 
 # ==================== ФУНКЦИИ ПОЛУЧЕНИЯ СПИСКА ПАР ====================
 def get_all_filtered_pairs(max_pairs=TOTAL_PAIRS):
@@ -125,7 +122,6 @@ def get_all_filtered_pairs(max_pairs=TOTAL_PAIRS):
                 scored.append((pair_name, volatility_pct, turnover))
             except: continue
         
-        # ВАЖНО: Увеличиваем задержку до 1 секунды, чтобы Kraken отдал ВСЕ пары!
         time.sleep(1.0)
 
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -179,7 +175,6 @@ def analyze_timeframe(df, params):
     if len(df) < 3: return None
     last = df.iloc[-2]; prev = df.iloc[-3]
     
-    # ВАЖНО: Добавили проверку на NaN для macd_line и macd_signal
     if any(pd.isna([last['ema_fast'], last['ema_slow'], last['rsi'], last['adx'], last['macd_line'], last['macd_signal']])): 
         return None
     
@@ -190,7 +185,6 @@ def analyze_timeframe(df, params):
         'adx': float(last['adx']),
         'close': float(last['close']),
         'atr': float(last['atr']) if not pd.isna(last['atr']) else 0.0,
-        # ВАЖНО: Вернули эти ключи!
         'macd_line': float(last['macd_line']),
         'macd_signal': float(last['macd_signal'])
     }
@@ -250,6 +244,7 @@ def load_state():
         except: return {}
 
 def save_state(state):
+    # RLock позволяет взять блокировку повторно, если она уже взята этим же потоком
     with state_lock:
         try:
             with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
@@ -366,7 +361,6 @@ def background_scan_loop():
                     results[tf] = analyze_timeframe(df_tf, params)
                     time.sleep(0.1)
                 
-                # Проверка боковика
                 if not df_daily.empty and len(df_daily) > 30:
                     close_price = df_daily['close'].iloc[-1]
                     breakout = check_breakout(df_daily, close_price)
@@ -393,7 +387,6 @@ def background_scan_loop():
                                 state[pair] = {'position': 'open', 'entry_price': close_price, 'stop': breakout['stop'], 'target': breakout['target'], 'entry_time': now_iso, 'strategy': 'breakout'}
                                 save_state(state); found_buy += 1
 
-                # Проверка трендов и сбор статистики
                 if all(results.get(tf) is not None for tf in TIMEFRAME_ORDER):
                     trend_score = sum(1 for tf in TIMEFRAME_ORDER if results[tf]['trend_up'])
                     r4h = results['4h']
@@ -408,7 +401,6 @@ def background_scan_loop():
                         "close_price": r4h['close']
                     })
 
-                # Проверка открытых позиций (выходы, безубыток, трейлинг)
                 pos = state.get(pair)
                 if pos and pos.get('position') == 'open' and results.get(TRIGGER_TF) and results.get('1d'):
                     with state_lock:
@@ -429,7 +421,6 @@ def background_scan_loop():
                 logger.error(f"Ошибка в {pair}: {e}")
                 continue
 
-        # ======== ФОРМИРОВАНИЕ ПОДРОБНОГО СТАТУСА ========
         open_pos = sum(1 for p in state.values() if p.get('position') == 'open')
         now_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
         
