@@ -3,7 +3,7 @@
 Универсальный бот (VPS): WebSocket + REST сканер.
 Отслеживает ТОП-200 пар в реальном времени (WebSocket)
 и сканирует 700 пар на боковики каждые 2 часа (REST).
-Добавлен вывод PnL в % при закрытии сделок в Telegram.
+Исправление: Маппинг внутренних имен Kraken для REST API (REST_PAIR_BY_WSNAME).
 """
 
 import json
@@ -71,10 +71,31 @@ PAIRS_ALL = []
 ohlc_buffers = {}
 state = {}
 
+# ВАЖНО: Обратная мапа (wsname -> REST pair name)
+REST_PAIR_BY_WSNAME = {}
+
+# RLock позволяет повторно захватывать блокировку в одном потоке (защита от дедлока)
 state_lock = threading.RLock()
+
+# ==================== НОВАЯ ФУНКЦИЯ МАППИНГА ====================
+def build_asset_pairs():
+    """Заполняет REST_PAIR_BY_WSNAME (например, BTC/USD -> XXBTZUSD)"""
+    global REST_PAIR_BY_WSNAME
+    try:
+        resp = requests.get(f"{BASE_URL}/AssetPairs", timeout=20)
+        data = resp.json()
+        result = data.get("result", {})
+        for rest_name, info in result.items():
+            wsname = info.get("wsname")
+            if wsname:
+                REST_PAIR_BY_WSNAME[wsname] = rest_name
+        logger.info(f"Построена карта пар: {len(REST_PAIR_BY_WSNAME)} пар.")
+    except Exception as e:
+        logger.error(f"Ошибка построения карты пар: {e}")
 
 # ==================== ФУНКЦИИ ПОЛУЧЕНИЯ СПИСКА ПАР ====================
 def get_all_filtered_pairs(max_pairs=TOTAL_PAIRS):
+    global REST_PAIR_BY_WSNAME
     try:
         pairs_resp = requests.get(f"{BASE_URL}/AssetPairs", timeout=20)
         pairs_data = pairs_resp.json()
@@ -83,6 +104,13 @@ def get_all_filtered_pairs(max_pairs=TOTAL_PAIRS):
             return []
         all_pairs = pairs_data.get("result", {})
         pair_map = {k: v.get("wsname") for k, v in all_pairs.items()}
+        
+        # Дополняем обратную мапу
+        for rest_name, info in all_pairs.items():
+            wsname = info.get("wsname")
+            if wsname:
+                REST_PAIR_BY_WSNAME[wsname] = rest_name
+                
     except Exception as e:
         logger.error(f"Ошибка получения списка пар: {e}")
         return []
@@ -255,7 +283,6 @@ def save_state(state):
         except IOError as e:
             logger.error(f"Ошибка сохранения: {e}")
 
-# ИЗМЕНЕНИЕ: Теперь log_trade возвращает процент PnL
 def log_trade(symbol, entry, exit, reason, strategy):
     with state_lock:
         trades = []
@@ -272,7 +299,7 @@ def log_trade(symbol, entry, exit, reason, strategy):
             "reason": reason, "strategy": strategy
         })
         with open(TRADES_LOG_FILE, 'w') as f: json.dump(trades, f, indent=2)
-        return round(pnl, 2) # Возвращаем PnL для сообщения
+        return round(pnl, 2)
 
 # ==================== WEB SOCKET ====================
 def on_open(ws):
@@ -303,14 +330,12 @@ def on_message(ws, message):
                 if pos and pos.get('position') == 'open':
                     if new_candle['low'] <= pos['stop']:
                         exit_price = pos['stop']
-                        # ИЗМЕНЕНИЕ: получаем PnL
                         pnl_pct = log_trade(symbol, pos['entry_price'], exit_price, "Stop-Loss (WebSocket)", pos.get('strategy', 'unknown'))
                         send_telegram(f"🔴 <b>СТОП-ЛОСС (WebSocket)</b>\nПара: {symbol}\nЦена: {exit_price:.4f}\nРезультат: <b>{pnl_pct:+.2f}%</b>")
                         state[symbol] = {'position': 'closed'}
                         save_state(state)
                     elif new_candle['high'] >= pos['target']:
                         exit_price = pos['target']
-                        # ИЗМЕНЕНИЕ: получаем PnL
                         pnl_pct = log_trade(symbol, pos['entry_price'], exit_price, "Take-Profit (WebSocket)", pos.get('strategy', 'unknown'))
                         send_telegram(f"🟢 <b>ТЕЙК-ПРОФИТ (WebSocket)</b>\nПара: {symbol}\nЦена: {exit_price:.4f}\nРезультат: <b>{pnl_pct:+.2f}%</b>")
                         state[symbol] = {'position': 'closed'}
@@ -350,7 +375,8 @@ def run_websocket():
 
 # ==================== ФОНОВОЕ СКАНИРОВАНИЕ ====================
 def fetch_klines(pair, interval, min_bars):
-    pair_name = pair.replace('/', '')
+    # ВАЖНО: Используем правильное REST имя из словаря!
+    pair_name = REST_PAIR_BY_WSNAME.get(pair, pair.replace('/', ''))
     try:
         resp = requests.get(f"{BASE_URL}/OHLC", params={"pair": pair_name, "interval": interval}, timeout=20)
         data = resp.json()
@@ -455,7 +481,6 @@ def background_scan_loop():
                         exit_now, reason = check_exit(results, pos)
                         if exit_now:
                             exit_price = results[TRIGGER_TF]['close']
-                            # ИЗМЕНЕНИЕ: получаем PnL
                             pnl_pct = log_trade(pair, pos['entry_price'], exit_price, reason, pos.get('strategy', 'unknown'))
                             send_telegram(f"🔴 <b>ВЫХОД</b>\nПара: {pair}\nЦена: {exit_price:.4f}\nПричина: {reason}\nРезультат: <b>{pnl_pct:+.2f}%</b>")
                             state[pair] = {'position': 'closed'}; save_state(state); found_sell += 1
@@ -525,6 +550,10 @@ def background_scan_loop():
 def main():
     global PAIRS_WS, PAIRS_ALL, ohlc_buffers, state
     logger.info("Инициализация универсального бота (VPS)...")
+    
+    # ВАЖНО: Строим карту имен пар ДО запуска остальных функций
+    build_asset_pairs()
+    
     state = load_state()
 
     logger.info(f"Запрос списка {TOTAL_PAIRS} пар...")
