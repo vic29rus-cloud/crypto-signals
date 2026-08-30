@@ -3,7 +3,8 @@
 Универсальный бот (VPS): WebSocket + REST сканер.
 Отслеживает ТОП-200 пар в реальном времени (WebSocket)
 и сканирует 700 пар на боковики каждые 2 часа (REST).
-Исправлено: логирование ошибок fetch_klines, RLock, защита от вылетов.
+Полностью автономен, защищен от дедлоков (RLock).
+Добавлен мгновенный контроль стопов/тейков в WebSocket.
 """
 
 import json
@@ -186,6 +187,8 @@ def analyze_timeframe(df, params):
         'rsi': float(last['rsi']),
         'adx': float(last['adx']),
         'close': float(last['close']),
+        'high': float(last['high']),
+        'low': float(last['low']),
         'atr': float(last['atr']) if not pd.isna(last['atr']) else 0.0,
         'macd_line': float(last['macd_line']),
         'macd_signal': float(last['macd_signal'])
@@ -216,10 +219,13 @@ def check_breakout(df_daily, current_price):
 def check_exit(results, pos):
     r4h = results.get(TRIGGER_TF)
     if r4h is None: return False, ""
-    if r4h['close'] <= pos['stop']:
+    
+    # Используем low/high, чтобы ловить "хвосты" внутри свечи
+    if r4h['low'] <= pos['stop']:
         reason = "Трейлинг-стоп" if pos.get('trailing_active') else ("Безубыток" if pos.get('breakeven_moved') else "Stop-Loss")
         return True, reason
-    if r4h['close'] >= pos['target']: return True, "Take-Profit"
+    if r4h['high'] >= pos['target']:
+        return True, "Take-Profit"
     if r4h['macd_cross_up'] is False and r4h.get('ema_cross_down', False): return True, "Разворот"
     return False, ""
 
@@ -292,6 +298,26 @@ def on_message(ws, message):
             else:
                 ohlc_buffers[symbol].append(new_candle)
             
+            # ---------- МГНОВЕННЫЙ КОНТРОЛЬ СТОПОВ/ТЕЙКОВ (Вариант B) ----------
+            with state_lock:
+                pos = state.get(symbol)
+                if pos and pos.get('position') == 'open':
+                    # Если low задел стоп
+                    if new_candle['low'] <= pos['stop']:
+                        exit_price = pos['stop']
+                        log_trade(symbol, pos['entry_price'], exit_price, "Stop-Loss (WebSocket)", pos.get('strategy', 'unknown'))
+                        send_telegram(f"🔴 <b>СТОП-ЛОСС (WebSocket)</b>\nПара: {symbol}\nЦена: {exit_price:.4f}")
+                        state[symbol] = {'position': 'closed'}
+                        save_state(state)
+                    # Если high задел тейк
+                    elif new_candle['high'] >= pos['target']:
+                        exit_price = pos['target']
+                        log_trade(symbol, pos['entry_price'], exit_price, "Take-Profit (WebSocket)", pos.get('strategy', 'unknown'))
+                        send_telegram(f"🟢 <b>ТЕЙК-ПРОФИТ (WebSocket)</b>\nПара: {symbol}\nЦена: {exit_price:.4f}")
+                        state[symbol] = {'position': 'closed'}
+                        save_state(state)
+
+            # ----- Анализ на вход (если позиции нет) -----
             if len(ohlc_buffers[symbol]) >= MIN_BARS:
                 df = pd.DataFrame(list(ohlc_buffers[symbol]))
                 df['ema_fast'] = ema(df['close'], 9); df['ema_slow'] = ema(df['close'], 21)
