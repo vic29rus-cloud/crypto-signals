@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Универсальный бот (VPS): WebSocket + REST сканер.
-Финальная версия со всеми исправлениями.
+ФИНАЛЬНАЯ ВЕРСИЯ: Разделены списки для Confluence (импульс) и Breakout (боковики).
 """
 
 import json
@@ -32,8 +32,10 @@ ATR_MULT_SL, ATR_MULT_TP = 2.0, 4.0
 BREAKEVEN_TRIGGER_ATR = 1.0
 TRAILING_ATR_MULT = 1.5
 
-TOP_N = 200
-TOTAL_PAIRS = 700
+# Количество пар для анализа
+TOP_N = 200               # Волатильные для Confluence и WebSocket
+CONSOLIDATION_PAIRS = 700 # ВСЕ пары (включая спокойные) для поиска боковиков
+
 STATUS_INTERVAL_MINUTES = 120
 SCAN_INTERVAL_SECONDS = 7200
 
@@ -65,7 +67,8 @@ logger = logging.getLogger(__name__)
 
 # ==================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
 PAIRS_WS = []
-PAIRS_ALL = []
+PAIRS_VOLATILE = []
+PAIRS_ALL = []  # Все пары для боковиков
 ohlc_buffers = {}
 state = {}
 REST_PAIR_BY_WSNAME = {}
@@ -86,8 +89,8 @@ def build_asset_pairs():
     except Exception as e:
         logger.error(f"Ошибка построения карты: {e}")
 
-# ==================== ПОЛУЧЕНИЕ СПИСКА ПАР ====================
-def get_all_filtered_pairs(max_pairs=TOTAL_PAIRS):
+# ==================== ПОЛУЧЕНИЕ ВОЛАТИЛЬНЫХ ПАР (для Confluence) ====================
+def get_filtered_pairs(max_pairs=TOP_N):
     try:
         pairs_resp = requests.get(f"{BASE_URL}/AssetPairs", timeout=20)
         pairs_data = pairs_resp.json()
@@ -137,11 +140,42 @@ def get_all_filtered_pairs(max_pairs=TOTAL_PAIRS):
                 scored.append((pair_name, volatility_pct, turnover))
             except: continue
         
-        time.sleep(1.0)
+        time.sleep(0.5)
 
     scored.sort(key=lambda x: x[1], reverse=True)
     final_pairs = []
     for kraken_name, _, _ in scored[:max_pairs]:
+        ws_name = pair_map.get(kraken_name)
+        if ws_name: final_pairs.append(ws_name)
+    return final_pairs
+
+# ==================== ПОЛУЧЕНИЕ ВСЕХ ПАР (для Breakout) ====================
+def get_all_available_pairs(max_pairs=CONSOLIDATION_PAIRS):
+    try:
+        pairs_resp = requests.get(f"{BASE_URL}/AssetPairs", timeout=20)
+        pairs_data = pairs_resp.json()
+        if pairs_data.get("error"):
+            logger.error(f"Kraken API error: {pairs_data['error']}")
+            return []
+        all_pairs = pairs_data.get("result", {})
+        pair_map = {k: v.get("wsname") for k, v in all_pairs.items()}
+    except Exception as e:
+        logger.error(f"Ошибка получения списка: {e}")
+        return []
+
+    candidates = []
+    for kraken_name, info in all_pairs.items():
+        wsname = info.get("wsname", "")
+        if "/" not in wsname: continue
+        base, quote = wsname.split("/")
+        if quote != "USD": continue
+        if any(x in base for x in EXCLUDE_BASE_SUBSTRINGS): continue
+        if base in STABLECOINS: continue
+        candidates.append(kraken_name)
+
+    # Берём первые N доступных пар (без фильтра волатильности)
+    final_pairs = []
+    for kraken_name in candidates[:max_pairs]:
         ws_name = pair_map.get(kraken_name)
         if ws_name: final_pairs.append(ws_name)
     return final_pairs
@@ -259,28 +293,19 @@ def detect_consolidation(df_daily):
 
 def check_breakout(df_daily, current_price):
     if df_daily.empty or len(df_daily) < 60: return None
-    
-    # Закрытые свечи для расчета диапазона и индикаторов (без lookahead bias)
     closed = df_daily.iloc[:-1]
     if closed.empty or len(closed) < 60: return None
     window = closed.tail(30)
     if window.empty: return None
-    
     high = window['high'].max(); low = window['low'].min(); mean = window['close'].mean()
     range_pct = (high - low) / mean * 100 if mean > 0 else 100
     if range_pct > 15.0: return None
-    
     if current_price < high: return None
-    
-    # ВАЖНО: Объём берем из текущего дня (df_daily), а не из закрытых!
     vol_avg = closed['volume'].rolling(20).mean().iloc[-1]
     vol_ok = df_daily['volume'].iloc[-1] > vol_avg * 1.8
-    
     if not vol_ok: return None
-    
     adx_val = adx(closed).iloc[-1]
     atr_val = atr(closed).iloc[-1]
-    
     stop = current_price - atr_val * ATR_MULT_SL
     target = current_price + atr_val * ATR_MULT_TP
     return {"close": current_price, "stop": stop, "target": target, "days": len(window)}
@@ -445,18 +470,24 @@ def fetch_klines(pair, interval, min_bars):
 def background_scan_loop():
     global state
     while True:
-        logger.info("=== Запуск фонового сканирования (700 пар) ===")
-        all_pairs = get_all_filtered_pairs(TOTAL_PAIRS)
-        if not all_pairs:
-            logger.error("Не удалось получить пары!"); time.sleep(SCAN_INTERVAL_SECONDS); continue
+        logger.info("=== Запуск фонового сканирования ===")
         
-        current_prices = fetch_current_prices(all_pairs)
+        # 1. Получаем волатильные пары для Confluence и WebSocket
+        volatile_pairs = get_filtered_pairs(TOP_N)
+        # 2. Получаем все пары для поиска боковиков (без фильтра волатильности)
+        all_pairs_for_consolidation = get_all_available_pairs(CONSOLIDATION_PAIRS)
+
+        if not volatile_pairs:
+            logger.error("Не удалось получить волатильные пары!"); time.sleep(SCAN_INTERVAL_SECONDS); continue
+        
+        current_prices = fetch_current_prices(volatile_pairs + all_pairs_for_consolidation)
         found_buy, found_sell = 0, 0
         scan_summary = []
         consolidation_list = []
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        for idx, pair in enumerate(all_pairs):
+        # === ЦИКЛ 1: Confluence (Волатильные пары) ===
+        for idx, pair in enumerate(volatile_pairs):
             try:
                 df_daily = pd.DataFrame(fetch_klines(pair, 1440, 100))
                 if df_daily.empty:
@@ -470,32 +501,6 @@ def background_scan_loop():
                     results[tf] = analyze_timeframe(df_tf, params)
                     time.sleep(0.3)
 
-                # 1. СНАЧАЛА проверяем боковик
-                if not df_daily.empty and len(df_daily) > 30:
-                    cons = detect_consolidation(df_daily)
-                    if cons:
-                        consolidation_list.append({
-                            "pair": pair,
-                            "days": cons['days'],
-                            "range_pct": cons['range_pct'],
-                            "adx": cons['adx'],
-                            "breakout_level": cons['upper_level']
-                        })
-
-                # 2. ПОТОМ проверяем пробой (событие)
-                if not df_daily.empty and len(df_daily) > 30:
-                    current_price = current_prices.get(pair, df_daily['close'].iloc[-1])
-                    breakout = check_breakout(df_daily, current_price)
-                    
-                    if breakout:
-                        now_iso = datetime.now(timezone.utc).isoformat()
-                        with state_lock:
-                            if state.get(pair, {}).get('position') != 'open':
-                                send_telegram(f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>\nПара: {pair}\nЦена: {current_price:.4f}\nSL: {breakout['stop']:.4f}\nTP: {breakout['target']:.4f}\nДней в боковике: {breakout['days']}")
-                                state[pair] = {'position': 'open', 'entry_price': current_price, 'stop': breakout['stop'], 'target': breakout['target'], 'entry_time': now_iso, 'strategy': 'breakout'}
-                                save_state(state); found_buy += 1
-
-                # 3. Проверяем тренды для кандидатов
                 if all(results.get(tf) is not None for tf in TIMEFRAME_ORDER):
                     trend_score = sum(1 for tf in TIMEFRAME_ORDER if results[tf]['trend_up'])
                     r4h = results['4h']
@@ -506,11 +511,10 @@ def background_scan_loop():
                         "adx_1d": results['1d']['adx'], "macd_gap_pct": macd_gap_pct, "close_price": r4h['close']
                     })
 
-                # 4. Проверяем открытые позиции на выход
+                # Проверяем открытые позиции на выход
                 pos = state.get(pair)
                 if pos and pos.get('position') == 'open' and results.get(TRIGGER_TF) and results.get('1d'):
                     with state_lock:
-                        # Безубыток по ATR (корректно для любой волатильности)
                         if pos.get('entry_price') and results[TRIGGER_TF]['close'] >= pos['entry_price'] + (BREAKEVEN_TRIGGER_ATR * results['1d']['atr']) and not pos.get('breakeven_moved'):
                             pos['stop'] = pos['entry_price'] * 1.001; pos['breakeven_moved'] = True
                         
@@ -529,6 +533,40 @@ def background_scan_loop():
                 logger.error(f"Ошибка в {pair}: {e}")
                 continue
 
+        # === ЦИКЛ 2: Breakout (Все пары, включая спокойные) ===
+        for idx, pair in enumerate(all_pairs_for_consolidation):
+            try:
+                df_daily = pd.DataFrame(fetch_klines(pair, 1440, 100))
+                if df_daily.empty: continue
+
+                # Проверяем боковик
+                if not df_daily.empty and len(df_daily) > 30:
+                    cons = detect_consolidation(df_daily)
+                    if cons:
+                        consolidation_list.append({
+                            "pair": pair,
+                            "days": cons['days'],
+                            "range_pct": cons['range_pct'],
+                            "adx": cons['adx'],
+                            "breakout_level": cons['upper_level']
+                        })
+
+                    # Проверяем пробой
+                    current_price = current_prices.get(pair, df_daily['close'].iloc[-1])
+                    breakout = check_breakout(df_daily, current_price)
+                    
+                    if breakout:
+                        now_iso = datetime.now(timezone.utc).isoformat()
+                        with state_lock:
+                            if state.get(pair, {}).get('position') != 'open':
+                                send_telegram(f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>\nПара: {pair}\nЦена: {current_price:.4f}\nSL: {breakout['stop']:.4f}\nTP: {breakout['target']:.4f}\nДней в боковике: {breakout['days']}")
+                                state[pair] = {'position': 'open', 'entry_price': current_price, 'stop': breakout['stop'], 'target': breakout['target'], 'entry_time': now_iso, 'strategy': 'breakout'}
+                                save_state(state); found_buy += 1
+            except Exception as e:
+                logger.error(f"Ошибка в {pair}: {e}")
+                continue
+
+        # === ОТПРАВКА СТАТУСА ===
         open_pos = sum(1 for p in state.values() if p.get('position') == 'open')
         now_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
         
@@ -536,8 +574,8 @@ def background_scan_loop():
             f"📡 <b>Статус сканирования</b> — {now_str}",
             f"━━━━━━━━━━━━━━━━━━━━━",
             f"📊 <b>Общая статистика:</b>",
-            f"• Отслеживается пар (Confluence): {len(all_pairs)}",
-            f"• Дополнительно проверено на боковик: {TOTAL_PAIRS - TOP_N}",
+            f"• Отслеживается пар (Confluence): {len(volatile_pairs)}",
+            f"• Дополнительно проверено на боковик: {len(all_pairs_for_consolidation)}",
             f"• Всего в боковике найдено: {len(consolidation_list)}",
             f"• Открытых позиций: {open_pos}",
             f"• Входов за цикл: {found_buy}",
@@ -585,20 +623,20 @@ def background_scan_loop():
 
 # ==================== MAIN ====================
 def main():
-    global PAIRS_WS, PAIRS_ALL, ohlc_buffers, state
+    global PAIRS_WS, PAIRS_VOLATILE, PAIRS_ALL, ohlc_buffers, state
     logger.info("Инициализация универсального бота (VPS)...")
     build_asset_pairs()
     state = load_state()
 
-    logger.info(f"Запрос списка {TOTAL_PAIRS} пар...")
-    PAIRS_ALL = []
-    while not PAIRS_ALL:
-        PAIRS_ALL = get_all_filtered_pairs(TOTAL_PAIRS)
-        if not PAIRS_ALL:
-            logger.error("Не удалось получить пары! Жду 5 минут и пробую снова...")
+    logger.info("Запрос списков пар...")
+    PAIRS_VOLATILE = []
+    while not PAIRS_VOLATILE:
+        PAIRS_VOLATILE = get_filtered_pairs(TOP_N)
+        if not PAIRS_VOLATILE:
+            logger.error("Не удалось получить волатильные пары! Жду 5 минут и пробую снова...")
             time.sleep(300)
     
-    PAIRS_WS = PAIRS_ALL[:TOP_N]
+    PAIRS_WS = PAIRS_VOLATILE
     logger.info(f"Топ-200 для WebSocket: {len(PAIRS_WS)} пар")
 
     ohlc_buffers = {pair: deque(maxlen=100) for pair in PAIRS_WS}
@@ -610,7 +648,7 @@ def main():
             ohlc_buffers[pair].extend(history)
         time.sleep(0.1)
 
-    logger.info("Запуск фонового сканера (700 пар, каждые 2 часа)...")
+    logger.info("Запуск фонового сканера (каждые 2 часа)...")
     scanner_thread = threading.Thread(target=background_scan_loop, daemon=True)
     scanner_thread.start()
 
