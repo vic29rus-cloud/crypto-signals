@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Универсальный бот (VPS): WebSocket + REST сканер.
-Исправления:
-1. Устранен Lookahead Bias (незакрытые свечи).
-2. Отдельная функция detect_consolidation() для списка боковиков.
-3. Rate limit (задержки 0.3 сек).
-4. Точное время сделок (now_iso в момент входа/выхода).
-5. Atomic Write для защиты state.json от повреждений.
+Исправления: 
+1. Добавлен расчет ema_cross_down/ema_cross_up.
+2. Устранен Lookahead Bias (незакрытые свечи).
+3. Отдельная функция detect_consolidation().
+4. Rate limit (задержки 0.3 сек).
+5. Точное время сделок.
+6. Atomic Write для защиты state.json.
 """
 
 import json
@@ -220,9 +221,12 @@ def analyze_timeframe(df, params):
     if any(pd.isna([last['ema_fast'], last['ema_slow'], last['rsi'], last['adx'], last['macd_line'], last['macd_signal']])): 
         return None
     
+    # ИСПРАВЛЕНИЕ: Теперь считаем ema_cross_down и ema_cross_up!
     return {
         'trend_up': bool(last['ema_fast'] > last['ema_slow']),
         'macd_cross_up': bool(prev['macd_line'] <= prev['macd_signal'] and last['macd_line'] > last['macd_signal']),
+        'ema_cross_down': bool(prev['ema_fast'] >= prev['ema_slow'] and last['ema_fast'] < last['ema_slow']),
+        'ema_cross_up': bool(prev['ema_fast'] <= prev['ema_slow'] and last['ema_fast'] > last['ema_slow']),
         'rsi': float(last['rsi']),
         'adx': float(last['adx']),
         'close': float(last['close']),
@@ -233,7 +237,7 @@ def analyze_timeframe(df, params):
         'macd_signal': float(last['macd_signal'])
     }
 
-# НОВАЯ ФУНКЦИЯ ОТ РЕЦЕНЗЕНТА: Ищем боковики по закрытым свечам
+# НОВАЯ ФУНКЦИЯ: Ищем боковики по закрытым свечам
 def detect_consolidation(df_daily):
     closed = df_daily.iloc[:-1]
     if len(closed) < 60:
@@ -288,7 +292,9 @@ def check_exit(results, pos):
         return True, reason
     if r4h['high'] >= pos['target']:
         return True, "Take-Profit"
-    if r4h['macd_cross_up'] is False and r4h.get('ema_cross_down', False): return True, "Разворот"
+    # ИСПРАВЛЕНИЕ: Теперь этот выход реально работает!
+    if r4h['ema_cross_down']: 
+        return True, "Разворот (4h)"
     return False, ""
 
 # ==================== TELEGRAM И СОСТОЯНИЕ ====================
@@ -313,14 +319,13 @@ def load_state():
             with open(STATE_FILE, 'r') as f: return json.load(f)
         except: return {}
 
-# ИСПРАВЛЕНИЕ: Atomic Write для предотвращения повреждения файла
 def save_state(state):
     with state_lock:
         try:
             tmp_file = STATE_FILE + ".tmp"
             with open(tmp_file, 'w') as f:
                 json.dump(state, f, indent=2)
-            os.replace(tmp_file, STATE_FILE)  # Атомарная операция
+            os.replace(tmp_file, STATE_FILE)
         except IOError as e:
             logger.error(f"Ошибка сохранения: {e}")
 
@@ -464,9 +469,9 @@ def background_scan_loop():
                     df_tf = pd.DataFrame(fetch_klines(pair, params['kraken_interval'], params['min_bars']))
                     if df_tf.empty: logger.debug(f"[{pair}] Нет данных по {tf}")
                     results[tf] = analyze_timeframe(df_tf, params)
-                    time.sleep(0.3) # УВЕЛИЧЕНА ЗАДЕРЖКА ДЛЯ RATE LIMIT
+                    time.sleep(0.3)
 
-                # 1. СНАЧАЛА проверяем боковик (новое!)
+                # 1. СНАЧАЛА проверяем боковик
                 if not df_daily.empty and len(df_daily) > 30:
                     cons = detect_consolidation(df_daily)
                     if cons:
@@ -478,13 +483,12 @@ def background_scan_loop():
                             "breakout_level": cons['upper_level']
                         })
 
-                # 2. ПОТОМ проверяем пробой (событие, не состояние)
+                # 2. ПОТОМ проверяем пробой (событие)
                 if not df_daily.empty and len(df_daily) > 30:
                     current_price = current_prices.get(pair, df_daily['close'].iloc[-1])
                     breakout = check_breakout(df_daily, current_price)
                     
                     if breakout:
-                        # Время входа берется прямо сейчас!
                         now_iso = datetime.now(timezone.utc).isoformat()
                         with state_lock:
                             if state.get(pair, {}).get('position') != 'open':
@@ -517,7 +521,6 @@ def background_scan_loop():
                         exit_now, reason = check_exit(results, pos)
                         if exit_now:
                             exit_price = results[TRIGGER_TF]['close']
-                            # Время выхода берется прямо сейчас!
                             now_iso = datetime.now(timezone.utc).isoformat()
                             pnl_pct = log_trade(pair, pos['entry_price'], exit_price, reason, pos.get('strategy', 'unknown'))
                             send_telegram(f"🔴 <b>ВЫХОД</b>\nПара: {pair}\nЦена: {exit_price:.4f}\nПричина: {reason}\nРезультат: <b>{pnl_pct:+.2f}%</b>")
