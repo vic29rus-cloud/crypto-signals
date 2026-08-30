@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
 Универсальный бот (VPS): WebSocket + REST сканер.
-Исправления: RLock (без дедлоков), точные стопы/тейки по high/low,
-маппинг имен Kraken, вывод PnL в %.
+Исправления:
+1. Устранен Lookahead Bias (незакрытые свечи).
+2. Отдельная функция detect_consolidation() для списка боковиков.
+3. Rate limit (задержки 0.3 сек).
+4. Точное время сделок (now_iso в момент входа/выхода).
+5. Atomic Write для защиты state.json от повреждений.
 """
 
 import json
@@ -40,6 +44,7 @@ SCAN_INTERVAL_SECONDS = 7200
 
 STATE_FILE = "/opt/kraken-scanner/kraken_ws_state.json"
 TRADES_LOG_FILE = "/opt/kraken-scanner/trades_log.json"
+QUALIFIED_PAIRS_FILE = "/opt/kraken-scanner/qualified_pairs.json"
 
 TIMEFRAME_PARAMS = {
     "15m": {"kraken_interval": 15,   "ema_fast": 9,  "ema_slow": 21, "min_bars": 80},
@@ -69,8 +74,6 @@ PAIRS_ALL = []
 ohlc_buffers = {}
 state = {}
 REST_PAIR_BY_WSNAME = {}
-
-# ИСПРАВЛЕНИЕ ДЕДЛОКА: RLock вместо Lock!
 state_lock = threading.RLock()
 
 # ==================== МАППИНГ ИМЕН ПАР ====================
@@ -230,6 +233,34 @@ def analyze_timeframe(df, params):
         'macd_signal': float(last['macd_signal'])
     }
 
+# НОВАЯ ФУНКЦИЯ ОТ РЕЦЕНЗЕНТА: Ищем боковики по закрытым свечам
+def detect_consolidation(df_daily):
+    closed = df_daily.iloc[:-1]
+    if len(closed) < 60:
+        return None
+
+    window = closed.tail(30)
+    high = window['high'].max()
+    low = window['low'].min()
+    mean = window['close'].mean()
+
+    if mean <= 0:
+        return None
+
+    range_pct = (high - low) / mean * 100
+    adx_val = adx(closed).iloc[-1]
+
+    if range_pct <= 15.0 and adx_val < 20:
+        return {
+            "days": len(window),
+            "range_pct": round(range_pct, 2),
+            "adx": round(float(adx_val), 2),
+            "upper_level": high,
+            "lower_level": low,
+        }
+
+    return None
+
 def check_breakout(df_daily, current_price):
     if df_daily.empty or len(df_daily) < 60: return None
     closed = df_daily.iloc[:-1]
@@ -252,7 +283,6 @@ def check_breakout(df_daily, current_price):
 def check_exit(results, pos):
     r4h = results.get(TRIGGER_TF)
     if r4h is None: return False, ""
-    # Проверяем по high/low! Это важно!
     if r4h['low'] <= pos['stop']:
         reason = "Трейлинг-стоп" if pos.get('trailing_active') else ("Безубыток" if pos.get('breakeven_moved') else "Stop-Loss")
         return True, reason
@@ -283,10 +313,14 @@ def load_state():
             with open(STATE_FILE, 'r') as f: return json.load(f)
         except: return {}
 
+# ИСПРАВЛЕНИЕ: Atomic Write для предотвращения повреждения файла
 def save_state(state):
     with state_lock:
         try:
-            with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
+            tmp_file = STATE_FILE + ".tmp"
+            with open(tmp_file, 'w') as f:
+                json.dump(state, f, indent=2)
+            os.replace(tmp_file, STATE_FILE)  # Атомарная операция
         except IOError as e:
             logger.error(f"Ошибка сохранения: {e}")
 
@@ -415,6 +449,7 @@ def background_scan_loop():
         found_buy, found_sell = 0, 0
         scan_summary = []
         consolidation_list = []
+        # now_iso берется ПЕРЕД обработкой, но обновляется внутри цикла для точности
         now_iso = datetime.now(timezone.utc).isoformat()
 
         for idx, pair in enumerate(all_pairs):
@@ -429,29 +464,35 @@ def background_scan_loop():
                     df_tf = pd.DataFrame(fetch_klines(pair, params['kraken_interval'], params['min_bars']))
                     if df_tf.empty: logger.debug(f"[{pair}] Нет данных по {tf}")
                     results[tf] = analyze_timeframe(df_tf, params)
-                    time.sleep(0.1)
-                
+                    time.sleep(0.3) # УВЕЛИЧЕНА ЗАДЕРЖКА ДЛЯ RATE LIMIT
+
+                # 1. СНАЧАЛА проверяем боковик (новое!)
+                if not df_daily.empty and len(df_daily) > 30:
+                    cons = detect_consolidation(df_daily)
+                    if cons:
+                        consolidation_list.append({
+                            "pair": pair,
+                            "days": cons['days'],
+                            "range_pct": cons['range_pct'],
+                            "adx": cons['adx'],
+                            "breakout_level": cons['upper_level']
+                        })
+
+                # 2. ПОТОМ проверяем пробой (событие, не состояние)
                 if not df_daily.empty and len(df_daily) > 30:
                     current_price = current_prices.get(pair, df_daily['close'].iloc[-1])
                     breakout = check_breakout(df_daily, current_price)
                     
                     if breakout:
-                        window = df_daily.iloc[:-1].tail(30)
-                        high = window['high'].max(); low = window['low'].min(); mean = window['close'].mean()
-                        range_pct = (high - low) / mean * 100 if mean > 0 else 0
-                        adx_val = adx(df_daily.iloc[:-1]).iloc[-1]
-                        
-                        consolidation_list.append({
-                            "pair": pair, "days": breakout['days'], "range_pct": range_pct,
-                            "adx": adx_val, "breakout_level": current_price
-                        })
-                        
+                        # Время входа берется прямо сейчас!
+                        now_iso = datetime.now(timezone.utc).isoformat()
                         with state_lock:
                             if state.get(pair, {}).get('position') != 'open':
                                 send_telegram(f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>\nПара: {pair}\nЦена: {current_price:.4f}\nSL: {breakout['stop']:.4f}\nTP: {breakout['target']:.4f}\nДней в боковике: {breakout['days']}")
                                 state[pair] = {'position': 'open', 'entry_price': current_price, 'stop': breakout['stop'], 'target': breakout['target'], 'entry_time': now_iso, 'strategy': 'breakout'}
                                 save_state(state); found_buy += 1
 
+                # 3. Проверяем тренды для кандидатов
                 if all(results.get(tf) is not None for tf in TIMEFRAME_ORDER):
                     trend_score = sum(1 for tf in TIMEFRAME_ORDER if results[tf]['trend_up'])
                     r4h = results['4h']
@@ -462,6 +503,7 @@ def background_scan_loop():
                         "adx_1d": results['1d']['adx'], "macd_gap_pct": macd_gap_pct, "close_price": r4h['close']
                     })
 
+                # 4. Проверяем открытые позиции на выход
                 pos = state.get(pair)
                 if pos and pos.get('position') == 'open' and results.get(TRIGGER_TF) and results.get('1d'):
                     with state_lock:
@@ -475,6 +517,8 @@ def background_scan_loop():
                         exit_now, reason = check_exit(results, pos)
                         if exit_now:
                             exit_price = results[TRIGGER_TF]['close']
+                            # Время выхода берется прямо сейчас!
+                            now_iso = datetime.now(timezone.utc).isoformat()
                             pnl_pct = log_trade(pair, pos['entry_price'], exit_price, reason, pos.get('strategy', 'unknown'))
                             send_telegram(f"🔴 <b>ВЫХОД</b>\nПара: {pair}\nЦена: {exit_price:.4f}\nПричина: {reason}\nРезультат: <b>{pnl_pct:+.2f}%</b>")
                             state[pair] = {'position': 'closed'}; save_state(state); found_sell += 1
