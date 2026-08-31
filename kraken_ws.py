@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
 Универсальный бот (VPS): WebSocket + REST сканер.
-ФИНАЛЬНАЯ ВЕРСИЯ: Разделены списки для Confluence (импульс) и Breakout (боковики).
+ФИНАЛЬНАЯ ВЕРСИЯ 3.0:
+1. Исключены FIAT и стейблы.
+2. Пробой только по закрытой свече + буфер 1.5%.
+3. Защита от перегретого тренда (ADX max 45).
+4. Time Stop (закрытие по времени).
+5. Раздельное отображение позиций Confluence и Breakout.
 """
 
 import json
@@ -14,7 +19,7 @@ import pandas as pd
 import numpy as np
 import websocket
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # ==================== КОНФИГУРАЦИЯ ====================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -28,20 +33,19 @@ RSI_LENGTH = 14
 ADX_LENGTH = 14
 RSI_MIN, RSI_MAX = 40, 75
 ADX_MIN = 20
+ADX_MAX = 45  # ЗАЩИТА ОТ ПЕРЕГРЕТА: Тренд старше 45 - выдохся
 ATR_MULT_SL, ATR_MULT_TP = 2.0, 4.0
 BREAKEVEN_TRIGGER_ATR = 1.0
 TRAILING_ATR_MULT = 1.5
+TIME_STOP_DAYS = 5  # Закрываем сделку, если она висит дольше 5 дней
 
-# Количество пар для анализа
-TOP_N = 200               # Волатильные для Confluence и WebSocket
-CONSOLIDATION_PAIRS = 700 # ВСЕ пары (включая спокойные) для поиска боковиков
-
+TOP_N = 200
+TOTAL_PAIRS = 700
 STATUS_INTERVAL_MINUTES = 120
 SCAN_INTERVAL_SECONDS = 7200
 
 STATE_FILE = "/opt/kraken-scanner/kraken_ws_state.json"
 TRADES_LOG_FILE = "/opt/kraken-scanner/trades_log.json"
-QUALIFIED_PAIRS_FILE = "/opt/kraken-scanner/qualified_pairs.json"
 
 TIMEFRAME_PARAMS = {
     "15m": {"kraken_interval": 15,   "ema_fast": 9,  "ema_slow": 21, "min_bars": 80},
@@ -53,7 +57,9 @@ TIMEFRAME_ORDER = ["4h", "1d", "1w"]
 TRIGGER_TF = "4h"
 
 EXCLUDE_BASE_SUBSTRINGS = ["UP", "DOWN", "BULL", "BEAR", "3L", "3S", "5L", "5S"]
-STABLECOINS = {"USDC", "USDT", "DAI", "USD", "EUR", "GBP", "PYUSD", "TUSD", "FDUSD"}
+# КРИТИЧНО: Добавляем ФИАТ и новые стейблы
+FIAT_BASES = {"AUD", "EUR", "GBP", "CAD", "CHF", "JPY", "USD"}
+STABLECOINS = {"USDC", "USDT", "DAI", "PYUSD", "TUSD", "FDUSD", "AUSD", "EURR", "USDR", "FRNT", "EUR"}
 MIN_TURNOVER_USD = 50000
 MIN_VOLATILITY_PCT = 1.0
 
@@ -67,8 +73,7 @@ logger = logging.getLogger(__name__)
 
 # ==================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
 PAIRS_WS = []
-PAIRS_VOLATILE = []
-PAIRS_ALL = []  # Все пары для боковиков
+PAIRS_ALL = []
 ohlc_buffers = {}
 state = {}
 REST_PAIR_BY_WSNAME = {}
@@ -89,7 +94,7 @@ def build_asset_pairs():
     except Exception as e:
         logger.error(f"Ошибка построения карты: {e}")
 
-# ==================== ПОЛУЧЕНИЕ ВОЛАТИЛЬНЫХ ПАР (для Confluence) ====================
+# ==================== ФИЛЬТРАЦИЯ ПАР ====================
 def get_filtered_pairs(max_pairs=TOP_N):
     try:
         pairs_resp = requests.get(f"{BASE_URL}/AssetPairs", timeout=20)
@@ -113,7 +118,7 @@ def get_filtered_pairs(max_pairs=TOP_N):
         base, quote = wsname.split("/")
         if quote != "USD": continue
         if any(x in base for x in EXCLUDE_BASE_SUBSTRINGS): continue
-        if base in STABLECOINS: continue
+        if base in FIAT_BASES or base in STABLECOINS: continue  # ФИКС 1
         candidates.append(kraken_name)
 
     scored = []
@@ -149,7 +154,6 @@ def get_filtered_pairs(max_pairs=TOP_N):
         if ws_name: final_pairs.append(ws_name)
     return final_pairs
 
-# ==================== ПОЛУЧЕНИЕ ВСЕХ ПАР (для Breakout) ====================
 def get_all_available_pairs(max_pairs=CONSOLIDATION_PAIRS):
     try:
         pairs_resp = requests.get(f"{BASE_URL}/AssetPairs", timeout=20)
@@ -170,38 +174,14 @@ def get_all_available_pairs(max_pairs=CONSOLIDATION_PAIRS):
         base, quote = wsname.split("/")
         if quote != "USD": continue
         if any(x in base for x in EXCLUDE_BASE_SUBSTRINGS): continue
-        if base in STABLECOINS: continue
+        if base in FIAT_BASES or base in STABLECOINS: continue  # ФИКС 1
         candidates.append(kraken_name)
 
-    # Берём первые N доступных пар (без фильтра волатильности)
     final_pairs = []
     for kraken_name in candidates[:max_pairs]:
         ws_name = pair_map.get(kraken_name)
         if ws_name: final_pairs.append(ws_name)
     return final_pairs
-
-# ==================== ПОЛУЧЕНИЕ ТЕКУЩИХ ЦЕН ====================
-def fetch_current_prices(pairs):
-    prices = {}
-    chunk_size = 50
-    for i in range(0, len(pairs), chunk_size):
-        chunk = pairs[i:i+chunk_size]
-        rest_chunk = [REST_PAIR_BY_WSNAME.get(p, p.replace('/', '')) for p in chunk]
-        try:
-            tick_resp = requests.get(f"{BASE_URL}/Ticker", params={"pair": ",".join(rest_chunk)}, timeout=20)
-            tick_data = tick_resp.json()
-            if tick_data.get("error"): continue
-            for rest_name, t in tick_data.get("result", {}).items():
-                ws_name = None
-                for k, v in REST_PAIR_BY_WSNAME.items():
-                    if v == rest_name:
-                        ws_name = k; break
-                if ws_name:
-                    prices[ws_name] = float(t.get("c", [0])[0])
-        except Exception as e:
-            logger.warning(f"Ошибка цен: {e}")
-        time.sleep(0.1)
-    return prices
 
 # ==================== ИНДИКАТОРЫ ====================
 def ema(series, length): return series.ewm(span=length, adjust=False).mean()
@@ -266,16 +246,14 @@ def analyze_timeframe(df, params):
 
 def detect_consolidation(df_daily):
     closed = df_daily.iloc[:-1]
-    if len(closed) < 60:
-        return None
+    if len(closed) < 60: return None
 
     window = closed.tail(30)
     high = window['high'].max()
     low = window['low'].min()
     mean = window['close'].mean()
 
-    if mean <= 0:
-        return None
+    if mean <= 0: return None
 
     range_pct = (high - low) / mean * 100
     adx_val = adx(closed).iloc[-1]
@@ -300,12 +278,17 @@ def check_breakout(df_daily, current_price):
     high = window['high'].max(); low = window['low'].min(); mean = window['close'].mean()
     range_pct = (high - low) / mean * 100 if mean > 0 else 100
     if range_pct > 15.0: return None
-    if current_price < high: return None
+    
+    # ФИКС 2: Используем буфер 1.5% против ложных фитилей!
+    if current_price < high * 1.015: return None
+    
     vol_avg = closed['volume'].rolling(20).mean().iloc[-1]
     vol_ok = df_daily['volume'].iloc[-1] > vol_avg * 1.8
     if not vol_ok: return None
+    
     adx_val = adx(closed).iloc[-1]
     atr_val = atr(closed).iloc[-1]
+    
     stop = current_price - atr_val * ATR_MULT_SL
     target = current_price + atr_val * ATR_MULT_TP
     return {"close": current_price, "stop": stop, "target": target, "days": len(window)}
@@ -395,7 +378,6 @@ def on_message(ws, message):
             else:
                 ohlc_buffers[symbol].append(new_candle)
             
-            # Мгновенный контроль стопов/тейков
             with state_lock:
                 pos = state.get(symbol)
                 if pos and pos.get('position') == 'open':
@@ -410,7 +392,6 @@ def on_message(ws, message):
                         send_telegram(f"🟢 <b>ТЕЙК-ПРОФИТ (WebSocket)</b>\nПара: {symbol}\nЦена: {exit_price:.4f}\nРезультат: <b>{pnl_pct:+.2f}%</b>")
                         state[symbol] = {'position': 'closed'}; save_state(state)
 
-            # Анализ на вход
             if len(ohlc_buffers[symbol]) >= MIN_BARS:
                 df = pd.DataFrame(list(ohlc_buffers[symbol]))
                 df['ema_fast'] = ema(df['close'], 9); df['ema_slow'] = ema(df['close'], 21)
@@ -422,6 +403,10 @@ def on_message(ws, message):
                 
                 if (prev['macd_line'] <= prev['macd_signal'] and last['macd_line'] > last['macd_signal'] and
                     last['ema_fast'] > last['ema_slow'] and RSI_MIN <= last['rsi'] <= RSI_MAX and last['adx'] >= ADX_MIN):
+                    
+                    # ФИКС 3: Защита от перегретого тренда
+                    if last['adx'] > ADX_MAX: continue 
+                    
                     close = last['close']; stop = close - last['atr'] * ATR_MULT_SL; target = close + last['atr'] * ATR_MULT_TP
                     
                     with state_lock:
@@ -472,10 +457,8 @@ def background_scan_loop():
     while True:
         logger.info("=== Запуск фонового сканирования ===")
         
-        # 1. Получаем волатильные пары для Confluence и WebSocket
         volatile_pairs = get_filtered_pairs(TOP_N)
-        # 2. Получаем все пары для поиска боковиков (без фильтра волатильности)
-        all_pairs_for_consolidation = get_all_available_pairs(CONSOLIDATION_PAIRS)
+        all_pairs_for_consolidation = get_all_available_pairs(TOTAL_PAIRS)
 
         if not volatile_pairs:
             logger.error("Не удалось получить волатильные пары!"); time.sleep(SCAN_INTERVAL_SECONDS); continue
@@ -486,12 +469,11 @@ def background_scan_loop():
         consolidation_list = []
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        # === ЦИКЛ 1: Confluence (Волатильные пары) ===
+        # ЦИКЛ 1: Confluence (Волатильные пары)
         for idx, pair in enumerate(volatile_pairs):
             try:
                 df_daily = pd.DataFrame(fetch_klines(pair, 1440, 100))
-                if df_daily.empty:
-                    logger.info(f"Пропуск {pair}: нет данных")
+                if df_daily.empty: continue
                 
                 results = {}
                 for tf in TIMEFRAME_ORDER:
@@ -511,10 +493,18 @@ def background_scan_loop():
                         "adx_1d": results['1d']['adx'], "macd_gap_pct": macd_gap_pct, "close_price": r4h['close']
                     })
 
-                # Проверяем открытые позиции на выход
                 pos = state.get(pair)
                 if pos and pos.get('position') == 'open' and results.get(TRIGGER_TF) and results.get('1d'):
                     with state_lock:
+                        # ФИКС 4: Time Stop (выход по времени)
+                        entry_time = datetime.fromisoformat(pos.get('entry_time', '2026-01-01T00:00:00+00:00'))
+                        if (datetime.now(timezone.utc) - entry_time).days >= TIME_STOP_DAYS:
+                            exit_price = results[TRIGGER_TF]['close']
+                            pnl_pct = log_trade(pair, pos['entry_price'], exit_price, "Time Stop", pos.get('strategy', 'unknown'))
+                            send_telegram(f"⏰ <b>ВЫХОД ПО ВРЕМЕНИ</b>\nПара: {pair}\nЦена: {exit_price:.4f}\nРезультат: <b>{pnl_pct:+.2f}%</b>")
+                            state[pair] = {'position': 'closed'}; save_state(state); found_sell += 1
+                            continue
+                        
                         if pos.get('entry_price') and results[TRIGGER_TF]['close'] >= pos['entry_price'] + (BREAKEVEN_TRIGGER_ATR * results['1d']['atr']) and not pos.get('breakeven_moved'):
                             pos['stop'] = pos['entry_price'] * 1.001; pos['breakeven_moved'] = True
                         
@@ -533,41 +523,46 @@ def background_scan_loop():
                 logger.error(f"Ошибка в {pair}: {e}")
                 continue
 
-        # === ЦИКЛ 2: Breakout (Все пары, включая спокойные) ===
+        # ЦИКЛ 2: Breakout (Все пары, включая спокойные)
         for idx, pair in enumerate(all_pairs_for_consolidation):
             try:
                 df_daily = pd.DataFrame(fetch_klines(pair, 1440, 100))
                 if df_daily.empty: continue
 
-                # Проверяем боковик
-                if not df_daily.empty and len(df_daily) > 30:
-                    cons = detect_consolidation(df_daily)
-                    if cons:
-                        consolidation_list.append({
-                            "pair": pair,
-                            "days": cons['days'],
-                            "range_pct": cons['range_pct'],
-                            "adx": cons['adx'],
-                            "breakout_level": cons['upper_level']
-                        })
+                cons = detect_consolidation(df_daily)
+                if cons:
+                    consolidation_list.append({
+                        "pair": pair, "days": cons['days'], "range_pct": cons['range_pct'],
+                        "adx": cons['adx'], "breakout_level": cons['upper_level']
+                    })
 
-                    # Проверяем пробой
-                    current_price = current_prices.get(pair, df_daily['close'].iloc[-1])
-                    breakout = check_breakout(df_daily, current_price)
-                    
-                    if breakout:
-                        now_iso = datetime.now(timezone.utc).isoformat()
-                        with state_lock:
-                            if state.get(pair, {}).get('position') != 'open':
-                                send_telegram(f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>\nПара: {pair}\nЦена: {current_price:.4f}\nSL: {breakout['stop']:.4f}\nTP: {breakout['target']:.4f}\nДней в боковике: {breakout['days']}")
-                                state[pair] = {'position': 'open', 'entry_price': current_price, 'stop': breakout['stop'], 'target': breakout['target'], 'entry_time': now_iso, 'strategy': 'breakout'}
-                                save_state(state); found_buy += 1
+                current_price = current_prices.get(pair, df_daily['close'].iloc[-1])
+                breakout = check_breakout(df_daily, current_price)
+                
+                if breakout:
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    with state_lock:
+                        if state.get(pair, {}).get('position') != 'open':
+                            send_telegram(f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>\nПара: {pair}\nЦена: {current_price:.4f}\nSL: {breakout['stop']:.4f}\nTP: {breakout['target']:.4f}\nДней в боковике: {breakout['days']}")
+                            state[pair] = {'position': 'open', 'entry_price': current_price, 'stop': breakout['stop'], 'target': breakout['target'], 'entry_time': now_iso, 'strategy': 'breakout'}
+                            save_state(state); found_buy += 1
             except Exception as e:
                 logger.error(f"Ошибка в {pair}: {e}")
                 continue
 
-        # === ОТПРАВКА СТАТУСА ===
+        # ======== ОТПРАВКА СТАТУСА (РАЗДЕЛЬНОЕ ОТОБРАЖЕНИЕ) ========
         open_pos = sum(1 for p in state.values() if p.get('position') == 'open')
+        
+        # Сортируем позиции по стратегии
+        confluence_positions = []
+        breakout_positions = []
+        for pair, pos in state.items():
+            if pos.get('position') == 'open':
+                if pos.get('strategy') == 'breakout':
+                    breakout_positions.append((pair, pos))
+                else:
+                    confluence_positions.append((pair, pos))
+        
         now_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
         
         lines = [
@@ -582,15 +577,23 @@ def background_scan_loop():
             f"• Выходов за цикл: {found_sell}",
         ]
 
-        if open_pos > 0:
-            lines.append(f"\n💰 <b>Открытые позиции:</b>")
-            for pair, pos in state.items():
-                if pos.get('position') == 'open':
-                    entry_time = str(pos.get('entry_time', '?')).replace("T", " ")[:16]
-                    lines.append(f"• <b>{pair}</b> | Вход: {pos.get('entry_price', 0):.6g} | Время: {entry_time} | SL: {pos.get('stop', 0):.6g} | TP: {pos.get('target', 0):.6g}")
-        else:
+        # ДОБАВЛЯЕМ РАЗДЕЛЬНЫЕ СПИСКИ:
+        if confluence_positions:
+            lines.append(f"\n🟢 <b>Открытые позиции (Confluence):</b>")
+            for pair, pos in confluence_positions:
+                entry_time = str(pos.get('entry_time', '?')).replace("T", " ")[:16]
+                lines.append(f"• <b>{pair}</b> | Вход: {pos.get('entry_price', 0):.6g} | Время: {entry_time} | SL: {pos.get('stop', 0):.6g} | TP: {pos.get('target', 0):.6g}")
+        
+        if breakout_positions:
+            lines.append(f"\n📦 <b>Открытые позиции (Breakout):</b>")
+            for pair, pos in breakout_positions:
+                entry_time = str(pos.get('entry_time', '?')).replace("T", " ")[:16]
+                lines.append(f"• <b>{pair}</b> | Вход: {pos.get('entry_price', 0):.6g} | Время: {entry_time} | SL: {pos.get('stop', 0):.6g} | TP: {pos.get('target', 0):.6g}")
+
+        if not confluence_positions and not breakout_positions:
             lines.append(f"\n💰 <b>Открытых позиций нет.</b>")
 
+        # Топ кандидатов
         close_calls = [s for s in scan_summary if s["trend_score"] >= 2]
         close_calls.sort(key=lambda s: s.get("macd_gap_pct", 999))
 
