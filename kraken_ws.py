@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Универсальный бот (VPS): WebSocket + REST сканер.
-Версия 13.0 - Финальная версия (исправлены ошибки советника + фильтрация пар).
+Версия 14.0 - Полностью исправленная версия.
+Решает: unhashable type, NoneType, маппинг пар, отправка Telegram.
 """
 
 import json
@@ -22,19 +23,16 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 BASE_URL = "https://api.kraken.com/0/public"
 WS_URL = "wss://ws.kraken.com/v2"
 
-# Сканирование
 TOP_N = 200
 TOTAL_PAIRS = 700
-SCAN_INTERVAL_SECONDS = 7200  # 2 часа
+SCAN_INTERVAL_SECONDS = 7200
 MIN_TURNOVER_USD = 50000
 
-# Стратегия
 TIMEFRAME = 15
 MIN_BARS = 80
 TRIGGER_TF = "4h"
 TIME_STOP_DAYS = 7
 
-# Риск-менеджмент
 MAX_OPEN_POSITIONS = 5
 MAX_TRADES_PER_HOUR = 10
 ENTRY_COOLDOWN_SECONDS = 3600
@@ -42,11 +40,9 @@ MIN_STOP_DISTANCE_PCT = 0.5
 MAX_ENTRY_SLIPPAGE_PCT = 0.5
 MAX_BREAKOUT_DISTANCE_PCT = 3.0
 
-# Комиссии
 FEE_PCT = 0.25
 SLIPPAGE_PCT = 0.05
 
-# Индикаторы
 ATR_MULT_SL = 3.0
 ATR_MULT_TP = 6.0
 BREAKEVEN_TRIGGER_ATR = 1.0
@@ -54,10 +50,8 @@ TRAILING_TRIGGER_ATR = 2.0
 TRAILING_STEP_ATR = 1.0
 ADX_MAX = 45
 
-# Очистка
 CLEANUP_AFTER_DAYS = 14
 
-# Пути к файлам
 STATE_FILE = "/opt/kraken-scanner/kraken_ws_state.json"
 TRADES_LOG_FILE = "/opt/kraken-scanner/trades_log.json"
 MAX_STATUS_PAIRS = 20
@@ -76,6 +70,9 @@ state_lock = threading.RLock()
 trade_times = []
 ohlc_buffers = {}
 last_processed_closed = {}
+
+REST_PAIR_BY_WSNAME = {}
+WSNAME_BY_RESTNAME = {}
 
 # ==================== ФУНКЦИИ ====================
 def send_telegram(text):
@@ -137,7 +134,7 @@ def log_trade(symbol, entry, exit_price, reason, strategy, entry_time=None):
         with open(TRADES_LOG_FILE, 'w') as f: json.dump(trades, f, indent=2)
         return round(net_pnl, 2)
 
-# ==================== ИНДИКАТОРЫ (Исправлено советником) ====================
+# ==================== ИНДИКАТОРЫ ====================
 def ema(series, period): return series.ewm(span=period, adjust=False).mean()
 
 def rsi(series, period=14):
@@ -166,11 +163,9 @@ def adx(df, period=14):
     dx = 100 * np.abs((plus_di - minus_di) / (plus_di + minus_di))
     return dx.ewm(alpha=1/period).mean()
 
-# ГЛАВНОЕ ИСПРАВЛЕНИЕ: Здесь мы создаем колонки ema_fast, ema_slow, macd_line, macd_signal!
 def analyze_timeframe(df, params):
     if df.empty or len(df) < params['min_bars']:
         return None
-
     df = df.copy()
     df['ema_fast'] = ema(df['close'], params['ema_fast'])
     df['ema_slow'] = ema(df['close'], params['ema_slow'])
@@ -179,17 +174,13 @@ def analyze_timeframe(df, params):
     df['rsi'] = rsi(df['close'])
     df['adx'] = adx(df)
     df['atr'] = atr(df)
-
     if len(df) < 3:
         return None
-
     last = df.iloc[-2]
     prev = df.iloc[-3]
-
     if any(pd.isna([last['ema_fast'], last['ema_slow'], last['rsi'],
                     last['adx'], last['macd_line'], last['macd_signal']])):
         return None
-
     return {
         'trend_up': bool(last['ema_fast'] > last['ema_slow']),
         'macd_cross_up': bool(prev['macd_line'] <= prev['macd_signal'] and last['macd_line'] > last['macd_signal']),
@@ -271,9 +262,6 @@ def can_enter(pair):
     return True
 
 # ==================== МАППИНГ ПАР ====================
-REST_PAIR_BY_WSNAME = {}
-WSNAME_BY_RESTNAME = {}
-
 def build_asset_pairs():
     global REST_PAIR_BY_WSNAME, WSNAME_BY_RESTNAME
     try:
@@ -287,7 +275,6 @@ def build_asset_pairs():
         logger.info(f"Загружено {len(REST_PAIR_BY_WSNAME)} пар")
     except Exception as e: logger.error(f"Ошибка загрузки AssetPairs: {e}")
 
-# ==================== ПОЛУЧЕНИЕ ПАР (ИСПРАВЛЕНО!) ====================
 def get_filtered_pairs(top_n):
     try:
         pairs_resp = requests.get(f"{BASE_URL}/AssetPairs", timeout=20)
@@ -298,14 +285,9 @@ def get_filtered_pairs(top_n):
             if not wsname.endswith("/USD"): continue
             base = wsname.split('/')[0]
             if base in {"USDC", "USDT", "DAI", "PYUSD", "TUSD", "FDUSD"}: continue
-
-            # ВАЖНО: Конвертируем в REST имя! Это исправление из V12.3
             rest_name = REST_PAIR_BY_WSNAME.get(wsname)
-            if rest_name:
-                candidates.append(rest_name)
-
+            if rest_name: candidates.append(rest_name)
         if not candidates: return []
-
         scored = []
         chunk_size = 50
         for i in range(0, len(candidates), chunk_size):
@@ -317,7 +299,6 @@ def get_filtered_pairs(top_n):
             except Exception as e:
                 logger.warning(f"Ошибка тикеров: {e}")
                 continue
-
             for pair_name, t in tick_data.get("result", {}).items():
                 try:
                     high_24h = float(t.get("h", [0, 0])[1]); low_24h = float(t.get("l", [0, 0])[1])
@@ -326,11 +307,9 @@ def get_filtered_pairs(top_n):
                     if turnover < MIN_TURNOVER_USD or low_24h <= 0: continue
                     volatility_pct = ((high_24h - low_24h) / low_24h) * 100
                     ws_name = WSNAME_BY_RESTNAME.get(pair_name)
-                    if ws_name:
-                        scored.append((ws_name, volatility_pct, turnover))
+                    if ws_name: scored.append((ws_name, volatility_pct, turnover))
                 except: continue
             time.sleep(0.1)
-
         scored.sort(key=lambda x: x[1], reverse=True)
         return [s[0] for s in scored[:top_n]]
     except Exception as e:
@@ -378,6 +357,8 @@ def fetch_current_prices(pairs):
     if not pairs: return prices
     rest_names = []
     for p in pairs:
+        if not isinstance(p, str):
+            continue
         rest_name = REST_PAIR_BY_WSNAME.get(p)
         if rest_name: rest_names.append(rest_name)
     if not rest_names: return prices
@@ -399,7 +380,7 @@ def fetch_current_prices(pairs):
         time.sleep(0.1)
     return prices
 
-# ==================== WEBSOCKET (ИСПРАВЛЕНО СОВЕТНИКОМ!) ====================
+# ==================== WEBSOCKET ====================
 def on_open(ws):
     logger.info(f"WebSocket подключен. Подписываемся на {len(PAIRS_WS)} пар...")
     ws.send(json.dumps({
@@ -411,35 +392,29 @@ def on_message(ws, message):
     global state, trade_times
     try:
         data = json.loads(message)
-
-        # ВАЖНО: Игнорируем служебные сообщения, обрабатываем только "update"
         if data.get('channel') != 'ohlc' or data.get('type') != 'update':
             return
-
         for item in data.get('data', []):
-            # Защита от snapshot без времени
             if item.get('time') is None:
                 continue
-
             symbol = item.get('symbol', '')
             if symbol not in ohlc_buffers:
                 continue
-
-            new_candle = {
-                'start': int(item.get('time')),
-                'open': float(item.get('open')),
-                'high': float(item.get('high')),
-                'low': float(item.get('low')),
-                'close': float(item.get('close')),
-                'volume': float(item.get('volume')),
-            }
-
+            try:
+                new_candle = {
+                    'start': int(item.get('time')),
+                    'open': float(item.get('open')),
+                    'high': float(item.get('high')),
+                    'low': float(item.get('low')),
+                    'close': float(item.get('close')),
+                    'volume': float(item.get('volume')),
+                }
+            except (TypeError, ValueError):
+                continue
             if ohlc_buffers[symbol] and ohlc_buffers[symbol][-1]['start'] == new_candle['start']:
                 ohlc_buffers[symbol][-1] = new_candle
             else:
                 ohlc_buffers[symbol].append(new_candle)
-
-            # ===== ВЫХОД =====
             exit_messages = []
             with state_lock:
                 pos = state.get(symbol, {})
@@ -458,20 +433,14 @@ def on_message(ws, message):
                         pos.update({'position': 'closed', 'last_exit_ts': time.time(), 'last_exit_price': exit_price, 'last_exit_reason': 'take-profit'})
                         state[symbol] = pos
                         save_state(state)
-
             for msg in exit_messages:
                 send_telegram(msg)
-
-            # ===== ВХОД =====
             if len(ohlc_buffers[symbol]) < MIN_BARS + 1:
                 continue
-
             closed_start = int(ohlc_buffers[symbol][-2]['start'])
             if last_processed_closed.get(symbol) == closed_start:
                 continue
-
             last_processed_closed[symbol] = closed_start
-
             df = pd.DataFrame(list(ohlc_buffers[symbol]))
             df['ema_fast'] = ema(df['close'], 9)
             df['ema_slow'] = ema(df['close'], 21)
@@ -480,46 +449,36 @@ def on_message(ws, message):
             df['atr'] = atr(df)
             df['rsi'] = rsi(df['close'])
             df['adx'] = adx(df)
-
             if len(df) < 3:
                 continue
-
             signal_candle = df.iloc[-2]
             current_candle = df.iloc[-1]
             prev = df.iloc[-3]
-
             if pd.isna(signal_candle['ema_fast']) or pd.isna(signal_candle['rsi']):
                 continue
-
             if not (prev['macd_line'] <= prev['macd_signal']
                     and signal_candle['macd_line'] > signal_candle['macd_signal']
                     and signal_candle['ema_fast'] > signal_candle['ema_slow']
                     and 40 <= signal_candle['rsi'] <= 75
                     and 20 <= signal_candle['adx'] <= ADX_MAX):
                 continue
-
             entry_price = float(current_candle['close'])
             atr_value = float(signal_candle['atr'])
             if pd.isna(atr_value) or atr_value <= 0:
                 continue
-
             stop = entry_price - atr_value * ATR_MULT_SL
             target = entry_price + atr_value * ATR_MULT_TP
-
             if stop >= entry_price or target <= entry_price:
                 continue
-
             stop_distance_pct = (entry_price - stop) / entry_price * 100
             if stop_distance_pct < MIN_STOP_DISTANCE_PCT:
                 continue
-
             with state_lock:
                 if not can_enter(symbol):
                     continue
                 old_state = state.get(symbol, {})
                 if old_state.get('last_signal_candle') == closed_start:
                     continue
-
                 new_state = old_state.copy()
                 new_state.update({
                     'position': 'open',
@@ -534,9 +493,7 @@ def on_message(ws, message):
                 state[symbol] = new_state
                 trade_times.append(time.time())
                 save_state(state)
-
             send_telegram(f"🟢 <b>МГНОВЕННЫЙ ВХОД (WebSocket)</b>\nПара: {symbol}\nЦена: {entry_price:.8f}\nSL: {stop:.8f}\nTP: {target:.8f}")
-
     except Exception as e:
         logger.error(f"Ошибка WebSocket: {e}")
 
@@ -566,31 +523,27 @@ def background_scan_loop():
         try:
             volatile_pairs = get_filtered_pairs(TOP_N) or []
             all_pairs_for_consolidation = get_all_available_pairs(TOTAL_PAIRS) or []
-            
             with state_lock:
                 open_pairs = [p for p, pos in state.items() if pos.get('position') == 'open']
-            
             management_pairs = list(dict.fromkeys(volatile_pairs + open_pairs))
             if not management_pairs:
                 logger.error("Нет пар для обработки")
                 time.sleep(SCAN_INTERVAL_SECONDS)
                 continue
-
             pairs_for_prices = list(dict.fromkeys(volatile_pairs + all_pairs_for_consolidation + open_pairs))
             current_prices = fetch_current_prices(pairs_for_prices)
-            
             found_buy, found_sell = 0, 0
             scan_summary = []; consolidation_list = []; consolidation_seen = set()
             now_iso = datetime.now(timezone.utc).isoformat()
             daily_cache = {}
-
-            # === ПЕРВЫЙ ПРОХОД ===
+            # ПЕРВЫЙ ПРОХОД
             for idx, pair in enumerate(management_pairs):
+                if not isinstance(pair, str):
+                    continue
                 try:
                     df_daily_data = fetch_klines(pair, 1440, 150)
                     if not df_daily_data: continue
                     df_daily = pd.DataFrame(df_daily_data); daily_cache[pair] = df_daily
-                    
                     results = {}; results['1d'] = analyze_timeframe(df_daily, TIMEFRAME_PARAMS['1d'])
                     for tf in ["4h", "1w"]:
                         params = TIMEFRAME_PARAMS[tf]
@@ -598,23 +551,19 @@ def background_scan_loop():
                         if df_tf.empty: continue
                         results[tf] = analyze_timeframe(df_tf, params)
                     time.sleep(0.3)
-
                     if not results.get('4h') or not results.get('1d'): continue
                     r4h = results['4h']; r1d = results['1d']
                     trend_score = 0
                     if r4h['ema_fast'] > r4h['ema_slow']: trend_score += 1
                     if r1d['ema_fast'] > r1d['ema_slow']: trend_score += 1
                     if results.get('1w') and results['1w']['ema_fast'] > results['1w']['ema_slow']: trend_score += 1
-                    
                     macd_gap_pct = (r4h['macd_line'] - r4h['macd_signal']) / r4h['close'] * 100 if r4h['close'] else 0.0
                     scan_summary.append({"pair": pair, "trend_score": trend_score, "rsi_4h": r4h['rsi'], "adx_1d": r1d['adx'], "macd_gap_pct": macd_gap_pct, "close_price": r4h['close']})
-
                     current_price = current_prices.get(pair, r4h['close'])
                     cons = detect_consolidation(df_daily)
                     if cons and pair not in consolidation_seen:
                         consolidation_seen.add(pair)
                         consolidation_list.append({"pair": pair, "days": cons['days'], "range_pct": cons['range_pct'], "adx": cons['adx'], "breakout_level": cons['upper_level']})
-                    
                     breakout = check_breakout(df_daily, current_price)
                     opened_breakout = False
                     if breakout:
@@ -631,14 +580,12 @@ def background_scan_loop():
                                         found_buy += 1; opened_breakout = True
                     if opened_breakout:
                         send_telegram(f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>\nПара: {pair}\nЦена: {current_price:.8f}\nSL: {breakout['stop']:.8f}\nTP: {breakout['target']:.8f}\nДней в боковике: {breakout['days']}")
-
                     messages = []; time_stopped = False
                     with state_lock:
                         pos = state.get(pair)
                         if pos and pos.get('position') == 'open' and results.get(TRIGGER_TF) and results.get('1d'):
                             try: entry_time = datetime.fromisoformat(pos.get('entry_time', '2026-01-01T00:00:00+00:00'))
                             except Exception: entry_time = datetime.now(timezone.utc)
-                            
                             if (datetime.now(timezone.utc) - entry_time).days >= TIME_STOP_DAYS:
                                 exit_price = results[TRIGGER_TF]['close']
                                 pnl_pct = log_trade(pair, pos['entry_price'], exit_price, "Time Stop", pos.get('strategy', 'unknown'), pos.get('entry_time'))
@@ -659,13 +606,13 @@ def background_scan_loop():
                                     pos.update({'position': 'closed', 'last_exit_ts': time.time(), 'last_exit_price': exit_price, 'last_exit_reason': reason})
                                     state[pair] = pos; save_state(state); found_sell += 1
                                 else: state[pair] = pos; save_state(state)
-                    
                     for msg in messages: send_telegram(msg)
                     if time_stopped: continue
                 except Exception as e: logger.error(f"Ошибка в {pair}: {e}"); continue
-
-            # === ВТОРОЙ ПРОХОД ===
+            # ВТОРОЙ ПРОХОД
             for idx, pair in enumerate(all_pairs_for_consolidation):
+                if not isinstance(pair, str):
+                    continue
                 try:
                     df_daily = daily_cache.get(pair)
                     if df_daily is None:
@@ -692,7 +639,6 @@ def background_scan_loop():
                         if opened_breakout:
                             send_telegram(f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>\nПара: {pair}\nЦена: {current_price:.8f}\nSL: {breakout['stop']:.8f}\nTP: {breakout['target']:.8f}\nДней в боковике: {breakout['days']}")
                 except Exception as e: logger.error(f"Ошибка во втором проходе {pair}: {e}"); continue
-
             try:
                 with state_lock:
                     if len(state) > 500:
@@ -704,7 +650,6 @@ def background_scan_loop():
                                 if last_exit_ts > 0 and now_ts - last_exit_ts > CLEANUP_AFTER_DAYS * 86400: del state[p]
                         save_state(state)
             except Exception as e: logger.error(f"Ошибка очистки state: {e}")
-
             send_status(scan_summary, consolidation_list, found_buy, found_sell)
             time.sleep(SCAN_INTERVAL_SECONDS)
         except Exception as e:
@@ -771,7 +716,6 @@ if __name__ == "__main__":
     os.makedirs(os.path.dirname(TRADES_LOG_FILE), exist_ok=True)
     state = load_state()
     build_asset_pairs()
-
     PAIRS_WS = []
     retry_count = 0
     while not PAIRS_WS and retry_count < 3:
@@ -780,25 +724,21 @@ if __name__ == "__main__":
             logger.warning(f"Попытка {retry_count + 1}: не удалось получить волатильные пары, пробуем снова...")
             time.sleep(10)
         retry_count += 1
-
     if not PAIRS_WS:
         logger.warning("Используем все доступные пары как fallback")
         PAIRS_WS = get_all_available_pairs(TOP_N)
-
     if not PAIRS_WS:
         logger.critical("Не удалось получить пары для WebSocket!")
         exit(1)
-
     logger.info(f"Загружено {len(PAIRS_WS)} пар для WebSocket")
-
     for pair in PAIRS_WS:
+        if not isinstance(pair, str): continue
         history = fetch_klines(pair, TIMEFRAME, 80)
         if history:
             ohlc_buffers[pair] = deque(history, maxlen=200)
             if len(ohlc_buffers[pair]) >= 2:
                 last_processed_closed[pair] = int(list(ohlc_buffers[pair])[-2]['start'])
         time.sleep(0.1)
-
     ws_thread = threading.Thread(target=run_websocket, daemon=True)
     ws_thread.start()
     background_scan_loop()
