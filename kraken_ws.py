@@ -33,14 +33,15 @@ RSI_LENGTH = 14
 ADX_LENGTH = 14
 RSI_MIN, RSI_MAX = 40, 75
 ADX_MIN = 20
-ADX_MAX = 45  # ЗАЩИТА ОТ ПЕРЕГРЕТА: Тренд старше 45 - выдохся
+ADX_MAX = 45
 ATR_MULT_SL, ATR_MULT_TP = 2.0, 4.0
 BREAKEVEN_TRIGGER_ATR = 1.0
 TRAILING_ATR_MULT = 1.5
-TIME_STOP_DAYS = 5  # Закрываем сделку, если она висит дольше 5 дней
+TIME_STOP_DAYS = 5
 
 TOP_N = 200
 TOTAL_PAIRS = 700
+CONSOLIDATION_PAIRS = 700  # <-- ДОБАВЛЕНА
 STATUS_INTERVAL_MINUTES = 120
 SCAN_INTERVAL_SECONDS = 7200
 
@@ -57,7 +58,6 @@ TIMEFRAME_ORDER = ["4h", "1d", "1w"]
 TRIGGER_TF = "4h"
 
 EXCLUDE_BASE_SUBSTRINGS = ["UP", "DOWN", "BULL", "BEAR", "3L", "3S", "5L", "5S"]
-# КРИТИЧНО: Добавляем ФИАТ и новые стейблы
 FIAT_BASES = {"AUD", "EUR", "GBP", "CAD", "CHF", "JPY", "USD"}
 STABLECOINS = {"USDC", "USDT", "DAI", "PYUSD", "TUSD", "FDUSD", "AUSD", "EURR", "USDR", "FRNT", "EUR"}
 MIN_TURNOVER_USD = 50000
@@ -118,7 +118,7 @@ def get_filtered_pairs(max_pairs=TOP_N):
         base, quote = wsname.split("/")
         if quote != "USD": continue
         if any(x in base for x in EXCLUDE_BASE_SUBSTRINGS): continue
-        if base in FIAT_BASES or base in STABLECOINS: continue  # ФИКС 1
+        if base in FIAT_BASES or base in STABLECOINS: continue
         candidates.append(kraken_name)
 
     scored = []
@@ -154,7 +154,7 @@ def get_filtered_pairs(max_pairs=TOP_N):
         if ws_name: final_pairs.append(ws_name)
     return final_pairs
 
-def get_all_available_pairs(max_pairs=CONSOLIDATION_PAIRS):
+def get_all_available_pairs(max_pairs=CONSOLIDATION_PAIRS): # <-- ТЕПЕРЬ ВСЕ РАБОТАЕТ
     try:
         pairs_resp = requests.get(f"{BASE_URL}/AssetPairs", timeout=20)
         pairs_data = pairs_resp.json()
@@ -174,7 +174,7 @@ def get_all_available_pairs(max_pairs=CONSOLIDATION_PAIRS):
         base, quote = wsname.split("/")
         if quote != "USD": continue
         if any(x in base for x in EXCLUDE_BASE_SUBSTRINGS): continue
-        if base in FIAT_BASES or base in STABLECOINS: continue  # ФИКС 1
+        if base in FIAT_BASES or base in STABLECOINS: continue
         candidates.append(kraken_name)
 
     final_pairs = []
@@ -279,7 +279,6 @@ def check_breakout(df_daily, current_price):
     range_pct = (high - low) / mean * 100 if mean > 0 else 100
     if range_pct > 15.0: return None
     
-    # ФИКС 2: Используем буфер 1.5% против ложных фитилей!
     if current_price < high * 1.015: return None
     
     vol_avg = closed['volume'].rolling(20).mean().iloc[-1]
@@ -404,7 +403,6 @@ def on_message(ws, message):
                 if (prev['macd_line'] <= prev['macd_signal'] and last['macd_line'] > last['macd_signal'] and
                     last['ema_fast'] > last['ema_slow'] and RSI_MIN <= last['rsi'] <= RSI_MAX and last['adx'] >= ADX_MIN):
                     
-                    # ФИКС 3: Защита от перегретого тренда
                     if last['adx'] > ADX_MAX: continue 
                     
                     close = last['close']; stop = close - last['atr'] * ATR_MULT_SL; target = close + last['atr'] * ATR_MULT_TP
@@ -469,7 +467,6 @@ def background_scan_loop():
         consolidation_list = []
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        # ЦИКЛ 1: Confluence (Волатильные пары)
         for idx, pair in enumerate(volatile_pairs):
             try:
                 df_daily = pd.DataFrame(fetch_klines(pair, 1440, 100))
@@ -496,7 +493,6 @@ def background_scan_loop():
                 pos = state.get(pair)
                 if pos and pos.get('position') == 'open' and results.get(TRIGGER_TF) and results.get('1d'):
                     with state_lock:
-                        # ФИКС 4: Time Stop (выход по времени)
                         entry_time = datetime.fromisoformat(pos.get('entry_time', '2026-01-01T00:00:00+00:00'))
                         if (datetime.now(timezone.utc) - entry_time).days >= TIME_STOP_DAYS:
                             exit_price = results[TRIGGER_TF]['close']
@@ -523,7 +519,6 @@ def background_scan_loop():
                 logger.error(f"Ошибка в {pair}: {e}")
                 continue
 
-        # ЦИКЛ 2: Breakout (Все пары, включая спокойные)
         for idx, pair in enumerate(all_pairs_for_consolidation):
             try:
                 df_daily = pd.DataFrame(fetch_klines(pair, 1440, 100))
@@ -550,10 +545,8 @@ def background_scan_loop():
                 logger.error(f"Ошибка в {pair}: {e}")
                 continue
 
-        # ======== ОТПРАВКА СТАТУСА (РАЗДЕЛЬНОЕ ОТОБРАЖЕНИЕ) ========
         open_pos = sum(1 for p in state.values() if p.get('position') == 'open')
         
-        # Сортируем позиции по стратегии
         confluence_positions = []
         breakout_positions = []
         for pair, pos in state.items():
@@ -577,7 +570,6 @@ def background_scan_loop():
             f"• Выходов за цикл: {found_sell}",
         ]
 
-        # ДОБАВЛЯЕМ РАЗДЕЛЬНЫЕ СПИСКИ:
         if confluence_positions:
             lines.append(f"\n🟢 <b>Открытые позиции (Confluence):</b>")
             for pair, pos in confluence_positions:
@@ -593,7 +585,6 @@ def background_scan_loop():
         if not confluence_positions and not breakout_positions:
             lines.append(f"\n💰 <b>Открытых позиций нет.</b>")
 
-        # Топ кандидатов
         close_calls = [s for s in scan_summary if s["trend_score"] >= 2]
         close_calls.sort(key=lambda s: s.get("macd_gap_pct", 999))
 
