@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Универсальный бот (VPS): WebSocket + REST сканер.
-Версия 14.0 - Полностью исправленная версия.
-Решает: unhashable type, NoneType, маппинг пар, отправка Telegram.
+Версия 14.1 - Финальная стабильная версия.
+Исправлено: send_status (unhashable type), WS (NoneType), analyze_timeframe (ema_fast).
 """
 
 import json
@@ -357,8 +357,7 @@ def fetch_current_prices(pairs):
     if not pairs: return prices
     rest_names = []
     for p in pairs:
-        if not isinstance(p, str):
-            continue
+        if not isinstance(p, str): continue
         rest_name = REST_PAIR_BY_WSNAME.get(p)
         if rest_name: rest_names.append(rest_name)
     if not rest_names: return prices
@@ -668,7 +667,11 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     lines.append("━" * 25)
     lines.append("📊 <b>Общая статистика:</b>")
     lines.append(f"• Отслеживается пар (Confluence): {len(PAIRS_WS)}")
-    lines.append(f"• Проверено на боковик: {len(set(PAIRS_WS) | set(consolidation_list))}")
+    
+    # ИСПРАВЛЕНИЕ: безопасное извлечение пар из словарей
+    checked_pairs = len(set(PAIRS_WS) | {item["pair"] for item in consolidation_list})
+    lines.append(f"• Проверено на боковик: {checked_pairs}")
+    
     lines.append(f"• Всего в боковике найдено: {len(consolidation_list)}")
     lines.append(f"• Открытых позиций: {open_pos}")
     lines.append(f"• Входов за цикл: {found_buy}")
