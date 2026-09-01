@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Универсальный бот (VPS): WebSocket + REST сканер.
-Версия 12.1 - Исправленная версия для бумажного теста.
+Версия 12.2 - Финальная версия для бумажного теста.
 
 Исправлено:
 - Подписка WebSocket (символы с "/")
 - Обработка символов в on_message
 - Загрузка истории с числовым интервалом
+- Fallback для get_filtered_pairs (устойчивость к сбоям)
 - Все чтения state под блокировкой
 - Топ-200 проверяются на пробой через кэш
 - Защита от дублей боковиков
@@ -1355,7 +1356,21 @@ if __name__ == "__main__":
     
     build_asset_pairs()
     
-    PAIRS_WS = get_filtered_pairs(TOP_N)
+    PAIRS_WS = []
+    retry_count = 0
+    
+    # Пытаемся получить топ-200 волатильных пар (до 3 попыток)
+    while not PAIRS_WS and retry_count < 3:
+        PAIRS_WS = get_filtered_pairs(TOP_N)
+        if not PAIRS_WS:
+            logger.warning(f"Попытка {retry_count + 1}: не удалось получить волатильные пары, пробуем снова...")
+            time.sleep(10)
+        retry_count += 1
+    
+    # Если топ-200 так и не получили, берем все доступные пары как запасной вариант
+    if not PAIRS_WS:
+        logger.warning("Используем все доступные пары как fallback (без фильтра волатильности)")
+        PAIRS_WS = get_all_available_pairs(TOP_N)
     
     if not PAIRS_WS:
         logger.critical("Не удалось получить пары для WebSocket!")
@@ -1364,7 +1379,7 @@ if __name__ == "__main__":
     logger.info(f"Загружено {len(PAIRS_WS)} пар для WebSocket")
     
     for pair in PAIRS_WS:
-        history = fetch_klines(pair, TIMEFRAME, 80)  # Исправлено: TIMEFRAME = 15
+        history = fetch_klines(pair, TIMEFRAME, 80)  # TIMEFRAME = 15
         if history:
             ohlc_buffers[pair] = deque(history, maxlen=200)
             
