@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Универсальный бот (VPS): WebSocket + REST сканер.
-Версия 12.2 - Финальная версия для бумажного теста.
+Версия 12.3 - Финальная версия для бумажного теста.
 
 Исправлено:
 - Подписка WebSocket (символы с "/")
 - Обработка символов в on_message
 - Загрузка истории с числовым интервалом
 - Fallback для get_filtered_pairs (устойчивость к сбоям)
+- Исправлен маппинг пар в get_filtered_pairs/get_all_available_pairs (REST имена)
 - Все чтения state под блокировкой
 - Топ-200 проверяются на пробой через кэш
 - Защита от дублей боковиков
@@ -471,7 +472,10 @@ def get_filtered_pairs(top_n):
             if base in {"USDC", "USDT", "DAI", "PYUSD", "TUSD", "FDUSD"}:
                 continue
             
-            candidates.append(wsname)
+            # ИСПРАВЛЕНИЕ: Берём внутреннее имя Kraken для REST API
+            rest_name = REST_PAIR_BY_WSNAME.get(wsname)
+            if rest_name:
+                candidates.append(rest_name)
         
         if not candidates:
             return []
@@ -539,7 +543,10 @@ def get_all_available_pairs(max_pairs):
             if base in {"USDC", "USDT", "DAI", "PYUSD", "TUSD", "FDUSD"}:
                 continue
             
-            candidates.append(wsname)
+            # ИСПРАВЛЕНИЕ: Берём внутреннее имя Kraken для REST API
+            rest_name = REST_PAIR_BY_WSNAME.get(wsname)
+            if rest_name:
+                candidates.append(rest_name)
         
         return candidates[:max_pairs]
     
@@ -1379,7 +1386,7 @@ if __name__ == "__main__":
     logger.info(f"Загружено {len(PAIRS_WS)} пар для WebSocket")
     
     for pair in PAIRS_WS:
-        history = fetch_klines(pair, TIMEFRAME, 80)  # TIMEFRAME = 15
+        history = fetch_klines(pair, TIMEFRAME, 80)
         if history:
             ohlc_buffers[pair] = deque(history, maxlen=200)
             
