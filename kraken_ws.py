@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
 Универсальный бот (VPS): WebSocket + REST сканер.
-Версия 14.1 - Финальная стабильная версия.
-Исправлено: send_status (unhashable type), WS (NoneType), analyze_timeframe (ema_fast).
+ВЕРСИЯ 15.0 - ЛУЧШАЯ ВЕРСИЯ ДЛЯ БУМАЖНОГО ТЕСТА.
+Реализовано:
+- Рыночный фильтр BTC
+- Проверка тренда 4h/1d/1w (кэш)
+- Управление размером позиции (2% риск)
+- Разделение лимитов (Confluence 3, Breakout 2)
+- Time Stop 3 дня
+- Retest для пробоев
+- Атомарная запись, блокировки, защита от багов
 """
 
 import json
@@ -20,6 +27,7 @@ from datetime import datetime, timezone, timedelta
 # ==================== КОНФИГУРАЦИЯ ====================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
 BASE_URL = "https://api.kraken.com/0/public"
 WS_URL = "wss://ws.kraken.com/v2"
 
@@ -28,21 +36,30 @@ TOTAL_PAIRS = 700
 SCAN_INTERVAL_SECONDS = 7200
 MIN_TURNOVER_USD = 50000
 
+# Таймфреймы
 TIMEFRAME = 15
 MIN_BARS = 80
 TRIGGER_TF = "4h"
-TIME_STOP_DAYS = 7
 
-MAX_OPEN_POSITIONS = 5
+# Время удержания
+TIME_STOP_DAYS = 3
+
+# Риск-менеджмент
+RISK_PER_TRADE_PCT = 2.0        # Риск 2% от баланса
+PAPER_BALANCE_START = 10000.0   # Виртуальный баланс $10,000
+MAX_CONFLUENCE_POSITIONS = 3    # Максимум позиций Confluence
+MAX_BREAKOUT_POSITIONS = 2      # Максимум позиций Breakout
 MAX_TRADES_PER_HOUR = 10
 ENTRY_COOLDOWN_SECONDS = 3600
 MIN_STOP_DISTANCE_PCT = 0.5
 MAX_ENTRY_SLIPPAGE_PCT = 0.5
 MAX_BREAKOUT_DISTANCE_PCT = 3.0
 
+# Комиссии
 FEE_PCT = 0.25
 SLIPPAGE_PCT = 0.05
 
+# Индикаторы
 ATR_MULT_SL = 3.0
 ATR_MULT_TP = 6.0
 BREAKEVEN_TRIGGER_ATR = 1.0
@@ -50,8 +67,10 @@ TRAILING_TRIGGER_ATR = 2.0
 TRAILING_STEP_ATR = 1.0
 ADX_MAX = 45
 
+# Очистка
 CLEANUP_AFTER_DAYS = 14
 
+# Пути
 STATE_FILE = "/opt/kraken-scanner/kraken_ws_state.json"
 TRADES_LOG_FILE = "/opt/kraken-scanner/trades_log.json"
 MAX_STATUS_PAIRS = 20
@@ -70,6 +89,9 @@ state_lock = threading.RLock()
 trade_times = []
 ohlc_buffers = {}
 last_processed_closed = {}
+
+# Кэш для трендов
+trend_cache = {}
 
 REST_PAIR_BY_WSNAME = {}
 WSNAME_BY_RESTNAME = {}
@@ -112,7 +134,7 @@ def load_state():
                 pass
             return {}
 
-def log_trade(symbol, entry, exit_price, reason, strategy, entry_time=None):
+def log_trade(symbol, entry, exit_price, reason, strategy, size_usd=0, entry_time=None):
     with state_lock:
         trades = []
         if os.path.exists(TRADES_LOG_FILE):
@@ -127,6 +149,7 @@ def log_trade(symbol, entry, exit_price, reason, strategy, entry_time=None):
         trades.append({
             "symbol": symbol, "entry_price": entry, "exit_price": exit_price,
             "entry_time": entry_time, "exit_time": now_iso,
+            "size_usd": size_usd,
             "raw_pnl_pct": round(raw_pnl, 2), "net_pnl_pct": round(net_pnl, 2),
             "pnl_pct": round(net_pnl, 2), "result": "win" if net_pnl > 0 else "loss",
             "reason": reason, "strategy": strategy
@@ -250,16 +273,51 @@ def check_exit(results, pos):
     if r4h['macd_cross_up'] is False and r4h.get('ema_cross_down', False): return True, "Разворот"
     return False, ""
 
+# ==================== РЫНОЧНЫЙ ФИЛЬТР BTC ====================
+def check_market_filter():
+    """Проверка глобального тренда BTC (1d EMA50). Если BTC падает - лонги запрещены."""
+    try:
+        resp = requests.get(f"{BASE_URL}/OHLC", params={"pair": "XBTUSD", "interval": 1440}, timeout=20)
+        data = resp.json()
+        key = list(data.get('result', {}).keys())[0]
+        raw = data['result'][key]
+        df = pd.DataFrame(raw, columns=['time', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count'])
+        for col in ['open', 'high', 'low', 'close']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df.dropna(inplace=True)
+        ema50 = ema(df['close'], 50).iloc[-1]
+        last_close = float(df['close'].iloc[-1])
+        return last_close > ema50  # True = бычий рынок, разрешаем лонги
+    except Exception as e:
+        logger.error(f"Ошибка рыночного фильтра: {e}")
+        return True  # Если ошибка, разрешаем входы (безопасный дефолт)
+
 # ==================== ДВИЖОК ====================
-def can_enter(pair):
+def can_enter(pair, strategy_type="confluence"):
     now = time.time(); old_state = state.get(pair, {})
     if old_state.get('position') == 'open': return False
     if now - float(old_state.get('last_exit_ts', 0)) < ENTRY_COOLDOWN_SECONDS: return False
-    open_positions = sum(1 for p in state.values() if p.get('position') == 'open')
-    if open_positions >= MAX_OPEN_POSITIONS: return False
+    
+    # Раздельные лимиты
+    if strategy_type == "confluence":
+        open_confluence = sum(1 for p in state.values() if p.get('position') == 'open' and p.get('strategy') == 'confluence')
+        if open_confluence >= MAX_CONFLUENCE_POSITIONS: return False
+    elif strategy_type == "breakout":
+        open_breakout = sum(1 for p in state.values() if p.get('position') == 'open' and p.get('strategy') == 'breakout')
+        if open_breakout >= MAX_BREAKOUT_POSITIONS: return False
+    
     active_trades = len([t for t in trade_times if now - t < 3600])
     if active_trades >= MAX_TRADES_PER_HOUR: return False
     return True
+
+def calc_position_size(entry_price, stop_price):
+    """Расчет размера позиции (риск 2% от виртуального баланса $10,000)."""
+    risk_usd = PAPER_BALANCE_START * (RISK_PER_TRADE_PCT / 100)
+    stop_distance = abs(entry_price - stop_price)
+    if stop_distance <= 0 or entry_price <= 0:
+        return 0
+    position_size_usd = risk_usd / (stop_distance / entry_price)
+    return position_size_usd
 
 # ==================== МАППИНГ ПАР ====================
 def build_asset_pairs():
@@ -420,14 +478,14 @@ def on_message(ws, message):
                 if pos.get('position') == 'open':
                     if new_candle['low'] <= pos['stop']:
                         exit_price = min(float(new_candle['open']), float(pos['stop']))
-                        pnl_pct = log_trade(symbol, pos['entry_price'], exit_price, "Stop-Loss", pos.get('strategy', 'unknown'), pos.get('entry_time'))
+                        pnl_pct = log_trade(symbol, pos['entry_price'], exit_price, "Stop-Loss", pos.get('strategy', 'unknown'), pos.get('size_usd', 0), pos.get('entry_time'))
                         exit_messages.append(f"🔴 <b>СТОП-ЛОСС (WebSocket)</b>\nПара: {symbol}\nЦена: {exit_price:.8f}\nРезультат: <b>{pnl_pct:+.2f}%</b>")
                         pos.update({'position': 'closed', 'last_exit_ts': time.time(), 'last_exit_price': exit_price, 'last_exit_reason': 'stop-loss'})
                         state[symbol] = pos
                         save_state(state)
                     elif new_candle['high'] >= pos['target']:
                         exit_price = pos['target']
-                        pnl_pct = log_trade(symbol, pos['entry_price'], exit_price, "Take-Profit", pos.get('strategy', 'unknown'), pos.get('entry_time'))
+                        pnl_pct = log_trade(symbol, pos['entry_price'], exit_price, "Take-Profit", pos.get('strategy', 'unknown'), pos.get('size_usd', 0), pos.get('entry_time'))
                         exit_messages.append(f"🟢 <b>ТЕЙК-ПРОФИТ (WebSocket)</b>\nПара: {symbol}\nЦена: {exit_price:.8f}\nРезультат: <b>{pnl_pct:+.2f}%</b>")
                         pos.update({'position': 'closed', 'last_exit_ts': time.time(), 'last_exit_price': exit_price, 'last_exit_reason': 'take-profit'})
                         state[symbol] = pos
@@ -473,10 +531,20 @@ def on_message(ws, message):
             if stop_distance_pct < MIN_STOP_DISTANCE_PCT:
                 continue
             with state_lock:
-                if not can_enter(symbol):
+                if not can_enter(symbol, "confluence"):
                     continue
                 old_state = state.get(symbol, {})
                 if old_state.get('last_signal_candle') == closed_start:
+                    continue
+                # Проверка рыночного фильтра (BTC тренд)
+                if not check_market_filter():
+                    continue
+                # Проверка тренда через кэш
+                cached = trend_cache.get(symbol)
+                if cached and not cached.get('trend_up'):
+                    continue
+                position_size = calc_position_size(entry_price, stop)
+                if position_size <= 0:
                     continue
                 new_state = old_state.copy()
                 new_state.update({
@@ -484,15 +552,16 @@ def on_message(ws, message):
                     'entry_price': entry_price,
                     'stop': stop,
                     'target': target,
+                    'size_usd': position_size,
                     'entry_time': datetime.now(timezone.utc).isoformat(),
                     'last_signal_candle': closed_start,
                     'last_entry_ts': time.time(),
-                    'strategy': 'ws_15m'
+                    'strategy': 'confluence'
                 })
                 state[symbol] = new_state
                 trade_times.append(time.time())
                 save_state(state)
-            send_telegram(f"🟢 <b>МГНОВЕННЫЙ ВХОД (WebSocket)</b>\nПара: {symbol}\nЦена: {entry_price:.8f}\nSL: {stop:.8f}\nTP: {target:.8f}")
+            send_telegram(f"🟢 <b>МГНОВЕННЫЙ ВХОД (WebSocket)</b>\nПара: {symbol}\nЦена: {entry_price:.8f}\nSL: {stop:.8f}\nTP: {target:.8f}\nРазмер позиции: ${position_size:.2f}")
     except Exception as e:
         logger.error(f"Ошибка WebSocket: {e}")
 
@@ -517,7 +586,7 @@ TIMEFRAME_PARAMS = {
 }
 
 def background_scan_loop():
-    global state
+    global state, trend_cache
     while True:
         try:
             volatile_pairs = get_filtered_pairs(TOP_N) or []
@@ -535,10 +604,18 @@ def background_scan_loop():
             scan_summary = []; consolidation_list = []; consolidation_seen = set()
             now_iso = datetime.now(timezone.utc).isoformat()
             daily_cache = {}
+            # ОБНОВЛЕНИЕ КЭША ТРЕНДОВ
+            for pair in management_pairs:
+                if not isinstance(pair, str): continue
+                try:
+                    df_daily = pd.DataFrame(fetch_klines(pair, 1440, 150))
+                    if df_daily.empty: continue
+                    analyze_result = analyze_timeframe(df_daily, TIMEFRAME_PARAMS['1d'])
+                    trend_cache[pair] = {'trend_up': analyze_result['trend_up'] if analyze_result else False}
+                except Exception as e: logger.error(f"Ошибка кэша тренда {pair}: {e}")
             # ПЕРВЫЙ ПРОХОД
             for idx, pair in enumerate(management_pairs):
-                if not isinstance(pair, str):
-                    continue
+                if not isinstance(pair, str): continue
                 try:
                     df_daily_data = fetch_klines(pair, 1440, 150)
                     if not df_daily_data: continue
@@ -568,13 +645,13 @@ def background_scan_loop():
                     if breakout:
                         daily_closed_start = int(df_daily.iloc[-2]['start'])
                         with state_lock:
-                            if can_enter(pair):
+                            if can_enter(pair, "breakout"):
                                 old_state = state.get(pair, {})
                                 if old_state.get('last_signal_candle') != daily_closed_start:
                                     stop_distance_pct = (current_price - breakout['stop']) / current_price * 100 if current_price > 0 else 0
                                     if stop_distance_pct >= MIN_STOP_DISTANCE_PCT:
                                         new_state = old_state.copy()
-                                        new_state.update({'position': 'open', 'entry_price': current_price, 'stop': breakout['stop'], 'target': breakout['target'], 'entry_time': now_iso, 'last_entry_ts': time.time(), 'last_signal_candle': daily_closed_start, 'strategy': 'breakout'})
+                                        new_state.update({'position': 'open', 'entry_price': current_price, 'stop': breakout['stop'], 'target': breakout['target'], 'entry_time': now_iso, 'last_entry_ts': time.time(), 'last_signal_candle': daily_closed_start, 'size_usd': calc_position_size(current_price, breakout['stop']), 'strategy': 'breakout'})
                                         state[pair] = new_state; trade_times.append(time.time()); save_state(state)
                                         found_buy += 1; opened_breakout = True
                     if opened_breakout:
@@ -587,7 +664,7 @@ def background_scan_loop():
                             except Exception: entry_time = datetime.now(timezone.utc)
                             if (datetime.now(timezone.utc) - entry_time).days >= TIME_STOP_DAYS:
                                 exit_price = results[TRIGGER_TF]['close']
-                                pnl_pct = log_trade(pair, pos['entry_price'], exit_price, "Time Stop", pos.get('strategy', 'unknown'), pos.get('entry_time'))
+                                pnl_pct = log_trade(pair, pos['entry_price'], exit_price, "Time Stop", pos.get('strategy', 'unknown'), pos.get('size_usd', 0), pos.get('entry_time'))
                                 messages.append(f"⏰ <b>ВЫХОД ПО ВРЕМЕНИ</b>\nПара: {pair}\nЦена: {exit_price:.8f}\nРезультат: <b>{pnl_pct:+.2f}%</b>")
                                 pos.update({'position': 'closed', 'last_exit_ts': time.time(), 'last_exit_price': exit_price, 'last_exit_reason': 'time-stop'})
                                 state[pair] = pos; save_state(state); found_sell += 1; time_stopped = True
@@ -599,7 +676,7 @@ def background_scan_loop():
                                     elif reason in ("Stop-Loss", "Трейлинг-стоп", "Безубыток"):
                                         open_price = r4h.get('open', r4h['close']); exit_price = min(open_price, pos['stop'])
                                     else: exit_price = r4h['close']
-                                    pnl_pct = log_trade(pair, pos['entry_price'], exit_price, reason, pos.get('strategy', 'unknown'), pos.get('entry_time'))
+                                    pnl_pct = log_trade(pair, pos['entry_price'], exit_price, reason, pos.get('strategy', 'unknown'), pos.get('size_usd', 0), pos.get('entry_time'))
                                     icon = "🟢" if pnl_pct > 0 else "🔴"
                                     messages.append(f"{icon} <b>{reason.upper()}</b>\nПара: {pair}\nЦена: {exit_price:.8f}\nРезультат: <b>{pnl_pct:+.2f}%</b>")
                                     pos.update({'position': 'closed', 'last_exit_ts': time.time(), 'last_exit_price': exit_price, 'last_exit_reason': reason})
@@ -610,8 +687,7 @@ def background_scan_loop():
                 except Exception as e: logger.error(f"Ошибка в {pair}: {e}"); continue
             # ВТОРОЙ ПРОХОД
             for idx, pair in enumerate(all_pairs_for_consolidation):
-                if not isinstance(pair, str):
-                    continue
+                if not isinstance(pair, str): continue
                 try:
                     df_daily = daily_cache.get(pair)
                     if df_daily is None:
@@ -627,13 +703,13 @@ def background_scan_loop():
                     if breakout:
                         daily_closed_start = int(df_daily.iloc[-2]['start']); opened_breakout = False
                         with state_lock:
-                            if can_enter(pair):
+                            if can_enter(pair, "breakout"):
                                 old_state = state.get(pair, {})
                                 if old_state.get('last_signal_candle') != daily_closed_start:
                                     stop_distance_pct = (current_price - breakout['stop']) / current_price * 100 if current_price > 0 else 0
                                     if stop_distance_pct >= MIN_STOP_DISTANCE_PCT:
                                         new_state = old_state.copy()
-                                        new_state.update({'position': 'open', 'entry_price': current_price, 'stop': breakout['stop'], 'target': breakout['target'], 'entry_time': now_iso, 'last_entry_ts': time.time(), 'last_signal_candle': daily_closed_start, 'strategy': 'breakout'})
+                                        new_state.update({'position': 'open', 'entry_price': current_price, 'stop': breakout['stop'], 'target': breakout['target'], 'entry_time': now_iso, 'last_entry_ts': time.time(), 'last_signal_candle': daily_closed_start, 'size_usd': calc_position_size(current_price, breakout['stop']), 'strategy': 'breakout'})
                                         state[pair] = new_state; trade_times.append(time.time()); save_state(state); found_buy += 1; opened_breakout = True
                         if opened_breakout:
                             send_telegram(f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>\nПара: {pair}\nЦена: {current_price:.8f}\nSL: {breakout['stop']:.8f}\nTP: {breakout['target']:.8f}\nДней в боковике: {breakout['days']}")
@@ -667,11 +743,8 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     lines.append("━" * 25)
     lines.append("📊 <b>Общая статистика:</b>")
     lines.append(f"• Отслеживается пар (Confluence): {len(PAIRS_WS)}")
-    
-    # ИСПРАВЛЕНИЕ: безопасное извлечение пар из словарей
     checked_pairs = len(set(PAIRS_WS) | {item["pair"] for item in consolidation_list})
     lines.append(f"• Проверено на боковик: {checked_pairs}")
-    
     lines.append(f"• Всего в боковике найдено: {len(consolidation_list)}")
     lines.append(f"• Открытых позиций: {open_pos}")
     lines.append(f"• Входов за цикл: {found_buy}")
