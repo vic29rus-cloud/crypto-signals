@@ -695,55 +695,87 @@ def background_scan_loop():
 def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     with state_lock:
         open_positions_snapshot = [(pair, dict(pos)) for pair, pos in state.items() if pos.get('position') == 'open']
-    open_pos = len(open_positions_snapshot); confluence_positions = []; breakout_positions = []
+    open_pos = len(open_positions_snapshot)
+    confluence_positions = []
+    breakout_positions = []
     for pair, pos in open_positions_snapshot:
-        if pos.get('strategy') == 'breakout': breakout_positions.append((pair, pos))
-        else: confluence_positions.append((pair, pos))
+        if pos.get('strategy') == 'breakout':
+            breakout_positions.append((pair, pos))
+        else:
+            confluence_positions.append((pair, pos))
+
     lines = []
-    lines.append(f"📡 <b>Статус сканирования</b> — {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC")
-    lines.append("━" * 25)
-    lines.append("📊 <b>Общая статистика:</b>")
-    lines.append(f"• Отслеживается пар (Confluence): {len(PAIRS_WS)}")
+    # Заголовок (голубой/синий)
+    lines.append(f"📡 <b>СТАТУС СКАНЕРА</b> | <i>{datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC</i>")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━")
+    
+    # ПАНЕЛЬ СТАТИСТИКИ (с фонами)
+    lines.append("🔹 <b>📊 ОБЩАЯ СТАТИСТИКА</b>")
+    lines.append(f"🔹 Отслеживается пар: <b>{len(PAIRS_WS)}</b>")
     checked_pairs = len(set(PAIRS_WS) | {item["pair"] for item in consolidation_list})
-    lines.append(f"• Проверено на боковик: {checked_pairs}")
-    lines.append(f"• Всего в боковике найдено: {len(consolidation_list)}")
-    lines.append(f"• Открытых позиций: {open_pos}")
-    lines.append(f"• Входов за цикл: {found_buy}")
-    lines.append(f"• Выходов за цикл: {found_sell}")
-    lines.append("")
+    lines.append(f"🔹 Проверено на боковик: <b>{checked_pairs}</b>")
+    lines.append(f"🔹 🎯 В боковике найдено: <b>{len(consolidation_list)}</b>")
+    lines.append(f"🔹 💰 Открытых позиций: <b>{open_pos}</b>")
+    lines.append(f"🔹 👉 Входов за цикл: <b>{found_buy}</b>")
+    lines.append(f"🔹 👈 Выходов за цикл: <b>{found_sell}</b>")
+    
+    lines.append("━━━━━━━━━━━━━━━━━━━━━")
+
+    # ОТКРЫТЫЕ ПОЗИЦИИ (зеленые)
     if confluence_positions:
-        lines.append("💰 <b>Открытые позиции (Confluence):</b>")
+        lines.append("🟢 <b>💰 ОТКРЫТЫЕ ПОЗИЦИИ (CONFLUENCE)</b>")
         for pair, pos in confluence_positions:
             entry_time = str(pos.get('entry_time', '?')).replace("T", " ")[:16]
-            lines.append(f"• <b>{pair}</b>\n| Вход: {pos.get('entry_price', 0):.8f}\n| Время: {entry_time}\n| SL: {pos.get('stop', 0):.8f}\n| TP: {pos.get('target', 0):.8f}")
+            lines.append(f"  <b>{pair}</b> | Вход: {pos.get('entry_price', 0):.8f} | Время: {entry_time}")
+            lines.append(f"  💚 Стоп: {pos.get('stop', 0):.8f} | 🎯 Цель: {pos.get('target', 0):.8f}")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+
     if breakout_positions:
-        lines.append("📦 <b>Открытые позиции (Breakout):</b>")
+        lines.append("📦 <b>💰 ОТКРЫТЫЕ ПОЗИЦИИ (BREAKOUT)</b>")
         for pair, pos in breakout_positions:
             entry_time = str(pos.get('entry_time', '?')).replace("T", " ")[:16]
-            lines.append(f"• <b>{pair}</b>\n| Вход: {pos.get('entry_price', 0):.8f}\n| Время: {entry_time}\n| SL: {pos.get('stop', 0):.8f}\n| TP: {pos.get('target', 0):.8f}")
+            lines.append(f"  <b>{pair}</b> | Вход: {pos.get('entry_price', 0):.8f} | Время: {entry_time}")
+            lines.append(f"  🍊 Стоп: {pos.get('stop', 0):.8f} | 🎯 Цель: {pos.get('target', 0):.8f}")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+
     if not confluence_positions and not breakout_positions:
-        lines.append("💰 <b>Открытых позиций нет.</b>")
+        lines.append("💤 <b>Открытых позиций нет.</b>")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+
+    # ТОП КАНДИДАТОВ (желтые)
     close_calls = [s for s in scan_summary if s["trend_score"] >= 2]
     close_calls.sort(key=lambda s: s.get("macd_gap_pct", 999))
     if close_calls:
-        lines.append("🎯 <b>Топ кандидатов на вход (Confluence):</b>")
+        lines.append("🎯 <b>ТОП КАНДИДАТОВ (CONFLUENCE)</b>")
         for i, s in enumerate(close_calls[:3], 1):
             gap = s.get("macd_gap_pct", 0)
-            if gap < 0: proximity = "⏳ Близко к кроссу (ждём)"
-            elif gap < 0.5: proximity = "🟡 Кросс недавно, ещё актуально"
-            else: proximity = "⚠️ Кросс был давно, вход маловероятен скоро"
-            lines.append(f"{i}. <b>{s['pair']}</b>\nТренд: {s['trend_score']}/3\n| ADX: {s['adx_1d']:.0f}\n| RSI(4h): {s['rsi_4h']:.0f}\nОриентир входа (тек. цена): ~{s['close_price']:.8f}\n{proximity}")
-    else: lines.append("😴 <b>Кандидатов на вход (Confluence) нет</b>")
+            if gap < 0:
+                proximity = "⏳ Близко к кроссу (ждём)"
+            elif gap < 0.5:
+                proximity = "🟡 Кросс недавно, ещё актуально"
+            else:
+                proximity = "⚠️ Кросс был давно, вход маловероятен скоро"
+            lines.append(f"<b>{i}. {s['pair']}</b>")
+            lines.append(f"  Тренд: {s['trend_score']}/3 | ADX: {s['adx_1d']:.0f} | RSI(4h): {s['rsi_4h']:.0f}")
+            lines.append(f"  Цена: ~{s['close_price']:.8f}")
+            lines.append(f"  <i>{proximity}</i>")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+
+    # БОКОВИКИ (оранжевые)
     if consolidation_list:
-        lines.append("📦 <b>Монеты в длительном боковике (> 30 дней):</b>")
+        lines.append("📦 <b>МОНЕТЫ В БОКОВИКЕ (>30 ДНЕЙ)</b>")
         consolidation_list.sort(key=lambda x: x["days"], reverse=True)
         for i, item in enumerate(consolidation_list[:MAX_STATUS_PAIRS], 1):
-            lines.append(f"{i}. {item['pair']} – {item['days']} дн.\n| Диапазон: {item['range_pct']:.1f}%\n| ADX: {item['adx']:.0f}\n| Пробой выше: {item['breakout_level']:.6f}")
+            lines.append(f"  <b>{i}. {item['pair']}</b> – {item['days']} дн.")
+            lines.append(f"  📏 Диапазон: {item['range_pct']:.1f}% | ADX: {item['adx']:.0f}")
+            lines.append(f"  🚀 Пробой выше: {item['breakout_level']:.6f}")
         if len(consolidation_list) > MAX_STATUS_PAIRS:
             lines.append(f"... и ещё {len(consolidation_list) - MAX_STATUS_PAIRS} пар")
-    else: lines.append("📦 <b>Боковиков не найдено</b>")
-    lines.append("━" * 25)
-    lines.append("🔄 Следующее статусное сообщение через 2 ч.")
+    else:
+        lines.append("📦 <b>Боковиков не найдено</b>")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"🔄 Следующее статусное сообщение через 2 ч.")
     send_telegram("\n".join(lines))
 
 # ==================== MAIN ====================
