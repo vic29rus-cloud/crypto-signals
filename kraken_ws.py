@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
- KRAKEN SCANNER v16.0 «HYBRID+» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
+ KRAKEN SCANNER v16.1 «HYBRID+» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
  WebSocket (wss://ws.kraken.com/v2) + REST (api.kraken.com)
  Бумажная торговля: сделки -> trades_log.json, алерты -> Telegram
 ==============================================================================
@@ -78,8 +78,11 @@ PULLBACK_TP_ATR = 5.0
 TREND_CACHE_REFRESH_SECONDS = 1800
 TREND_CACHE_INITIAL_LIMIT = 60
 
+# --- v16: КЭШ ПРОБОЕВ (новое!) ---
+BREAKOUT_CACHE_SIZE = 30       # храним максимум 30 уровней
+
 CLEANUP_AFTER_DAYS = 14
-WS_SILENCE_TIMEOUT = 90        # v16: watchdog, секунд
+WS_SILENCE_TIMEOUT = 90
 
 WORK_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(WORK_DIR, "kraken_ws_state.json")
@@ -87,7 +90,7 @@ TRADES_LOG_FILE = os.path.join(WORK_DIR, "trades_log.json")
 LOG_FILE = os.path.join(WORK_DIR, "scanner.log")
 MAX_STATUS_PAIRS = 20
 
-# ==================== ЛОГИРОВАНИЕ (v16: ротация) ====================
+# ==================== ЛОГИРОВАНИЕ ====================
 os.makedirs(WORK_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -108,9 +111,13 @@ trade_times = []
 ohlc_buffers = {}
 last_processed_closed = {}
 
-trend_cache = {}               # v16: symbol -> {"score": 0..3, "4h", "1d", "1w"}
+trend_cache = {}
 trend_cache_lock = threading.RLock()
 LAST_FILTERED_PAIRS = []
+
+# НОВОЕ: кэш уровней пробоев
+breakout_cache = {}
+breakout_cache_lock = threading.RLock()
 
 last_ws_msg_ts = time.time()
 WS_APP = None
@@ -363,6 +370,9 @@ def check_exit(results, pos):
 # ==================== ДВИЖОК ====================
 def can_enter(pair):
     now = time.time()
+    # ФИКС 1: Очищаем старые записи, чтобы не было утечки памяти
+    trade_times[:] = [t for t in trade_times if now - t < 3600]
+    
     old_state = state.get(pair, {})
     if old_state.get("position") == "open":
         return False
@@ -375,7 +385,7 @@ def can_enter(pair):
         return False
     return True
 
-# ==================== v16: ТРЕНД-КЭШ (отдельный поток) ====================
+# ==================== v16: ТРЕНД-КЭШ ====================
 def get_trend(symbol):
     with trend_cache_lock:
         return trend_cache.get(symbol)
@@ -397,7 +407,7 @@ def refresh_trend_for(pair):
         p = TIMEFRAME_PARAMS[tf]
         df = pd.DataFrame(fetch_klines(pair, p["kraken_interval"], p["min_bars"]))
         res[tf] = compute_tf_trend(df, p)
-        time.sleep(0.3)
+        time.sleep(0.15)  # ФИКС 2: Пауза, чтобы не получить 429
     score = sum(1 for v in res.values() if v)
     with trend_cache_lock:
         trend_cache[pair] = {"score": score, **res}
@@ -526,8 +536,13 @@ def fetch_klines(pair, interval, min_bars):
         data = resp.json()
         if data.get("error"):
             return []
-        key = list(data.get("result", {}).keys())[0]
-        raw = data["result"][key]
+        
+        result = data.get("result", {})
+        if not result:  # ФИКС 3: Проверка на пустой ответ
+            return []
+        
+        key = list(result.keys())[0]
+        raw = result[key]
         df = pd.DataFrame(raw, columns=["time", "open", "high", "low",
                                         "close", "vwap", "volume", "count"])
         df["time"] = pd.to_numeric(df["time"], errors="coerce")
@@ -711,6 +726,71 @@ def open_position(symbol, sig, closed_start):
     save_state(state)
     return new_state
 
+# ==================== БЫСТРЫЙ ENTRY BREAKOUT ЧЕРЕЗ WEBSOCKET ====================
+def try_ws_breakout(symbol, new_candle, df):
+    """Вход по пробою уровня из кэша, подтверждённому закрытием 15m свечи и объёмом."""
+    with breakout_cache_lock:
+        level = breakout_cache.get(symbol)
+    if level is None or level <= 0:
+        return None
+
+    prev_close = float(df["close"].iloc[-3])
+    last_close = float(df["close"].iloc[-2])
+
+    vol_sma = df["volume"].rolling(20).mean()
+    vol_ratio = (float(df["volume"].iloc[-2] / vol_sma.iloc[-2])
+                 if not pd.isna(vol_sma.iloc[-2]) and vol_sma.iloc[-2] > 0 else 0.0)
+
+    # Свежий пробой: предыдущая свеча ниже уровня, пробойная закрылась выше
+    if not (prev_close < level <= last_close):
+        return None
+
+    # Не входим, если цена уже улетела далеко от уровня
+    if last_close > level * (1 + MAX_BREAKOUT_DISTANCE_PCT / 100):
+        return None
+
+    # Подтверждение объёмом именно пробойной свечи
+    if vol_ratio < 1.8:
+        return None
+
+    atr_val = float(df["atr"].iloc[-2]) if not pd.isna(df["atr"].iloc[-2]) else 0.0
+    if atr_val <= 0:
+        return None
+
+    entry = float(new_candle["close"])
+    stop = entry - atr_val * ATR_MULT_SL
+    target = entry + atr_val * ATR_MULT_TP
+    if stop >= entry or target <= entry:
+        return None
+    if (entry - stop) / entry * 100 < MIN_STOP_DISTANCE_PCT:
+        return None
+
+    closed_start = int(df.iloc[-2]["start"])
+    with state_lock:
+        if not can_enter(symbol):
+            return None
+        old_state = state.get(symbol, {})
+        if old_state.get("last_signal_candle") == closed_start:
+            return None
+        new_state = old_state.copy()
+        new_state.update({
+            "position": "open",
+            "entry_price": entry,
+            "stop": stop,
+            "target": target,
+            "atr_ref": atr_val,
+            "entry_time": datetime.now(timezone.utc).isoformat(),
+            "last_signal_candle": closed_start,
+            "last_entry_ts": time.time(),
+            "strategy": "breakout_ws",
+            "score": "BWS",
+        })
+        state[symbol] = new_state
+        trade_times.append(time.time())
+        save_state(state)
+    return {"entry": entry, "stop": stop, "target": target,
+            "vol_ratio": vol_ratio, "level": level}
+
 # ==================== WEBSOCKET ====================
 def on_open(ws):
     logger.info("WebSocket подключен. Подписка на %d пар (ohlc/%dm)...",
@@ -751,6 +831,7 @@ def on_message(ws, message):
             else:
                 buf.append(new_candle)
 
+            # ---- ведение открытых позиций (мгновенно) ----
             exit_messages = []
             with state_lock:
                 pos = state.get(symbol, {})
@@ -801,6 +882,7 @@ def on_message(ws, message):
             for msg in exit_messages:
                 send_telegram(msg)
 
+            # ---- сигнал по ЗАКРЫТОЙ 15m свече ----
             if len(buf) < MIN_BARS + 1:
                 continue
             closed_start = int(buf[-2]["start"])
@@ -821,6 +903,16 @@ def on_message(ws, message):
             df["ema_cross_up"] = ((df["ema_fast"] > df["ema_slow"])
                                   & (df["ema_fast"].shift(1) <= df["ema_slow"].shift(1)))
             df["vol_ratio"] = df["volume"] / df["vol_sma"].replace(0, np.nan)
+
+            # НОВОЕ: Вызов быстрого пробоя через WebSocket (перед Confluence)
+            breakout_sig = try_ws_breakout(symbol, new_candle, df)
+            if breakout_sig:
+                send_telegram(
+                    f"📦 <b>ПРОБОЙ БОКОВИКА (WS)</b>\nПара: {symbol}\n"
+                    f"Цена: {breakout_sig['entry']:.8f}\n"
+                    f"SL: {breakout_sig['stop']:.8f} · TP: {breakout_sig['target']:.8f}\n"
+                    f"Объём: {breakout_sig['vol_ratio']:.1f}×")
+                continue
 
             sig = evaluate_ws_entry(df, symbol)
             if sig is None:
@@ -919,7 +1011,7 @@ def try_open_breakout(pair, df_daily, current_price, now_iso):
 
 
 def background_scan_loop():
-    global state
+    global state, breakout_cache
     while True:
         try:
             volatile_pairs = get_filtered_pairs(TOP_N) or []
@@ -1098,6 +1190,14 @@ def background_scan_loop():
                     logger.error("Ошибка во втором проходе %s: %s", pair, e)
                     continue
 
+            # ---- НОВОЕ: заполняем кэш пробоев для WebSocket ----
+            with breakout_cache_lock:
+                consolidation_list.sort(key=lambda x: x["days"], reverse=True)
+                breakout_cache = {}
+                for item in consolidation_list[:BREAKOUT_CACHE_SIZE]:
+                    breakout_cache[item["pair"]] = item["breakout_level"]
+            logger.info("Breakout-кэш обновлён: %d уровней", len(breakout_cache))
+
             # ---- очистка state ----
             try:
                 with state_lock:
@@ -1119,18 +1219,20 @@ def background_scan_loop():
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
 
-
+# ==================== ОТПРАВКА СТАТУСА ====================
 def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     with state_lock:
         open_snapshot = [(pair, dict(pos)) for pair, pos in state.items()
                          if pos.get("position") == "open"]
     with trend_cache_lock:
         q3 = sum(1 for v in trend_cache.values() if v["score"] == 3)
-    confluence_positions = [(p, v) for p, v in open_snapshot if v.get("strategy") != "breakout"]
-    breakout_positions = [(p, v) for p, v in open_snapshot if v.get("strategy") == "breakout"]
+    confluence_positions = [(p, v) for p, v in open_snapshot
+                            if v.get("strategy") not in ("breakout", "breakout_ws")]
+    breakout_positions = [(p, v) for p, v in open_snapshot
+                          if v.get("strategy") in ("breakout", "breakout_ws")]
 
     lines = [
-        f"📡 <b>СТАТУС СКАНЕРА v16</b> | "
+        f"📡 <b>СТАТУС СКАНЕРА v16.1</b> | "
         f"<i>{datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         "🔹 <b>📊 ОБЩАЯ СТАТИСТИКА</b>",
@@ -1215,7 +1317,7 @@ def handle_stop(signum, _frame):
 
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v16.0 «HYBRID+» ...")
+    logger.info("Запуск бота v16.1 «HYBRID+» ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
@@ -1253,7 +1355,6 @@ if __name__ == "__main__":
         raise SystemExit(1)
     logger.info("Загружено %d пар для WebSocket", len(PAIRS_WS))
 
-    # v16: прогрев тренд-кэша для топа пар
     warm = PAIRS_WS[:TREND_CACHE_INITIAL_LIMIT]
     for idx, pair in enumerate(warm, 1):
         try:
@@ -1280,7 +1381,7 @@ if __name__ == "__main__":
     threading.Thread(target=watchdog_loop, daemon=True).start()
     threading.Thread(target=trend_cache_loop, daemon=True).start()
 
-    send_telegram(f"🟢 <b>СКАНЕР v16 «HYBRID+» ЗАПУЩЕН</b>\n"
+    send_telegram(f"🟢 <b>СКАНЕР v16.1 «HYBRID+» ЗАПУЩЕН</b>\n"
                   f"WS: {len(PAIRS_WS)} пар · тренд 3/3: {q3}\n"
                   f"Лимиты: {MAX_OPEN_POSITIONS} поз. / "
                   f"{MAX_TRADES_PER_HOUR} сделок в час / "
