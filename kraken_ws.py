@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
- KRAKEN SCANNER v16.2 «HYBRID+» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
+ KRAKEN SCANNER v16.3 «HYBRID+» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
  WebSocket (wss://ws.kraken.com/v2) + REST (api.kraken.com)
  Бумажная торговля: сделки -> trades_log.json, алерты -> Telegram
 ==============================================================================
@@ -39,7 +39,6 @@ TRIGGER_TF = "4h"
 TIME_STOP_DAYS = 7
 TIME_STOP_MIN_R = 1.0
 
-# --- v16.2: Лимиты расширены ---
 MAX_OPEN_POSITIONS = 8
 MAX_TRADES_PER_HOUR = 15
 ENTRY_COOLDOWN_SECONDS = 1800
@@ -62,23 +61,20 @@ BREAKEVEN_TRIGGER_ATR = 1.0
 TRAILING_TRIGGER_ATR = 2.0
 TRAILING_STEP_ATR = 1.5
 
-# --- v16.2: Измененные фильтры входов ---
-MIN_SIGNAL_SCORE = 5           # Снижено с 6 до 5
+MIN_SIGNAL_SCORE = 5
 FRESH_CROSS_WINDOW = 3
-RSI_MIN, RSI_MAX = 35, 80      # Расширено
-ADX_MIN, ADX_MAX = 15, 60      # Расширено (было 18, 50)
-MIN_VOL_MULT = 1.2             # Снижено с 1.3
+RSI_MIN, RSI_MAX = 35, 80
+ADX_MIN, ADX_MAX = 15, 60
+MIN_VOL_MULT = 1.2
 PULLBACK_ENABLED = True
 PULLBACK_VOL_MULT = 1.1
-PULLBACK_RSI_MAX = 68          # Расширено (было 65)
+PULLBACK_RSI_MAX = 68
 PULLBACK_SL_ATR = 2.5
 PULLBACK_TP_ATR = 5.0
 
-# --- v16.2: Тренд-кэш ---
 TREND_CACHE_REFRESH_SECONDS = 1800
 TREND_CACHE_INITIAL_LIMIT = 60
 
-# --- v16.2: КЭШ ПРОБОЕВ ---
 BREAKOUT_CACHE_SIZE = 30
 
 CLEANUP_AFTER_DAYS = 14
@@ -453,6 +449,10 @@ def build_asset_pairs():
         logger.error("Ошибка загрузки AssetPairs: %s", e)
 
 
+# Общие списки для фильтрации (используются в обеих функциях)
+FIAT_BASES = {"AUD", "GBP", "EUR", "CAD", "CHF", "JPY", "USD"}
+STABLECOINS = {"USDC", "USDT", "DAI", "PYUSD", "TUSD", "FDUSD", "AUSD", "EURR", "USDR", "FRNT", "EURQ", "USDPT", "BRL1", "EUROP", "SAPIEN", "DBR", "AB"}
+
 def get_filtered_pairs(top_n):
     global LAST_FILTERED_PAIRS
     try:
@@ -464,10 +464,7 @@ def get_filtered_pairs(top_n):
             if not wsname.endswith("/USD"):
                 continue
             base = wsname.split("/")[0]
-            # v16.2: Жесткий фильтр — чистая крипта только!
-            FIAT = {"AUD", "GBP", "EUR", "CAD", "CHF", "JPY", "USD"}
-            STABLES = {"USDC", "USDT", "DAI", "PYUSD", "TUSD", "FDUSD", "AUSD", "EURR", "USDR", "FRNT", "EURQ", "USDPT"}
-            if base in FIAT or base in STABLES:
+            if base in FIAT_BASES or base in STABLECOINS:
                 continue
             rest_name = REST_PAIR_BY_WSNAME.get(wsname)
             if rest_name:
@@ -520,10 +517,7 @@ def get_all_available_pairs(max_pairs):
             if not wsname.endswith("/USD"):
                 continue
             base = wsname.split("/")[0]
-            # v16.2: Жесткий фильтр — чистая крипта только!
-            FIAT = {"AUD", "GBP", "EUR", "CAD", "CHF", "JPY", "USD"}
-            STABLES = {"USDC", "USDT", "DAI", "PYUSD", "TUSD", "FDUSD", "AUSD", "EURR", "USDR", "FRNT", "EURQ", "USDPT"}
-            if base in FIAT or base in STABLES:
+            if base in FIAT_BASES or base in STABLECOINS:
                 continue
             candidates.append(wsname)
         return candidates[:max_pairs]
@@ -1233,7 +1227,7 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
                           if v.get("strategy") in ("breakout", "breakout_ws")]
 
     lines = [
-        f"📡 <b>СТАТУС СКАНЕРА v16.2</b> | "
+        f"📡 <b>СТАТУС СКАНЕРА v16.3</b> | "
         f"<i>{datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         "🔹 <b>📊 ОБЩАЯ СТАТИСТИКА</b>",
@@ -1318,7 +1312,7 @@ def handle_stop(signum, _frame):
 
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v16.2 «HYBRID+» ...")
+    logger.info("Запуск бота v16.3 «HYBRID+» ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
@@ -1381,7 +1375,7 @@ if __name__ == "__main__":
     threading.Thread(target=watchdog_loop, daemon=True).start()
     threading.Thread(target=trend_cache_loop, daemon=True).start()
 
-    send_telegram(f"🟢 <b>СКАНЕР v16.2 «HYBRID+» ЗАПУЩЕН</b>\n"
+    send_telegram(f"🟢 <b>СКАНЕР v16.3 «HYBRID+» ЗАПУЩЕН</b>\n"
                   f"WS: {len(PAIRS_WS)} пар · тренд 3/3: {q3}\n"
                   f"Лимиты: {MAX_OPEN_POSITIONS} поз. / "
                   f"{MAX_TRADES_PER_HOUR} сделок в час / "
