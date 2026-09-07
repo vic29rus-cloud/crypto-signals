@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
- KRAKEN SCANNER v16.1 «HYBRID+» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
+ KRAKEN SCANNER v16.2 «HYBRID+» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
  WebSocket (wss://ws.kraken.com/v2) + REST (api.kraken.com)
  Бумажная торговля: сделки -> trades_log.json, алерты -> Telegram
 ==============================================================================
@@ -28,18 +28,18 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 BASE_URL = "https://api.kraken.com/0/public"
 WS_URL = "wss://ws.kraken.com/v2"
 
-TOP_N = 200                    # пар на WebSocket
-TOTAL_PAIRS = 700              # пар в REST-скане боковиков
-SCAN_INTERVAL_SECONDS = 7200   # полный REST-цикл (2 часа)
+TOP_N = 200
+TOTAL_PAIRS = 700
+SCAN_INTERVAL_SECONDS = 7200
 MIN_TURNOVER_USD = 50_000
 
 TIMEFRAME = 15
 MIN_BARS = 80
 TRIGGER_TF = "4h"
 TIME_STOP_DAYS = 7
-TIME_STOP_MIN_R = 1.0          # v16: не закрывать по времени, если прибыль >= 1R
+TIME_STOP_MIN_R = 1.0
 
-# --- v16: лимиты расширены ---
+# --- v16.2: Лимиты расширены ---
 MAX_OPEN_POSITIONS = 8
 MAX_TRADES_PER_HOUR = 15
 ENTRY_COOLDOWN_SECONDS = 1800
@@ -56,30 +56,30 @@ SLIPPAGE_PCT = 0.05
 
 ATR_MULT_SL = 3.0
 ATR_MULT_TP = 6.0
-PARTIAL_TP_ATR = 3.0           # v16: частичный TP на 3×ATR
-PARTIAL_TP_FRACTION = 0.5      # v16: фиксируем 50% позиции
+PARTIAL_TP_ATR = 3.0
+PARTIAL_TP_FRACTION = 0.5
 BREAKEVEN_TRIGGER_ATR = 1.0
 TRAILING_TRIGGER_ATR = 2.0
-TRAILING_STEP_ATR = 1.5        # chandelier от макс. закрытия 4h
+TRAILING_STEP_ATR = 1.5
 
-# --- v16: фильтр входов (скоринг confluence) ---
-MIN_SIGNAL_SCORE = 6           # порог входа, шкала 0–10
-FRESH_CROSS_WINDOW = 3         # MACD-кросс действителен 3 закрытые свечи
-RSI_MIN, RSI_MAX = 40, 78
-ADX_MIN, ADX_MAX = 18, 50
-MIN_VOL_MULT = 1.3
+# --- v16.2: Измененные фильтры входов ---
+MIN_SIGNAL_SCORE = 5           # Снижено с 6 до 5
+FRESH_CROSS_WINDOW = 3
+RSI_MIN, RSI_MAX = 35, 80      # Расширено
+ADX_MIN, ADX_MAX = 15, 60      # Расширено (было 18, 50)
+MIN_VOL_MULT = 1.2             # Снижено с 1.3
 PULLBACK_ENABLED = True
 PULLBACK_VOL_MULT = 1.1
-PULLBACK_RSI_MAX = 65
+PULLBACK_RSI_MAX = 68          # Расширено (было 65)
 PULLBACK_SL_ATR = 2.5
 PULLBACK_TP_ATR = 5.0
 
-# --- v16: тренд-кэш ---
+# --- v16.2: Тренд-кэш ---
 TREND_CACHE_REFRESH_SECONDS = 1800
 TREND_CACHE_INITIAL_LIMIT = 60
 
-# --- v16: КЭШ ПРОБОЕВ (новое!) ---
-BREAKOUT_CACHE_SIZE = 30       # храним максимум 30 уровней
+# --- v16.2: КЭШ ПРОБОЕВ ---
+BREAKOUT_CACHE_SIZE = 30
 
 CLEANUP_AFTER_DAYS = 14
 WS_SILENCE_TIMEOUT = 90
@@ -115,7 +115,6 @@ trend_cache = {}
 trend_cache_lock = threading.RLock()
 LAST_FILTERED_PAIRS = []
 
-# НОВОЕ: кэш уровней пробоев
 breakout_cache = {}
 breakout_cache_lock = threading.RLock()
 
@@ -370,9 +369,7 @@ def check_exit(results, pos):
 # ==================== ДВИЖОК ====================
 def can_enter(pair):
     now = time.time()
-    # ФИКС 1: Очищаем старые записи, чтобы не было утечки памяти
     trade_times[:] = [t for t in trade_times if now - t < 3600]
-    
     old_state = state.get(pair, {})
     if old_state.get("position") == "open":
         return False
@@ -407,7 +404,7 @@ def refresh_trend_for(pair):
         p = TIMEFRAME_PARAMS[tf]
         df = pd.DataFrame(fetch_klines(pair, p["kraken_interval"], p["min_bars"]))
         res[tf] = compute_tf_trend(df, p)
-        time.sleep(0.15)  # ФИКС 2: Пауза, чтобы не получить 429
+        time.sleep(0.15)
     score = sum(1 for v in res.values() if v)
     with trend_cache_lock:
         trend_cache[pair] = {"score": score, **res}
@@ -466,7 +463,11 @@ def get_filtered_pairs(top_n):
             wsname = info.get("wsname", "")
             if not wsname.endswith("/USD"):
                 continue
-            if wsname.split("/")[0] in {"USDC", "USDT", "DAI", "PYUSD", "TUSD", "FDUSD"}:
+            base = wsname.split("/")[0]
+            # v16.2: Жесткий фильтр — чистая крипта только!
+            FIAT = {"AUD", "GBP", "EUR", "CAD", "CHF", "JPY", "USD"}
+            STABLES = {"USDC", "USDT", "DAI", "PYUSD", "TUSD", "FDUSD", "AUSD", "EURR", "USDR", "FRNT", "EURQ", "USDPT"}
+            if base in FIAT or base in STABLES:
                 continue
             rest_name = REST_PAIR_BY_WSNAME.get(wsname)
             if rest_name:
@@ -518,7 +519,11 @@ def get_all_available_pairs(max_pairs):
             wsname = info.get("wsname", "")
             if not wsname.endswith("/USD"):
                 continue
-            if wsname.split("/")[0] in {"USDC", "USDT", "DAI", "PYUSD", "TUSD", "FDUSD"}:
+            base = wsname.split("/")[0]
+            # v16.2: Жесткий фильтр — чистая крипта только!
+            FIAT = {"AUD", "GBP", "EUR", "CAD", "CHF", "JPY", "USD"}
+            STABLES = {"USDC", "USDT", "DAI", "PYUSD", "TUSD", "FDUSD", "AUSD", "EURR", "USDR", "FRNT", "EURQ", "USDPT"}
+            if base in FIAT or base in STABLES:
                 continue
             candidates.append(wsname)
         return candidates[:max_pairs]
@@ -536,11 +541,9 @@ def fetch_klines(pair, interval, min_bars):
         data = resp.json()
         if data.get("error"):
             return []
-        
         result = data.get("result", {})
-        if not result:  # ФИКС 3: Проверка на пустой ответ
+        if not result:
             return []
-        
         key = list(result.keys())[0]
         raw = result[key]
         df = pd.DataFrame(raw, columns=["time", "open", "high", "low",
@@ -604,8 +607,6 @@ def evaluate_ws_entry(df, symbol):
     if not (RSI_MIN <= sig["rsi"] <= RSI_MAX):
         return None
     if not (ADX_MIN <= sig["adx"] <= ADX_MAX):
-        return None
-    if not bool(sig["adx_slope_up"]):
         return None
     if not (sig["ema_fast"] > sig["ema_slow"]):
         return None
@@ -1232,7 +1233,7 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
                           if v.get("strategy") in ("breakout", "breakout_ws")]
 
     lines = [
-        f"📡 <b>СТАТУС СКАНЕРА v16.1</b> | "
+        f"📡 <b>СТАТУС СКАНЕРА v16.2</b> | "
         f"<i>{datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         "🔹 <b>📊 ОБЩАЯ СТАТИСТИКА</b>",
@@ -1317,13 +1318,12 @@ def handle_stop(signum, _frame):
 
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v16.1 «HYBRID+» ...")
+    logger.info("Запуск бота v16.2 «HYBRID+» ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
     state = load_state()
 
-    # МИГРАЦИЯ: для старых позиций добавляем недостающие поля
     for sym, pos in state.items():
         if pos.get("position") == "open":
             if "atr_ref" not in pos or pos["atr_ref"] <= 0:
@@ -1381,7 +1381,7 @@ if __name__ == "__main__":
     threading.Thread(target=watchdog_loop, daemon=True).start()
     threading.Thread(target=trend_cache_loop, daemon=True).start()
 
-    send_telegram(f"🟢 <b>СКАНЕР v16.1 «HYBRID+» ЗАПУЩЕН</b>\n"
+    send_telegram(f"🟢 <b>СКАНЕР v16.2 «HYBRID+» ЗАПУЩЕН</b>\n"
                   f"WS: {len(PAIRS_WS)} пар · тренд 3/3: {q3}\n"
                   f"Лимиты: {MAX_OPEN_POSITIONS} поз. / "
                   f"{MAX_TRADES_PER_HOUR} сделок в час / "
