@@ -115,23 +115,19 @@ CRYPTO_WHITELIST = {
 # Объединяем все исключения
 EXCLUDED = FIAT_BASES | STABLECOINS
 
+# ИСПРАВЛЕНИЕ №1 и №2 от советника (Гибрид + Правильный порядок):
 def is_crypto(base):
     """Проверяет, является ли базовая валюта настоящей криптовалютой."""
     if not base:
         return False
-    # Если заканчивается на X – токен акций
-    if base.endswith("X"):
-        return False
-    # Если в белом списке – точно крипта
+    # 1. Сначала белый список (чтобы STX и IMX не отсекались из-за "X")
     if base in CRYPTO_WHITELIST:
         return True
-    # Если в списке исключений – точно не крипта
-    if base in EXCLUDED:
+    # 2. Потом исключения (стейблы, фиат, акции)
+    if base in EXCLUDED or base.endswith("X"):
         return False
-    # Дополнительная проверка: если имя состоит только из заглавных латинских букв и цифр,
-    # и длина > 2 – скорее всего криптовалюта, но лучше пропустить через белый список.
-    # Для безопасности пропускаем только белый список
-    return False
+    # 3. Вариант Б: Всё остальное считаем криптой (новые листинги подхватываются автоматически)
+    return True
 
 # ==================== ЛОГИРОВАНИЕ ====================
 os.makedirs(WORK_DIR, exist_ok=True)
@@ -461,18 +457,38 @@ def trend_cache_loop():
         except Exception as e:
             logger.error("Поток тренд-кэша: %s", e)
 
-# ==================== МАППИНГ ПАР И ЦЕН (ОБНОВЛЁННЫЙ ФИЛЬТР) ====================
+# ==================== МАППИНГ ПАР И ЦЕН (ИСПРАВЛЕНИЕ 3 и 4) ====================
+# ИСПРАВЛЕНИЕ №3 (Пагинация):
+def fetch_all_instruments():
+    """Получает ВСЕ инструменты с пагинацией через cursor."""
+    items, cursor = [], ""
+    while True:
+        params = {"category": "spot", "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            data = requests.get(f"{BASE_URL}/instruments-info", params=params, timeout=20).json()
+            res = data.get("result", {})
+            items.extend(res.get("list", []))
+            cursor = res.get("nextPageCursor", "")
+            if not cursor:
+                break
+        except Exception as e:
+            logger.error("Ошибка получения инструментов: %s", e)
+            break
+    return items
+
 def get_filtered_pairs(top_n):
     global LAST_FILTERED_PAIRS
     try:
-        inst = requests.get(f"{BASE_URL}/instruments-info",
-                            params={"category": "spot", "limit": 1000}, timeout=20).json()
+        # Теперь используем пагинацию
+        inst_list = fetch_all_instruments()
         candidates = set()
-        for item in inst.get("result", {}).get("list", []):
+        for item in inst_list:
             base, quote = item.get("baseCoin", ""), item.get("quoteCoin", "")
             if item.get("status") != "Trading" or quote != "USDT":
                 continue
-            # Применяем фильтр только крипты
+            # Применяем фильтр только крипты (Гибрид)
             if not is_crypto(base):
                 continue
             candidates.add(item.get("symbol"))
@@ -499,18 +515,31 @@ def get_filtered_pairs(top_n):
         logger.error("get_filtered_pairs: %s", e)
         return []
 
+# ИСПРАВЛЕНИЕ №4 (Сортировка по обороту для полного списка):
 def get_all_available_pairs(max_pairs):
     try:
-        inst = requests.get(f"{BASE_URL}/instruments-info",
-                            params={"category": "spot", "limit": 1000}, timeout=20).json()
+        inst_list = fetch_all_instruments()
         candidates = []
-        for item in inst.get("result", {}).get("list", []):
+        
+        # Получаем обороты для сортировки
+        tick = requests.get(f"{BASE_URL}/tickers", params={"category": "spot"}, timeout=20).json()
+        turnovers = {}
+        for t in tick.get("result", {}).get("list", []):
+            try:
+                turnovers[t["symbol"]] = float(t.get("turnover24h", 0))
+            except:
+                turnovers[t["symbol"]] = 0.0
+        
+        for item in inst_list:
             base, quote = item.get("baseCoin", ""), item.get("quoteCoin", "")
             if item.get("status") != "Trading" or quote != "USDT":
                 continue
             if not is_crypto(base):
                 continue
             candidates.append(item.get("symbol"))
+        
+        # Сортируем по обороту (убывание), чтобы брать самые ликвидные
+        candidates.sort(key=lambda s: turnovers.get(s, 0), reverse=True)
         return candidates[:max_pairs]
     except Exception as e:
         logger.error("get_all_available_pairs: %s", e)
