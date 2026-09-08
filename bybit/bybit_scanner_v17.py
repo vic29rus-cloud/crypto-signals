@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
- BYBIT SCANNER v17.0 «HYBRID+» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
+ BYBIT SCANNER v17.1 «HYBRID+» — ТОЛЬКО КРИПТА (БЕЗ СТЕЙБЛОВ И АКЦИЙ)
  WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com)
  Бумажная торговля: сделки -> trades_log.json, алерты -> Telegram
 ==============================================================================
@@ -85,9 +85,53 @@ TRADES_LOG_FILE = os.path.join(WORK_DIR, "bybit_trades.json")
 LOG_FILE = os.path.join(WORK_DIR, "bybit_scanner.log")
 MAX_STATUS_PAIRS = 20
 
-# ==================== ФИЛЬТРЫ ====================
-FIAT_BASES = {"USDC", "USDT", "DAI", "PYUSD", "TUSD", "FDUSD", "AUSD", "EURR", "USDR", "FRNT", "EURQ", "USDPT", "BRL1", "EUROP", "SAPIEN", "DBR", "AB", "AUD", "GBP", "EUR", "CAD", "CHF", "JPY", "USD"}
-STABLECOINS = FIAT_BASES  # Для Bybit полностью объединяем
+# ==================== ФИЛЬТРЫ (ТОЛЬКО КРИПТА) ====================
+# Фиатные валюты – исключаем полностью
+FIAT_BASES = {"AUD", "GBP", "EUR", "CAD", "CHF", "JPY", "USD"}
+
+# Все известные стейблкоины и прочие привязки
+STABLECOINS = {
+    "USDC", "USDT", "DAI", "PYUSD", "TUSD", "FDUSD", "AUSD", "EURR", "USDR",
+    "FRNT", "EURQ", "USDPT", "BRL1", "EUROP", "SAPIEN", "DBR", "AB",
+    "USDTB", "USD1", "RLUSD",   # новые стейблы
+    # Токены акций (на всякий случай)
+    "AAPLX", "AMZNX", "GOOGLX", "MCDX"
+}
+
+# Белый список настоящих криптовалют (популярные и средние)
+CRYPTO_WHITELIST = {
+    "BTC", "ETH", "SOL", "XRP", "ADA", "DOT", "LINK", "UNI", "AVAX", "MATIC",
+    "ATOM", "FTM", "NEAR", "ALGO", "VET", "ICP", "FIL", "AAVE", "MKR", "COMP",
+    "CRV", "1INCH", "SUSHI", "ZEC", "DASH", "XLM", "ETC", "EOS", "NEO", "WAVES",
+    "TRX", "BNB", "LEO", "CRO", "TON", "SHIB", "DOGE", "PEPE", "WIF", "BONK",
+    "FLOKI", "MEME", "APT", "ARB", "OP", "LDO", "RNDR", "GRT", "MNT", "STX",
+    "IMX", "RUNE", "FLOW", "QNT", "EGLD", "CHZ", "MANA", "SAND", "GALA", "AXS",
+    "ENJ", "KAVA", "ZIL", "WOO", "CELO", "MINA", "ZEN", "QTUM", "ONT", "XEM",
+    "ICX", "BTT", "WIN", "KSM", "AKRO", "COTI", "OCEAN", "FET", "AGIX", "VRA",
+    "BAND", "NMR", "RLC", "STORJ", "NU", "OXT", "REN", "KNC", "BAL", "YFI",
+    "SNX", "MKR", "COMP", "CRV", "1INCH", "SUSHI", "ZEC", "DASH", "XMR"
+}
+
+# Объединяем все исключения
+EXCLUDED = FIAT_BASES | STABLECOINS
+
+def is_crypto(base):
+    """Проверяет, является ли базовая валюта настоящей криптовалютой."""
+    if not base:
+        return False
+    # Если заканчивается на X – токен акций
+    if base.endswith("X"):
+        return False
+    # Если в белом списке – точно крипта
+    if base in CRYPTO_WHITELIST:
+        return True
+    # Если в списке исключений – точно не крипта
+    if base in EXCLUDED:
+        return False
+    # Дополнительная проверка: если имя состоит только из заглавных латинских букв и цифр,
+    # и длина > 2 – скорее всего криптовалюта, но лучше пропустить через белый список.
+    # Для безопасности пропускаем только белый список
+    return False
 
 # ==================== ЛОГИРОВАНИЕ ====================
 os.makedirs(WORK_DIR, exist_ok=True)
@@ -118,7 +162,7 @@ last_ws_msg_ts = time.time()
 WS_APP = None
 PAIRS_WS = []
 
-# ==================== СЛУЖЕБНЫЕ ====================
+# ==================== СЛУЖЕБНЫЕ ФУНКЦИИ ====================
 def send_telegram(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -132,7 +176,6 @@ def send_telegram(text):
         except Exception as e:
             logger.error("Ошибка отправки Telegram: %s", e)
 
-
 def save_state(state_data):
     with state_lock:
         try:
@@ -142,7 +185,6 @@ def save_state(state_data):
             os.replace(tmp_file, STATE_FILE)
         except Exception as e:
             logger.error("Ошибка сохранения state: %s", e)
-
 
 def load_state():
     with state_lock:
@@ -158,7 +200,6 @@ def load_state():
             except OSError:
                 pass
             return {}
-
 
 def log_trade(symbol, entry, exit_price, reason, strategy,
               entry_time=None, size_fraction=1.0):
@@ -190,7 +231,7 @@ def log_trade(symbol, entry, exit_price, reason, strategy,
             json.dump(trades, f, indent=2)
         return round(net_pnl, 2)
 
-# ==================== ИНДИКАТОРЫ ====================
+# ==================== ИНДИКАТОРЫ (без изменений) ====================
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
@@ -267,7 +308,7 @@ def analyze_timeframe(df, params):
         "ema_slow": float(last["ema_slow"]),
     }
 
-# ==================== СТРАТЕГИИ ====================
+# ==================== СТРАТЕГИИ (без изменений) ====================
 def detect_consolidation(df_daily):
     closed = df_daily.iloc[:-1]
     if len(closed) < 60:
@@ -284,7 +325,6 @@ def detect_consolidation(df_daily):
         return {"days": len(window), "range_pct": range_pct, "adx": adx_val,
                 "upper_level": high, "lower_level": low}
     return None
-
 
 def check_breakout(df_daily, current_price):
     closed = df_daily.iloc[:-1]
@@ -319,7 +359,7 @@ def check_breakout(df_daily, current_price):
             "stop": current_price - atr_val * ATR_MULT_SL,
             "target": current_price + atr_val * ATR_MULT_TP}
 
-# ==================== УПРАВЛЕНИЕ ПОЗИЦИЕЙ ====================
+# ==================== УПРАВЛЕНИЕ ПОЗИЦИЕЙ (без изменений) ====================
 def check_exit(results, pos):
     if not results.get(TRIGGER_TF) or not results.get("1d"):
         return False, "", 0.0
@@ -355,7 +395,6 @@ def check_exit(results, pos):
         return True, "Разворот", r4h["close"]
     return False, "", 0.0
 
-# ==================== ДВИЖОК ====================
 def can_enter(pair):
     now = time.time()
     trade_times[:] = [t for t in trade_times if now - t < 3600]
@@ -371,7 +410,7 @@ def can_enter(pair):
         return False
     return True
 
-# ==================== ТРЕНД-КЭШ ====================
+# ==================== ТРЕНД-КЭШ (без изменений) ====================
 def get_trend(symbol):
     with trend_cache_lock:
         return trend_cache.get(symbol)
@@ -422,7 +461,7 @@ def trend_cache_loop():
         except Exception as e:
             logger.error("Поток тренд-кэша: %s", e)
 
-# ==================== МАППИНГ ПАР И ЦЕН (БАЙБИТ) ====================
+# ==================== МАППИНГ ПАР И ЦЕН (ОБНОВЛЁННЫЙ ФИЛЬТР) ====================
 def get_filtered_pairs(top_n):
     global LAST_FILTERED_PAIRS
     try:
@@ -433,7 +472,8 @@ def get_filtered_pairs(top_n):
             base, quote = item.get("baseCoin", ""), item.get("quoteCoin", "")
             if item.get("status") != "Trading" or quote != "USDT":
                 continue
-            if base in STABLECOINS:
+            # Применяем фильтр только крипты
+            if not is_crypto(base):
                 continue
             candidates.add(item.get("symbol"))
 
@@ -468,7 +508,7 @@ def get_all_available_pairs(max_pairs):
             base, quote = item.get("baseCoin", ""), item.get("quoteCoin", "")
             if item.get("status") != "Trading" or quote != "USDT":
                 continue
-            if base in STABLECOINS:
+            if not is_crypto(base):
                 continue
             candidates.append(item.get("symbol"))
         return candidates[:max_pairs]
@@ -508,7 +548,7 @@ def fetch_current_prices(pairs):
         logger.warning("Ошибка цен: %s", e)
     return prices
 
-# ==================== СКОРИНГ ВХОДА ====================
+# ==================== СКОРИНГ ВХОДА (без изменений) ====================
 def find_fresh_cross(df, window=FRESH_CROSS_WINDOW):
     ml, ms = df["macd_line"], df["macd_signal"]
     for ago in range(0, window):
@@ -647,7 +687,7 @@ def open_position(symbol, sig, closed_start):
     save_state(state)
     return new_state
 
-# ==================== БЫСТРЫЙ BREAKOUT ЧЕРЕЗ WS ====================
+# ==================== БЫСТРЫЙ BREAKOUT ЧЕРЕЗ WS (без изменений) ====================
 def try_ws_breakout(symbol, new_candle, df):
     with breakout_cache_lock:
         level = breakout_cache.get(symbol)
@@ -706,7 +746,7 @@ def try_ws_breakout(symbol, new_candle, df):
     return {"entry": entry, "stop": stop, "target": target,
             "vol_ratio": vol_ratio, "level": level}
 
-# ==================== WEBSOCKET (БАЙБИТ) ====================
+# ==================== WEBSOCKET (без изменений) ====================
 def on_open(ws):
     logger.info("WebSocket подключен. Подписка на %d пар...", len(PAIRS_WS))
     args = [f"kline.{TIMEFRAME}.{p}" for p in PAIRS_WS]
@@ -852,7 +892,6 @@ def on_message(ws, message):
     except Exception as e:
         logger.error("Ошибка WebSocket: %s", e)
 
-
 def on_error(ws, error):
     logger.error("WS ошибка: %s", error)
 
@@ -871,7 +910,6 @@ def run_websocket():
         except Exception as e:
             logger.error("WS критическая ошибка: %s", e)
         time.sleep(5)
-
 
 def watchdog_loop():
     while True:
@@ -1144,7 +1182,7 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
                           if v.get("strategy") in ("breakout", "breakout_ws")]
 
     lines = [
-        f"📡 <b>СТАТУС СКАНЕРА v17 (Bybit)</b> | "
+        f"📡 <b>СТАТУС СКАНЕРА v17.1 (Bybit – только крипта)</b> | "
         f"<i>{datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         "🔹 <b>📊 ОБЩАЯ СТАТИСТИКА</b>",
@@ -1204,7 +1242,7 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         lines.append("━━━━━━━━━━━━━━━━━━━━━")
 
     if consolidation_list:
-        lines.append("📦 <b>МОНЕТЫ В БОКОВИКЕ (30+ ДНЕЙ)</b>")
+        lines.append("📦 <b>МОНЕТЫ В БОКОВИКЕ (30+ ДНЕЙ) – только крипта</b>")
         consolidation_list.sort(key=lambda x: x["days"], reverse=True)
         for i, item in enumerate(consolidation_list[:MAX_STATUS_PAIRS], 1):
             lines.append(f"  <b>{i}. {item['pair']}</b> – {item['days']} дн.")
@@ -1227,9 +1265,8 @@ def handle_stop(signum, _frame):
         save_state(state)
     raise SystemExit(0)
 
-
 if __name__ == "__main__":
-    logger.info("Запуск бота v17.0 (Bybit) ...")
+    logger.info("Запуск бота v17.1 (Bybit – только крипта) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
@@ -1290,7 +1327,7 @@ if __name__ == "__main__":
     threading.Thread(target=watchdog_loop, daemon=True).start()
     threading.Thread(target=trend_cache_loop, daemon=True).start()
 
-    send_telegram(f"🟢 <b>СКАНЕР v17 (BYBIT) ЗАПУЩЕН</b>\n"
+    send_telegram(f"🟢 <b>СКАНЕР v17.1 (BYBIT – ТОЛЬКО КРИПТА) ЗАПУЩЕН</b>\n"
                   f"WS: {len(PAIRS_WS)} пар · тренд 3/3: {q3}\n"
                   f"Лимиты: {MAX_OPEN_POSITIONS} поз. / "
                   f"{MAX_TRADES_PER_HOUR} сделок в час / "
