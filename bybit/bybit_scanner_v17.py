@@ -2,16 +2,21 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v19.5 «HYBRID+ PRO» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
+BYBIT SCANNER v19.5a «HYBRID+ PRO» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
-ИСПРАВЛЕНО В v19.5:
-  • send_telegram теперь ПРОВЕРЯЕТ ответ Telegram и ЛОГИРУЕТ отказ
-  • Безопасная нарезка на чанки по границам строк (не рвёт HTML-теги)
-  • При ошибке парсинга HTML — повтор без разметки (текст всё равно дойдёт)
-  • Убран <blockquote expandable> (ломался при длинных списках)
-  • HTML-ссылки TradingView остались (они в пределах одной строки)
+ОТЛИЧИЕ v19.5a ОТ v19.5:
+  • Списки "ТОП КАНДИДАТОВ" и "МОНЕТЫ В БОКОВИКЕ" обёрнуты в
+    <blockquote expandable> — по умолчанию СВЁРНУТЫ, тап "Показать
+    полностью" раскрывает ВСЁ содержимое прямо в том же сообщении.
+  • Длина сообщения проверяется перед отправкой; если не влезает в
+    4096 символов Telegram — список монет автоматически урезается
+    (без разрыва HTML-тегов), сохраняя свёртку корректной.
+  • Формат монет сделан компактнее, чтобы вместить больше позиций.
+Всё остальное — как в v19.5 (проверка ответа Telegram, fallback без
+разметки, безопасная нарезка, HTML-ссылки TradingView, BTC-контекст,
+circuit breaker, сектора, dynamic sizing, retest, breakout-кэш).
 ==============================================================================
 """
 import json
@@ -123,11 +128,15 @@ BREAKOUT_CACHE_SIZE = 60
 CLEANUP_AFTER_DAYS = 14
 WS_SILENCE_TIMEOUT = 90
 
+# UI: сколько монет максимум в списке боковиков (с учётом свёртки)
+MAX_STATUS_PAIRS = 20
+# Общий лимит длины одного сообщения (Telegram: 4096; оставляем запас)
+MSG_SAFE_LIMIT = 3900
+
 WORK_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(WORK_DIR, "bybit_state.json")
 TRADES_LOG_FILE = os.path.join(WORK_DIR, "bybit_trades.json")
 LOG_FILE = os.path.join(WORK_DIR, "bybit_scanner.log")
-MAX_STATUS_PAIRS = 15   # было 20 — уменьшено чтобы не упираться в лимит Telegram
 
 # ==================== ЛОГИРОВАНИЕ ====================
 os.makedirs(WORK_DIR, exist_ok=True)
@@ -289,9 +298,10 @@ def portfolio_risk_used():
             total += dist * v.get("size_fraction", 1.0)
     return total
 
-# ==================== TELEGRAM (ИСПРАВЛЕНО) ====================
-def _split_html_safe(text, limit=3900):
-    """Режем по границам строк, чтобы не порвать HTML-теги."""
+# ==================== TELEGRAM ====================
+def _split_html_safe(text, limit=MSG_SAFE_LIMIT):
+    """Резервная нарезка по границам строк — используется, только если сообщение
+    всё-таки превысило лимит (например, из-за огромного шапки)."""
     chunks, cur = [], ""
     for line in text.split("\n"):
         if cur and len(cur) + len(line) + 1 > limit:
@@ -1493,7 +1503,71 @@ def background_scan_loop():
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
 
-# ==================== ОТПРАВКА СТАТУСА (без blockquote) ====================
+# ==================== ФОРМИРОВАНИЕ СПИСКОВ ДЛЯ СВЁРТКИ ====================
+def _build_cand_items(scan_summary):
+    """Список кандидатов — кортежи (текст_строки, длина_в_символах)."""
+    items = []
+    close_calls = [s for s in scan_summary if s["trend_score"] >= 2]
+    close_calls.sort(key=lambda s: s.get("macd_gap_pct", 999))
+    for i, s in enumerate(close_calls, 1):
+        gap = s.get("macd_gap_pct", 0)
+        if gap < 0:
+            proximity = "⏳ Близко к кроссу (ждём)"
+            highlight = gap > -0.25
+        elif gap < 0.5:
+            proximity = "🟡 Кросс недавно — окно 3 свечи активно"
+            highlight = True
+        else:
+            proximity = "⚠️ Кросс был давно"
+            highlight = False
+        extra = " · ADX↑" if s.get("adx_slope_up") else ""
+        vol = s.get("vol_ratio", 0.0)
+        vol_txt = f" · объём {vol:.1f}×" if vol >= MIN_VOL_MULT else ""
+        sym_link = tv_link(s["pair"])
+        head = (f"🟢 <b>▶ {i}. {sym_link} ◀</b> 🟢" if highlight
+                else f"<b>   {i}. {sym_link}</b>")
+        block_lines = [
+            head,
+            f"  Тренд: {s['trend_score']}/3 | ADX: {s['adx_1d']:.0f}{extra}"
+            f" | RSI(4h): {s['rsi_4h']:.0f}{vol_txt}",
+            f"  Цена: ~{s['close_price']:.8f}",
+            f"  <i>{proximity}</i>",
+        ]
+        text = "\n".join(block_lines)
+        items.append((text, len(text)))
+    return items
+
+def _build_cons_items(consolidation_list):
+    """Список боковиков — кортежи (текст_строки, длина_в_символах)."""
+    items = []
+    for i, item in enumerate(consolidation_list, 1):
+        dry = " 🥀" if item.get("vol_trend", 1.0) <= 0.9 else ""
+        ready = (item.get("range_pct", 99) < 15.0 and item.get("adx", 99) < 15)
+        sym_link = tv_link(item["pair"])
+        head = (f"🟢 <b>▶ {i}. {sym_link} ◀</b> – {item['days']} дн.{dry} 🟢" if ready
+                else f"<b>   {i}. {sym_link}</b> – {item['days']} дн.{dry}")
+        block_lines = [
+            head,
+            f"  📏 Диапазон: {item['range_pct']:.1f}% | ADX: {item['adx']:.0f}",
+            f"  🚀 Пробой выше: {item['upper_level']:.6f}",
+        ]
+        text = "\n".join(block_lines)
+        items.append((text, len(text)))
+    return items
+
+def _fit_items_into_limit(items, base_len, limit):
+    """Возвращает столько items, сколько уместится в limit - base_len.
+    Обрезка строго по целым монетам (не рвём HTML-теги)."""
+    used = base_len
+    out = []
+    for text, length in items:
+        if used + length + 1 > limit:
+            break
+        out.append(text)
+        used += length + 1
+    return out, used
+
+# ==================== ОТПРАВКА СТАТУСА (v19.5a: свёртка) ====================
 def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     with state_lock:
         open_snapshot = [(pair, dict(pos)) for pair, pos in state.items()
@@ -1509,8 +1583,9 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     breakout_positions = [(p, v) for p, v in open_snapshot
                           if v.get("strategy") in breakout_strategies]
 
-    lines = [
-        f"📡 <b>СТАТУС СКАНЕРА v19.5 (Bybit)</b> | "
+    # === ШАПКА ===
+    header_lines = [
+        f"📡 <b>СТАТУС СКАНЕРА v19.5a (Bybit)</b> | "
         f"<i>{datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         "🔹 <b>📊 ОБЩАЯ СТАТИСТИКА</b>",
@@ -1522,92 +1597,115 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         f"🔹 👉 Входов за цикл: <b>{found_buy}</b> · 👈 Выходов: <b>{found_sell}</b>",
     ]
     if not cb_can_trade():
-        lines.append("🔹 🛑 Circuit breaker: <b>входы на паузе</b>")
-    lines.append("━━━━━━━━━━━━━━━━━━━━━")
+        header_lines.append("🔹 🛑 Circuit breaker: <b>входы на паузе</b>")
+    header_lines.append("━━━━━━━━━━━━━━━━━━━━━")
 
     if confluence_positions:
-        lines.append("🟢 <b>💰 ПОЗИЦИИ (CONFLUENCE / PULLBACK)</b>")
+        header_lines.append("🟢 <b>💰 ПОЗИЦИИ (CONFLUENCE / PULLBACK)</b>")
         for pair, pos in confluence_positions:
             entry_time = str(pos.get("entry_time", "?")).replace("T", " ")[:16]
-            lines.append(f"  <b>{pair}</b> [score {pos.get('score', '?')}] | "
-                         f"Вход: {pos.get('entry_price', 0):.8f} | {entry_time}")
-            lines.append(f"  💚 Стоп: {pos.get('stop', 0):.8f} | "
-                         f"🎯 Цель: {pos.get('target', 0):.8f}"
-                         + (" | 💰 50% зафикс." if pos.get("partial_done") else ""))
-        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+            header_lines.append(
+                f"  <b>{pair}</b> [score {pos.get('score', '?')}] | "
+                f"Вход: {pos.get('entry_price', 0):.8f} | {entry_time}")
+            header_lines.append(
+                f"  💚 Стоп: {pos.get('stop', 0):.8f} | "
+                f"🎯 Цель: {pos.get('target', 0):.8f}"
+                + (" | 💰 50% зафикс." if pos.get("partial_done") else ""))
+        header_lines.append("━━━━━━━━━━━━━━━━━━━━━")
 
     if breakout_positions:
-        lines.append("📦 <b>💰 ПОЗИЦИИ (BREAKOUT / RETEST)</b>")
+        header_lines.append("📦 <b>💰 ПОЗИЦИИ (BREAKOUT / RETEST)</b>")
         for pair, pos in breakout_positions:
             entry_time = str(pos.get("entry_time", "?")).replace("T", " ")[:16]
-            lines.append(f"  <b>{pair}</b> [{pos.get('strategy')}] | "
-                         f"Вход: {pos.get('entry_price', 0):.8f} | {entry_time}")
-            lines.append(f"  🍊 Стоп: {pos.get('stop', 0):.8f} | "
-                         f"🎯 Цель: {pos.get('target', 0):.8f}")
-        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+            header_lines.append(f"  <b>{pair}</b> [{pos.get('strategy')}] | "
+                                f"Вход: {pos.get('entry_price', 0):.8f} | {entry_time}")
+            header_lines.append(f"  🍊 Стоп: {pos.get('stop', 0):.8f} | "
+                                f"🎯 Цель: {pos.get('target', 0):.8f}")
+        header_lines.append("━━━━━━━━━━━━━━━━━━━━━")
 
     if not open_snapshot:
-        lines.append("💤 <b>Открытых позиций нет.</b>")
-        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+        header_lines.append("💤 <b>Открытых позиций нет.</b>")
+        header_lines.append("━━━━━━━━━━━━━━━━━━━━━")
 
-    # ===== 🔵 ТОП КАНДИДАТОВ (без blockquote) =====
-    close_calls = [s for s in scan_summary if s["trend_score"] >= 2]
-    close_calls.sort(key=lambda s: s.get("macd_gap_pct", 999))
-    if close_calls:
-        lines.append("🔵🔵🔵 <b>ТОП КАНДИДАТОВ (CONFLUENCE)</b> 🔵🔵🔵")
-        lines.append("━━━━━━━━━━━━━━━━━━━━━")
-        for i, s in enumerate(close_calls[:3], 1):
-            gap = s.get("macd_gap_pct", 0)
-            if gap < 0:
-                proximity = "⏳ Близко к кроссу (ждём)"
-                highlight = gap > -0.25
-            elif gap < 0.5:
-                proximity = "🟡 Кросс недавно — окно 3 свечи активно"
-                highlight = True
-            else:
-                proximity = "⚠️ Кросс был давно"
-                highlight = False
-            extra = " · ADX↑" if s.get("adx_slope_up") else ""
-            vol = s.get("vol_ratio", 0.0)
-            vol_txt = f" · объём {vol:.1f}×" if vol >= MIN_VOL_MULT else ""
-            sym_link = tv_link(s['pair'])
-            if highlight:
-                head = f"🟢 <b>▶ {i}. {sym_link} ◀</b> 🟢"
-            else:
-                head = f"<b>   {i}. {sym_link}</b>"
-            lines.append(head)
-            lines.append(f"  Тренд: {s['trend_score']}/3 | ADX: {s['adx_1d']:.0f}{extra}"
-                         f" | RSI(4h): {s['rsi_4h']:.0f}{vol_txt}")
-            lines.append(f"  Цена: ~{s['close_price']:.8f}")
-            lines.append(f"  <i>{proximity}</i>")
-        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+    header_lines.append("👇 <i>Ниже — свёрнутые списки. Тап «Показать полностью» — раскрыть.</i>")
+    header_lines.append("👇 <i>Тап по 📈 тикеру — откроется TradingView</i>")
 
-    # ===== 🟡 МОНЕТЫ В БОКОВИКЕ (без blockquote) =====
-    if consolidation_list:
-        lines.append("🟡🟡🟡 <b>МОНЕТЫ В БОКОВИКЕ (30–60 ДНЕЙ)</b> 🟡🟡🟡")
-        lines.append("━━━━━━━━━━━━━━━━━━━━━")
-        for i, item in enumerate(consolidation_list[:MAX_STATUS_PAIRS], 1):
-            dry = " 🥀" if item.get("vol_trend", 1.0) <= 0.9 else ""
-            ready = (item.get("range_pct", 99) < 15.0 and item.get("adx", 99) < 15)
-            sym_link = tv_link(item['pair'])
-            if ready:
-                head = f"🟢 <b>▶ {i}. {sym_link} ◀</b> – {item['days']} дн.{dry} 🟢"
-            else:
-                head = f"<b>   {i}. {sym_link}</b> – {item['days']} дн.{dry}"
-            lines.append(head)
-            lines.append(f"  📏 Диапазон: {item['range_pct']:.1f}% | ADX: {item['adx']:.0f}")
-            lines.append(f"  🚀 Пробой выше: {item['upper_level']:.6f}")
-        if len(consolidation_list) > MAX_STATUS_PAIRS:
-            lines.append(f"... и ещё {len(consolidation_list) - MAX_STATUS_PAIRS} пар")
+    header_text = "\n".join(header_lines)
+
+    # === ГОТОВИМ КАНДИДАТОВ И БОКОВИКИ ===
+    cand_items = _build_cand_items(scan_summary)
+    cons_items = _build_cons_items(consolidation_list)
+
+    # Заголовки блоков (без строк со списком)
+    cand_title = "🔵🔵🔵 <b>ТОП КАНДИДАТОВ (CONFLUENCE)</b> 🔵🔵🔵\n━━━━━━━━━━━━━━━━━━━━━"
+    cons_title = "🟡🟡🟡 <b>МОНЕТЫ В БОКОВИКЕ (30–60 ДНЕЙ)</b> 🟡🟡🟡\n━━━━━━━━━━━━━━━━━━━━━"
+    bq_open, bq_close = "<blockquote expandable>", "</blockquote>"
+
+    # Ограничиваем список боковиков для отображения
+    cons_items = cons_items[:MAX_STATUS_PAIRS]
+
+    # Считаем доступное место:
+    # full = header + "\n" + bq_open + "\n" + cand_title + "\n" + [cand_items] + "\n"
+    #        + bq_close + "\n" + bq_open + "\n" + cons_title + "\n" + [cons_items]
+    #        + "\n" + bq_close + "\n" + footer
+    footer = ("━━━━━━━━━━━━━━━━━━━━━\n"
+              "🔄 Следующий статус через 2 ч. · лимиты: "
+              f"{MAX_OPEN_POSITIONS} поз. / {MAX_TRADES_PER_HOUR} сделок в час")
+
+    # Сначала оценим базовую длину без самих items
+    base_len = (len(header_text) + 1
+                + len(bq_open) + 1 + len(cand_title) + 1 + len(bq_close) + 1
+                + len(bq_open) + 1 + len(cons_title) + 1 + len(bq_close) + 1
+                + len(footer))
+
+    # Кандидаты: не обрезаем (их обычно ≤ 20), но если совсем не влезает — обрезаем
+    cand_fit, cand_used = _fit_items_into_limit(cand_items, base_len, MSG_SAFE_LIMIT)
+
+    # Боковики: обрезаем по оставшемуся месту
+    base_with_cand = base_len + cand_used
+    cons_fit, cons_used = _fit_items_into_limit(cons_items, base_with_cand, MSG_SAFE_LIMIT)
+
+    total_hidden_cons = max(0, len(consolidation_list) - len(cons_fit))
+    total_hidden_cand = max(0, len(cand_items) - len(cand_fit))
+
+    # === СОБИРАЕМ ИТОГОВОЕ СООБЩЕНИЕ ===
+    parts = [header_text]
+
+    if cand_fit:
+        cand_block = cand_title + "\n" + "\n".join(cand_fit)
+        if total_hidden_cand > 0:
+            cand_block += f"\n<i>... и ещё {total_hidden_cand} кандидатов</i>"
+        parts.append(bq_open + "\n" + cand_block + "\n" + bq_close)
     else:
-        lines.append("📦 <b>Боковиков не найдено</b>")
+        parts.append("😴 <b>Кандидатов на вход (Confluence) нет</b>")
 
-    lines.append("━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("🔄 Следующий статус через 2 ч. · лимиты: "
-                 f"{MAX_OPEN_POSITIONS} поз. / {MAX_TRADES_PER_HOUR} сделок в час")
-    lines.append("")
-    lines.append("👇 <i>Тапни синюю ссылку 📈 с тикером — откроется TradingView</i>")
-    send_telegram("\n".join(lines))
+    if cons_fit:
+        cons_block = cons_title + "\n" + "\n".join(cons_fit)
+        if total_hidden_cons > 0:
+            cons_block += f"\n<i>... и ещё {total_hidden_cons} монет в боковике</i>"
+        parts.append(bq_open + "\n" + cons_block + "\n" + bq_close)
+    else:
+        parts.append("📦 <b>Боковиков не найдено</b>")
+
+    parts.append(footer)
+
+    full_text = "\n".join(parts)
+
+    # Финальная страховка: если всё-таки не влезло — обрезаем хвост свёртки
+    if len(full_text) > MSG_SAFE_LIMIT:
+        # Оставляем шапку и урезаем списки до 5 монет
+        parts_emergency = [header_text]
+        if cand_fit:
+            parts_emergency.append(
+                bq_open + "\n" + cand_title + "\n"
+                + "\n".join(cand_fit[:3]) + "\n" + bq_close)
+        parts_emergency.append(
+            bq_open + "\n" + cons_title + "\n"
+            + "\n".join(cons_fit[:5]) + "\n" + bq_close)
+        parts_emergency.append(footer)
+        full_text = "\n".join(parts_emergency)
+
+    send_telegram(full_text)
 
 # ==================== MAIN ====================
 def handle_stop(signum, _frame):
@@ -1617,7 +1715,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v19.5 «HYBRID+ PRO» (Bybit) ...")
+    logger.info("Запуск бота v19.5a «HYBRID+ PRO» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
     state = load_state()
@@ -1681,10 +1779,10 @@ if __name__ == "__main__":
     threading.Thread(target=market_context_loop, daemon=True).start()
 
     send_telegram(
-        f"🟢 <b>СКАНЕР v19.5 «HYBRID+ PRO» ЗАПУЩЕН</b>\n"
+        f"🟢 <b>СКАНЕР v19.5a «HYBRID+ PRO» ЗАПУЩЕН</b>\n"
         f"WS: {len(PAIRS_WS)} пар + динамическая подписка\n"
         f"Тренд 3/3: {q3} · BTC-контекст: {'OK' if market_allows_longs() else 'БЛОК'}\n"
         f"Лимиты: {MAX_OPEN_POSITIONS} поз. / {MAX_TRADES_PER_HOUR} сделок в час / "
         f"порог score {MIN_SIGNAL_SCORE}/10\n"
-        f"UI: HTML-ссылки TradingView прямо в тексте")
+        f"UI: свёрнутые списки (тап — раскрыть) + HTML-ссылки TradingView")
     background_scan_loop()
