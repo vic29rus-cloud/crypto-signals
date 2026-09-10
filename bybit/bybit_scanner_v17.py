@@ -2,16 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v19.4 «HYBRID+ PRO» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
+BYBIT SCANNER v19.5 «HYBRID+ PRO» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
-НОВОЕ В v19.4 (UI):
-  • HTML-ссылки на TradingView прямо в тексте (без inline-кнопок)
-  • Каждая монета кликабельна в строке — сразу ведёт на график
-  • Сворачиваемые списки (blockquote expandable)
-  • Заголовки выделены цветными эмодзи: 🟡 боковики, 🔵 кандидаты
-  • Наиболее приближенные ко входу монеты подсвечиваются 🟢
+ИСПРАВЛЕНО В v19.5:
+  • send_telegram теперь ПРОВЕРЯЕТ ответ Telegram и ЛОГИРУЕТ отказ
+  • Безопасная нарезка на чанки по границам строк (не рвёт HTML-теги)
+  • При ошибке парсинга HTML — повтор без разметки (текст всё равно дойдёт)
+  • Убран <blockquote expandable> (ломался при длинных списках)
+  • HTML-ссылки TradingView остались (они в пределах одной строки)
 ==============================================================================
 """
 import json
@@ -127,7 +127,7 @@ WORK_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(WORK_DIR, "bybit_state.json")
 TRADES_LOG_FILE = os.path.join(WORK_DIR, "bybit_trades.json")
 LOG_FILE = os.path.join(WORK_DIR, "bybit_scanner.log")
-MAX_STATUS_PAIRS = 20
+MAX_STATUS_PAIRS = 15   # было 20 — уменьшено чтобы не упираться в лимит Telegram
 
 # ==================== ЛОГИРОВАНИЕ ====================
 os.makedirs(WORK_DIR, exist_ok=True)
@@ -289,27 +289,50 @@ def portfolio_risk_used():
             total += dist * v.get("size_fraction", 1.0)
     return total
 
-# ==================== TELEGRAM ====================
+# ==================== TELEGRAM (ИСПРАВЛЕНО) ====================
+def _split_html_safe(text, limit=3900):
+    """Режем по границам строк, чтобы не порвать HTML-теги."""
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        if cur and len(cur) + len(line) + 1 > limit:
+            chunks.append(cur)
+            cur = ""
+        cur = (cur + "\n" + line) if cur else line
+    if cur:
+        chunks.append(cur)
+    return chunks or [""]
+
+
 def send_telegram(text):
-    """Отправка сообщения в Telegram (HTML parse mode)."""
+    """Отправка с проверкой ответа и fallback без разметки."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram НЕ настроен: пустой токен или chat_id")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    for i in range(0, len(text), 4000):
-        chunk = text[i:i + 4000]
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": chunk,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        try:
-            requests.post(url, data=payload, timeout=10)
-        except Exception as e:
-            logger.error("Ошибка отправки Telegram: %s", e)
+    for chunk in _split_html_safe(text):
+        sent = False
+        for parse_mode in ("HTML", None):
+            payload = {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": chunk,
+                "disable_web_page_preview": True,
+            }
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
+            try:
+                r = requests.post(url, data=payload, timeout=10)
+                resp = r.json()
+                if resp.get("ok"):
+                    sent = True
+                    break
+                logger.error("Telegram отклонил (parse=%s): %s",
+                             parse_mode, resp.get("description"))
+            except Exception as e:
+                logger.error("Ошибка отправки Telegram: %s", e)
+        if not sent:
+            logger.error("Сообщение НЕ доставлено даже без разметки")
 
 def tv_link(symbol: str) -> str:
-    """HTML-ссылка на TradingView для вставки в текст."""
     url = f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol}"
     return f'<a href="{url}">📈 {symbol}</a>'
 
@@ -1470,7 +1493,7 @@ def background_scan_loop():
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
 
-# ==================== ОТПРАВКА СТАТУСА (HTML-ссылки в тексте) ====================
+# ==================== ОТПРАВКА СТАТУСА (без blockquote) ====================
 def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     with state_lock:
         open_snapshot = [(pair, dict(pos)) for pair, pos in state.items()
@@ -1487,7 +1510,7 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
                           if v.get("strategy") in breakout_strategies]
 
     lines = [
-        f"📡 <b>СТАТУС СКАНЕРА v19.4 (Bybit)</b> | "
+        f"📡 <b>СТАТУС СКАНЕРА v19.5 (Bybit)</b> | "
         f"<i>{datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         "🔹 <b>📊 ОБЩАЯ СТАТИСТИКА</b>",
@@ -1527,11 +1550,12 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         lines.append("💤 <b>Открытых позиций нет.</b>")
         lines.append("━━━━━━━━━━━━━━━━━━━━━")
 
-    # ===== 🔵 ТОП КАНДИДАТОВ =====
+    # ===== 🔵 ТОП КАНДИДАТОВ (без blockquote) =====
     close_calls = [s for s in scan_summary if s["trend_score"] >= 2]
     close_calls.sort(key=lambda s: s.get("macd_gap_pct", 999))
     if close_calls:
-        cand = []
+        lines.append("🔵🔵🔵 <b>ТОП КАНДИДАТОВ (CONFLUENCE)</b> 🔵🔵🔵")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
         for i, s in enumerate(close_calls[:3], 1):
             gap = s.get("macd_gap_pct", 0)
             if gap < 0:
@@ -1546,46 +1570,35 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
             extra = " · ADX↑" if s.get("adx_slope_up") else ""
             vol = s.get("vol_ratio", 0.0)
             vol_txt = f" · объём {vol:.1f}×" if vol >= MIN_VOL_MULT else ""
-            # Монета — кликабельная HTML-ссылка
             sym_link = tv_link(s['pair'])
             if highlight:
                 head = f"🟢 <b>▶ {i}. {sym_link} ◀</b> 🟢"
             else:
                 head = f"<b>   {i}. {sym_link}</b>"
-            cand.append(head)
-            cand.append(f"  Тренд: {s['trend_score']}/3 | ADX: {s['adx_1d']:.0f}{extra}"
-                        f" | RSI(4h): {s['rsi_4h']:.0f}{vol_txt}")
-            cand.append(f"  Цена: ~{s['close_price']:.8f}")
-            cand.append(f"  <i>{proximity}</i>")
-        lines.append("<blockquote expandable>")
-        lines.append("🔵🔵🔵 <b>ТОП КАНДИДАТОВ (CONFLUENCE)</b> 🔵🔵🔵")
-        lines.append("━━━━━━━━━━━━━━━━━━━━━")
-        lines.extend(cand)
-        lines.append("</blockquote>")
+            lines.append(head)
+            lines.append(f"  Тренд: {s['trend_score']}/3 | ADX: {s['adx_1d']:.0f}{extra}"
+                         f" | RSI(4h): {s['rsi_4h']:.0f}{vol_txt}")
+            lines.append(f"  Цена: ~{s['close_price']:.8f}")
+            lines.append(f"  <i>{proximity}</i>")
         lines.append("━━━━━━━━━━━━━━━━━━━━━")
 
-    # ===== 🟡 МОНЕТЫ В БОКОВИКЕ =====
+    # ===== 🟡 МОНЕТЫ В БОКОВИКЕ (без blockquote) =====
     if consolidation_list:
-        cons = []
+        lines.append("🟡🟡🟡 <b>МОНЕТЫ В БОКОВИКЕ (30–60 ДНЕЙ)</b> 🟡🟡🟡")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
         for i, item in enumerate(consolidation_list[:MAX_STATUS_PAIRS], 1):
             dry = " 🥀" if item.get("vol_trend", 1.0) <= 0.9 else ""
             ready = (item.get("range_pct", 99) < 15.0 and item.get("adx", 99) < 15)
-            # Монета — кликабельная HTML-ссылка
             sym_link = tv_link(item['pair'])
             if ready:
                 head = f"🟢 <b>▶ {i}. {sym_link} ◀</b> – {item['days']} дн.{dry} 🟢"
             else:
                 head = f"<b>   {i}. {sym_link}</b> – {item['days']} дн.{dry}"
-            cons.append(head)
-            cons.append(f"  📏 Диапазон: {item['range_pct']:.1f}% | ADX: {item['adx']:.0f}")
-            cons.append(f"  🚀 Пробой выше: {item['upper_level']:.6f}")
+            lines.append(head)
+            lines.append(f"  📏 Диапазон: {item['range_pct']:.1f}% | ADX: {item['adx']:.0f}")
+            lines.append(f"  🚀 Пробой выше: {item['upper_level']:.6f}")
         if len(consolidation_list) > MAX_STATUS_PAIRS:
-            cons.append(f"... и ещё {len(consolidation_list) - MAX_STATUS_PAIRS} пар")
-        lines.append("<blockquote expandable>")
-        lines.append("🟡🟡🟡 <b>МОНЕТЫ В БОКОВИКЕ (30–60 ДНЕЙ)</b> 🟡🟡🟡")
-        lines.append("━━━━━━━━━━━━━━━━━━━━━")
-        lines.extend(cons)
-        lines.append("</blockquote>")
+            lines.append(f"... и ещё {len(consolidation_list) - MAX_STATUS_PAIRS} пар")
     else:
         lines.append("📦 <b>Боковиков не найдено</b>")
 
@@ -1604,7 +1617,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v19.4 «HYBRID+ PRO» (Bybit) ...")
+    logger.info("Запуск бота v19.5 «HYBRID+ PRO» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
     state = load_state()
@@ -1668,10 +1681,10 @@ if __name__ == "__main__":
     threading.Thread(target=market_context_loop, daemon=True).start()
 
     send_telegram(
-        f"🟢 <b>СКАНЕР v19.4 «HYBRID+ PRO» ЗАПУЩЕН</b>\n"
+        f"🟢 <b>СКАНЕР v19.5 «HYBRID+ PRO» ЗАПУЩЕН</b>\n"
         f"WS: {len(PAIRS_WS)} пар + динамическая подписка\n"
         f"Тренд 3/3: {q3} · BTC-контекст: {'OK' if market_allows_longs() else 'БЛОК'}\n"
         f"Лимиты: {MAX_OPEN_POSITIONS} поз. / {MAX_TRADES_PER_HOUR} сделок в час / "
         f"порог score {MIN_SIGNAL_SCORE}/10\n"
-        f"UI: HTML-ссылки TradingView прямо в тексте (без кнопок)")
+        f"UI: HTML-ссылки TradingView прямо в тексте")
     background_scan_loop()
