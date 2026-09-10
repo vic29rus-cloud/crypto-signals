@@ -2,17 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v19.7.1 «ONE-MSG» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
+BYBIT SCANNER v19.7.2 «ONE-MSG» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
-ГЛАВНОЕ В v19.7.1:
-• СТАТУС = ОДНО сообщение Telegram (не режется на части)
-• Внутри две сворачиваемые менюшки <blockquote expandable>:
-  🔵 КАНДИДАТЫ и 🟡 БОКОВИКИ — открываются стрелкой
-• Списки компактные + авто-бюджет: если не влезает в 4000 символов —
-  сначала убираются ссылки, затем хвосты списков с пометкой «… и ещё N»
-• Подписка людей: /start, /stop, /help (polling, subscribers.json)
+ГЛАВНОЕ В v19.7.2:
+• СТАТУС = ОДНО сообщение Telegram, две сворачиваемые менюшки:
+  🔵 ТОП КАНДИДАТОВ и 🟡 МОНЕТЫ В БОКОВИКЕ (тап → раскрыть)
+• Cosmetic-фильтр статуса: из списка кандидатов убираются «мёртвые»
+  (RSI/ADX вне зоны входа, микро-капы), T3/3 + кросс поднимаются наверх
+  с пометкой ✨ (НЕ влияет на реальные входы)
+• Подписка: /start, /stop, /help (polling, subscribers.json)
 ==============================================================================
 """
 import json
@@ -117,6 +117,12 @@ PULLBACK_SL_ATR = 2.5
 PULLBACK_TP_ATR = 5.0
 PULLBACK_MAX_DEPTH_PCT = 0.05
 PULLBACK_MIN_PRIOR_MOVE_PCT = 0.03
+
+# --- Cosmetic-фильтры ТОЛЬКО для статуса (не влияют на реальные входы) ---
+STATUS_RSI_MIN, STATUS_RSI_MAX = 35, 75
+STATUS_ADX_MIN, STATUS_ADX_MAX = 18, 55
+STATUS_MIN_PRICE = 0.0001
+STATUS_READY_SCORE = 3
 
 TREND_CACHE_REFRESH_SECONDS = 1800
 TREND_CACHE_INITIAL_LIMIT = 60
@@ -386,15 +392,10 @@ def _split_html_safe(text, limit=TG_SAFE_LIMIT):
 
 def _send_to_all_one(text):
     """Отправляет ОДНО сообщение всем подписчикам (без нарезки).
-    Если текст превышает лимит Telegram — усекает с ellipsis,
-    сохраняя закрытие открытых HTML-тегов по возможности."""
+    Если текст превышает лимит Telegram — усекает безопасно."""
     if len(text) > TG_MSG_LIMIT:
-        # Безопасная усечка: не рвём теги по возможности.
-        # Отрезаем, убираем последний незакрытый тег-контекст грубо,
-        # затем добавляем многоточие.
         cut = TG_MSG_LIMIT - 10
         text = text[:cut].rstrip()
-        # Закрываем возможные незакрытые blockquote
         if "<blockquote" in text and "</blockquote>" not in text.rsplit("<blockquote", 1)[1]:
             text += "\n</blockquote>"
         text += " …"
@@ -418,11 +419,12 @@ def tv_link(symbol: str) -> str:
     return f'<a href="{url}">📈 {symbol}</a>'
 
 HELP_TEXT = (
-    "📡 <b>Bybit Scanner v19.7.1 — справка</b>\n"
+    "📡 <b>Bybit Scanner v19.7.2 — справка</b>\n"
     "Бот шлёт: входы/выходы, частичные TP и ОДИН статус каждые 2 часа.\n"
     "В статусе две сворачиваемые менюшки: 🔵 кандидаты и 🟡 боковики — "
     "нажми стрелку у цитаты, чтобы развернуть.\n"
     "📈 Синяя ссылка-тикер открывает график TradingView.\n"
+    "✨ = T3/3 + свежий кросс (полная готовность).\n"
     "Команды: /stop — отписаться, /help — справка."
 )
 
@@ -1626,7 +1628,7 @@ def background_scan_loop():
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
 
-# ==================== СТАТУС: ОДНО СООБЩЕНИЕ ====================
+# ==================== СТАТУС: ОДНО СООБЩЕНИЕ (v19.7.2) ====================
 def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     with state_lock:
         open_snapshot = [(pair, dict(pos)) for pair, pos in state.items()
@@ -1641,8 +1643,9 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     breakout_strategies = ("breakout", "breakout_ws", "breakout_retest")
     now_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M")
 
+    # === ШАПКА ===
     header = [
-        f"📡 <b>СТАТУС v19.7.1 (Bybit)</b> | <i>{now_str} UTC</i>",
+        f"📡 <b>СТАТУС v19.7.2 (Bybit)</b> | <i>{now_str} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔹 Пар WS: <b>{len(PAIRS_WS)}</b> · Тренд 3/3: <b>{q3}</b>",
         f"🔹 BTC: <b>{'OK' if mok else 'БЛОК: ' + mreason}</b>",
@@ -1667,8 +1670,18 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     else:
         pos_lines.append("💰 Позиций нет")
 
-    close_calls = sorted([s for s in scan_summary if s["trend_score"] >= 2],
-                         key=lambda s: s.get("macd_gap_pct", 999))
+    # === КАНДИДАТЫ: cosmetic-фильтр + умная сортировка ===
+    valid_calls = [
+        s for s in scan_summary
+        if s["trend_score"] >= 2
+        and STATUS_RSI_MIN <= s.get("rsi_4h", 0) <= STATUS_RSI_MAX
+        and STATUS_ADX_MIN <= s.get("adx_1d", 0) <= STATUS_ADX_MAX
+        and s.get("close_price", 0) >= STATUS_MIN_PRICE
+    ]
+    valid_calls.sort(key=lambda s: (-s["trend_score"],
+                                     s.get("macd_gap_pct", 999)))
+
+    # === БОКОВИКИ ===
     consolidation_list = sorted(consolidation_list,
                                 key=lambda x: (-x["days"], x.get("vol_trend", 1.0)))
 
@@ -1681,11 +1694,13 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         else:
             prox, hl = "⚠️", False
         name = tv_link(s["pair"]) if with_link else s["pair"]
-        mark = "🟢" if hl else ""
+        is_ready = s["trend_score"] == 3 and gap < 0.5
+        mark = "🟢" if is_ready else ("🟡" if hl else "")
         vol = s.get("vol_ratio", 0.0)
         vol_txt = f" · V{vol:.1f}x" if vol >= MIN_VOL_MULT else ""
         up = "↑" if s.get("adx_slope_up") else ""
-        return (f"{mark}{i}. {name} · T{s['trend_score']}/3 · "
+        ready_tag = " ✨" if is_ready else ""
+        return (f"{mark}{i}. {name}{ready_tag} · T{s['trend_score']}/3 · "
                 f"ADX{s['adx_1d']:.0f}{up} · RSI{s['rsi_4h']:.0f}{vol_txt} · "
                 f"~{s['close_price']:.6g} · {prox}")
 
@@ -1708,17 +1723,17 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         lines = list(header)
         lines += pos_lines
         lines.append("")
-        lines.append("🔵🔵 <b>КАНДИДАТЫ (CONFLUENCE)</b> — разверни ⤵")
+        lines.append("🔵🔵🔵 <b>ТОП КАНДИДАТОВ (CONFLUENCE)</b> 🔵🔵🔵")
         lines.append("<blockquote expandable>")
-        if close_calls:
-            for i, s in enumerate(close_calls[:max_cand], 1):
+        if valid_calls:
+            for i, s in enumerate(valid_calls[:max_cand], 1):
                 lines.append(cand_line(i, s, with_links))
-            if len(close_calls) > max_cand:
-                lines.append(f"… и ещё {len(close_calls) - max_cand}")
+            if len(valid_calls) > max_cand:
+                lines.append(f"… и ещё {len(valid_calls) - max_cand}")
         else:
-            lines.append("😴 кандидатов нет")
+            lines.append("😴 готовых кандидатов нет")
         lines.append("</blockquote>")
-        lines.append("🟡🟡 <b>БОКОВИКИ (30–60 дн)</b> — разверни ⤵")
+        lines.append("🟡🟡🟡 <b>МОНЕТЫ В БОКОВИКЕ (30–60 ДНЕЙ)</b> 🟡🟡🟡")
         lines.append("<blockquote expandable>")
         if consolidation_list:
             for i, item in enumerate(consolidation_list[:max_cons], 1):
@@ -1733,7 +1748,7 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
 
     text = None
     for with_links in (True, False):
-        max_cand, max_cons = len(close_calls), len(consolidation_list)
+        max_cand, max_cons = len(valid_calls), len(consolidation_list)
         while True:
             text = build(with_links, max_cand, max_cons)
             if len(text) <= TG_SAFE_LIMIT:
@@ -1744,16 +1759,15 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
                 max_cand = max(3, max_cand - 3)
             else:
                 break
-        if len(text) <= TG_SAFE_LIMIT:
+        if text and len(text) <= TG_SAFE_LIMIT:
             break
 
-    # Финальная страховка: если всё ещё больше лимита, шлём супер-компактный вариант
     if text is None or len(text) > TG_SAFE_LIMIT:
         text = build(False, 3, 5)
 
     _send_to_all_one(text)
     logger.info("Статус отправлен: %d символов, кандидатов %d, боковиков %d",
-                len(text), len(close_calls), len(consolidation_list))
+                len(text), len(valid_calls), len(consolidation_list))
 
 # ==================== MAIN ====================
 def handle_stop(signum, _frame):
@@ -1763,7 +1777,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v19.7.1 «ONE-MSG» (Bybit) ...")
+    logger.info("Запуск бота v19.7.2 «ONE-MSG» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
@@ -1831,11 +1845,12 @@ if __name__ == "__main__":
     threading.Thread(target=polling_loop, daemon=True).start()
 
     _send_to_all_one(
-        f"🟢 <b>СКАНЕР v19.7.1 «ONE-MSG» ЗАПУЩЕН</b>\n"
+        f"🟢 <b>СКАНЕР v19.7.2 «ONE-MSG» ЗАПУЩЕН</b>\n"
         f"WS: {len(PAIRS_WS)} пар + динам. подписка\n"
         f"Тренд 3/3: {q3} · BTC: {'OK' if market_allows_longs() else 'БЛОК'}\n"
         f"Лимиты: {MAX_OPEN_POSITIONS} поз / {MAX_TRADES_PER_HOUR} в час · "
         f"порог score {MIN_SIGNAL_SCORE}/10\n"
         f"📋 Статус = ОДНО сообщение: менюшки 🔵 и 🟡 открываются стрелкой\n"
-        f"👥 Подписчиков: {len(SUBSCRIBERS)} · /start · /stop · /help")
+        f"✨ = T3/3 + свежий кросс · 👥 {len(SUBSCRIBERS)} подписчиков\n"
+        f"/start · /stop · /help")
     background_scan_loop()
