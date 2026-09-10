@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v19.3 «HYBRID+ PRO» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
+BYBIT SCANNER v19.4 «HYBRID+ PRO» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
-НОВОЕ В v19.3 (UI):
-  • Inline-кнопка TradingView для КАЖДОЙ монеты из списков
+НОВОЕ В v19.4 (UI):
+  • HTML-ссылки на TradingView прямо в тексте (без inline-кнопок)
+  • Каждая монета кликабельна в строке — сразу ведёт на график
   • Сворачиваемые списки (blockquote expandable)
   • Заголовки выделены цветными эмодзи: 🟡 боковики, 🔵 кандидаты
   • Наиболее приближенные ко входу монеты подсвечиваются 🟢
@@ -127,10 +128,6 @@ STATE_FILE = os.path.join(WORK_DIR, "bybit_state.json")
 TRADES_LOG_FILE = os.path.join(WORK_DIR, "bybit_trades.json")
 LOG_FILE = os.path.join(WORK_DIR, "bybit_scanner.log")
 MAX_STATUS_PAIRS = 20
-
-# UI: сколько кнопок TradingView показывать
-TV_BUTTONS_CONSOLIDATION = 20   # = MAX_STATUS_PAIRS (все боковики из текста)
-TV_BUTTONS_CANDIDATES = 3       # все кандидаты из текста
 
 # ==================== ЛОГИРОВАНИЕ ====================
 os.makedirs(WORK_DIR, exist_ok=True)
@@ -292,12 +289,9 @@ def portfolio_risk_used():
             total += dist * v.get("size_fraction", 1.0)
     return total
 
-# ==================== TELEGRAM (с кнопками) ====================
-def send_telegram(text, buttons=None):
-    """Отправка сообщения в Telegram.
-    
-    buttons: список списков словарей {"text": "...", "url": "..."}
-    """
+# ==================== TELEGRAM ====================
+def send_telegram(text):
+    """Отправка сообщения в Telegram (HTML parse mode)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -309,35 +303,15 @@ def send_telegram(text, buttons=None):
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
-        if buttons:
-            payload["reply_markup"] = json.dumps({"inline_keyboard": buttons})
         try:
             requests.post(url, data=payload, timeout=10)
         except Exception as e:
             logger.error("Ошибка отправки Telegram: %s", e)
 
-def tradingview_url(symbol: str) -> str:
-    """Прямая ссылка на график TradingView (Bybit spot)."""
-    return f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol}"
-
-def build_tv_buttons(consolidation_list, close_calls):
-    """Кнопка TradingView для КАЖДОЙ монеты из списков."""
-    buttons = []
-    # Секция 1: кандидаты (первыми — они ближе всего к входу)
-    for i, s in enumerate(close_calls[:TV_BUTTONS_CANDIDATES], 1):
-        sym = s["pair"]
-        buttons.append([{
-            "text": f"🎯 {i}. {sym} · ADX {s['adx_1d']:.0f}",
-            "url": tradingview_url(sym),
-        }])
-    # Секция 2: боковики (все из текста)
-    for i, item in enumerate(consolidation_list[:TV_BUTTONS_CONSOLIDATION], 1):
-        sym = item["pair"]
-        buttons.append([{
-            "text": f"📦 {i}. {sym} · {item['upper_level']:.6f}",
-            "url": tradingview_url(sym),
-        }])
-    return buttons
+def tv_link(symbol: str) -> str:
+    """HTML-ссылка на TradingView для вставки в текст."""
+    url = f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol}"
+    return f'<a href="{url}">📈 {symbol}</a>'
 
 def save_state(state_data):
     with state_lock:
@@ -1123,7 +1097,7 @@ def on_message(ws, message):
                                         "Stop-Loss", pos.get("strategy", "?"),
                                         pos.get("entry_time"), size, frac)
                         exit_messages.append(
-                            f"🔴 <b>СТОП-ЛОСС (WS)</b>\nПара: {symbol}\n"
+                            f"🔴 <b>СТОП-ЛОСС (WS)</b>\nПара: {tv_link(symbol)}\n"
                             f"Цена: {exit_price:.8f}\n"
                             f"Результат: <b>{pnl:+.2f}%</b>"
                             + ("" if frac == 1.0 else " (оставшиеся 50%)"))
@@ -1137,7 +1111,7 @@ def on_message(ws, message):
                                         "Take-Profit", pos.get("strategy", "?"),
                                         pos.get("entry_time"), size, frac)
                         exit_messages.append(
-                            f"🟢 <b>ТЕЙК-ПРОФИТ (WS)</b>\nПара: {symbol}\n"
+                            f"🟢 <b>ТЕЙК-ПРОФИТ (WS)</b>\nПара: {tv_link(symbol)}\n"
                             f"Цена: {pos['target']:.8f}\n"
                             f"Результат: <b>{pnl:+.2f}%</b>"
                             + ("" if frac == 1.0 else " (оставшиеся 50%)"))
@@ -1158,7 +1132,7 @@ def on_message(ws, message):
                         state[symbol] = pos
                         save_state(state)
                         exit_messages.append(
-                            f"💰 <b>ЧАСТИЧНЫЙ TP (50%)</b>\nПара: {symbol}\n"
+                            f"💰 <b>ЧАСТИЧНЫЙ TP (50%)</b>\nПара: {tv_link(symbol)}\n"
                             f"Зафиксировано: <b>{pnl:+.2f}%</b> на половину позиции\n"
                             f"Стоп переведён в безубыток")
             for msg in exit_messages:
@@ -1188,12 +1162,11 @@ def on_message(ws, message):
             breakout_sig = try_ws_breakout(symbol, new_candle, df)
             if breakout_sig:
                 send_telegram(
-                    f"📦 <b>ПРОБОЙ БОКОВИКА (WS)</b>\nПара: {symbol}\n"
+                    f"📦 <b>ПРОБОЙ БОКОВИКА (WS)</b>\n"
+                    f"Пара: {tv_link(symbol)}\n"
                     f"Цена: {breakout_sig['entry']:.8f}\n"
                     f"SL: {breakout_sig['stop']:.8f} · TP: {breakout_sig['target']:.8f}\n"
-                    f"Объём: {breakout_sig['vol_ratio']:.1f}×",
-                    buttons=[[{"text": f"📈 Открыть {symbol}",
-                               "url": tradingview_url(symbol)}]])
+                    f"Объём: {breakout_sig['vol_ratio']:.1f}×")
                 continue
 
             with breakout_cache_lock:
@@ -1214,12 +1187,10 @@ def on_message(ws, message):
                          else f" · {sig['score']}")
             send_telegram(
                 f"🟢 <b>ВХОД (WS{score_txt})</b>\n"
-                f"Пара: {symbol} · {sig['strategy']}\n"
+                f"Пара: {tv_link(symbol)} · {sig['strategy']}\n"
                 f"Цена: {sig['entry']:.8f}\n"
                 f"SL: {sig['stop']:.8f} · TP: {sig['target']:.8f}\n"
-                f"<i>{' · '.join(sig['parts'])}</i>",
-                buttons=[[{"text": f"📈 Открыть {symbol}",
-                           "url": tradingview_url(symbol)}]])
+                f"<i>{' · '.join(sig['parts'])}</i>")
     except Exception as e:
         logger.error("Ошибка WebSocket: %s", e)
 
@@ -1359,13 +1330,12 @@ def background_scan_loop():
                     if breakout:
                         found_buy += 1
                         send_telegram(
-                            f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>\nПара: {pair}\n"
+                            f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>\n"
+                            f"Пара: {tv_link(pair)}\n"
                             f"Цена: {current_price:.8f}\n"
                             f"SL: {breakout['stop']:.8f} · TP: {breakout['target']:.8f}\n"
                             f"Дней в боковике: {breakout['days']} · "
-                            f"объём ×1.8 · ADX {breakout['adx']:.0f}",
-                            buttons=[[{"text": f"📈 Открыть {pair}",
-                                       "url": tradingview_url(pair)}]])
+                            f"объём ×1.8 · ADX {breakout['adx']:.0f}")
                     messages = []
                     time_stopped = False
                     with state_lock:
@@ -1387,7 +1357,8 @@ def background_scan_loop():
                                                 "Time Stop", pos.get("strategy", "?"),
                                                 pos.get("entry_time"), size, frac)
                                 messages.append(
-                                    f"⏰ <b>ВЫХОД ПО ВРЕМЕНИ</b>\nПара: {pair}\n"
+                                    f"⏰ <b>ВЫХОД ПО ВРЕМЕНИ</b>\n"
+                                    f"Пара: {tv_link(pair)}\n"
                                     f"Цена: {r4h['close']:.8f}\n"
                                     f"Результат: <b>{pnl:+.2f}%</b>")
                                 pos.update({"position": "closed",
@@ -1408,7 +1379,8 @@ def background_scan_loop():
                                                     size * PARTIAL_TP_FRACTION,
                                                     PARTIAL_TP_FRACTION)
                                     messages.append(
-                                        f"💰 <b>ЧАСТИЧНЫЙ TP (50%)</b>\nПара: {pair}\n"
+                                        f"💰 <b>ЧАСТИЧНЫЙ TP (50%)</b>\n"
+                                        f"Пара: {tv_link(pair)}\n"
                                         f"Зафиксировано: <b>{pnl:+.2f}%</b>\n"
                                         f"Стоп в безубытке, цель прежняя")
                                 if exit_now:
@@ -1419,7 +1391,8 @@ def background_scan_loop():
                                     icon = "🟢" if pnl > 0 else "🔴"
                                     suffix = (" (оставшиеся 50%)" if frac != 1.0 else "")
                                     messages.append(
-                                        f"{icon} <b>{reason.upper()}</b>\nПара: {pair}\n"
+                                        f"{icon} <b>{reason.upper()}</b>\n"
+                                        f"Пара: {tv_link(pair)}\n"
                                         f"Цена: {exit_price:.8f}\n"
                                         f"Результат: <b>{pnl:+.2f}%</b>{suffix}")
                                     pos.update({"position": "closed",
@@ -1457,12 +1430,11 @@ def background_scan_loop():
                     if breakout:
                         found_buy += 1
                         send_telegram(
-                            f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>\nПара: {pair}\n"
+                            f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>\n"
+                            f"Пара: {tv_link(pair)}\n"
                             f"Цена: {current_price:.8f}\n"
                             f"SL: {breakout['stop']:.8f} · TP: {breakout['target']:.8f}\n"
-                            f"Дней в боковике: {breakout['days']}",
-                            buttons=[[{"text": f"📈 Открыть {pair}",
-                                       "url": tradingview_url(pair)}]])
+                            f"Дней в боковике: {breakout['days']}")
                 except Exception as e:
                     logger.error("Ошибка во втором проходе %s: %s", pair, e)
                     continue
@@ -1498,7 +1470,7 @@ def background_scan_loop():
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
 
-# ==================== ОТПРАВКА СТАТУСА ====================
+# ==================== ОТПРАВКА СТАТУСА (HTML-ссылки в тексте) ====================
 def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     with state_lock:
         open_snapshot = [(pair, dict(pos)) for pair, pos in state.items()
@@ -1515,7 +1487,7 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
                           if v.get("strategy") in breakout_strategies]
 
     lines = [
-        f"📡 <b>СТАТУС СКАНЕРА v19.3 (Bybit)</b> | "
+        f"📡 <b>СТАТУС СКАНЕРА v19.4 (Bybit)</b> | "
         f"<i>{datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         "🔹 <b>📊 ОБЩАЯ СТАТИСТИКА</b>",
@@ -1574,10 +1546,12 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
             extra = " · ADX↑" if s.get("adx_slope_up") else ""
             vol = s.get("vol_ratio", 0.0)
             vol_txt = f" · объём {vol:.1f}×" if vol >= MIN_VOL_MULT else ""
+            # Монета — кликабельная HTML-ссылка
+            sym_link = tv_link(s['pair'])
             if highlight:
-                head = f"🟢 <b>▶ {i}. {s['pair']} ◀</b> 🟢"
+                head = f"🟢 <b>▶ {i}. {sym_link} ◀</b> 🟢"
             else:
-                head = f"<b>   {i}. {s['pair']}</b>"
+                head = f"<b>   {i}. {sym_link}</b>"
             cand.append(head)
             cand.append(f"  Тренд: {s['trend_score']}/3 | ADX: {s['adx_1d']:.0f}{extra}"
                         f" | RSI(4h): {s['rsi_4h']:.0f}{vol_txt}")
@@ -1596,10 +1570,12 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         for i, item in enumerate(consolidation_list[:MAX_STATUS_PAIRS], 1):
             dry = " 🥀" if item.get("vol_trend", 1.0) <= 0.9 else ""
             ready = (item.get("range_pct", 99) < 15.0 and item.get("adx", 99) < 15)
+            # Монета — кликабельная HTML-ссылка
+            sym_link = tv_link(item['pair'])
             if ready:
-                head = f"🟢 <b>▶ {i}. {item['pair']} ◀</b> – {item['days']} дн.{dry} 🟢"
+                head = f"🟢 <b>▶ {i}. {sym_link} ◀</b> – {item['days']} дн.{dry} 🟢"
             else:
-                head = f"<b>   {i}. {item['pair']}</b> – {item['days']} дн.{dry}"
+                head = f"<b>   {i}. {sym_link}</b> – {item['days']} дн.{dry}"
             cons.append(head)
             cons.append(f"  📏 Диапазон: {item['range_pct']:.1f}% | ADX: {item['adx']:.0f}")
             cons.append(f"  🚀 Пробой выше: {item['upper_level']:.6f}")
@@ -1617,12 +1593,8 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     lines.append("🔄 Следующий статус через 2 ч. · лимиты: "
                  f"{MAX_OPEN_POSITIONS} поз. / {MAX_TRADES_PER_HOUR} сделок в час")
     lines.append("")
-    lines.append("👇 <b>Кнопки TradingView для каждой монеты:</b>")
-    lines.append("🎯 <i>кандидаты</i> · 📦 <i>боковики</i>")
-
-    # Кнопки TradingView — для каждой монеты из списков
-    buttons = build_tv_buttons(consolidation_list, close_calls)
-    send_telegram("\n".join(lines), buttons=buttons)
+    lines.append("👇 <i>Тапни синюю ссылку 📈 с тикером — откроется TradingView</i>")
+    send_telegram("\n".join(lines))
 
 # ==================== MAIN ====================
 def handle_stop(signum, _frame):
@@ -1632,7 +1604,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v19.3 «HYBRID+ PRO» (Bybit) ...")
+    logger.info("Запуск бота v19.4 «HYBRID+ PRO» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
     state = load_state()
@@ -1696,10 +1668,10 @@ if __name__ == "__main__":
     threading.Thread(target=market_context_loop, daemon=True).start()
 
     send_telegram(
-        f"🟢 <b>СКАНЕР v19.3 «HYBRID+ PRO» ЗАПУЩЕН</b>\n"
+        f"🟢 <b>СКАНЕР v19.4 «HYBRID+ PRO» ЗАПУЩЕН</b>\n"
         f"WS: {len(PAIRS_WS)} пар + динамическая подписка\n"
         f"Тренд 3/3: {q3} · BTC-контекст: {'OK' if market_allows_longs() else 'БЛОК'}\n"
         f"Лимиты: {MAX_OPEN_POSITIONS} поз. / {MAX_TRADES_PER_HOUR} сделок в час / "
         f"порог score {MIN_SIGNAL_SCORE}/10\n"
-        f"UI: кнопка TradingView для каждой монеты")
+        f"UI: HTML-ссылки TradingView прямо в тексте (без кнопок)")
     background_scan_loop()
