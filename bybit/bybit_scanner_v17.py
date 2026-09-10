@@ -2,21 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v19.0 «HYBRID+ PRO» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
+BYBIT SCANNER v19.3 «HYBRID+ PRO» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
-ВЗЯТО ИЗ v18 (лучшее):
-  • BTC-контекст: не лонгуем альты при падающем BTC
-  • Circuit Breaker: пауза после 4 убытков подряд / дневного лимита убытка
-  • Секторный лимит: не более 2 позиций в секторе
-  • Pullback v18: наклон EMA21, глубина отката, сила импульса, бычья свеча
-  • Breakout: объёмное накопление (accumulation)
-  • HTTP circuit breaker + rate limiting
-  • Dynamic position sizing (score / волатильность / R:R / риск портфеля)
-
-ОБНОВЛЕНО В v19.1 (UI):
-  • Сворачиваемые списки (blockquote expandable) для боковиков и кандидатов
+НОВОЕ В v19.3 (UI):
+  • Inline-кнопка TradingView для КАЖДОЙ монеты из списков
+  • Сворачиваемые списки (blockquote expandable)
   • Заголовки выделены цветными эмодзи: 🟡 боковики, 🔵 кандидаты
   • Наиболее приближенные ко входу монеты подсвечиваются 🟢
 ==============================================================================
@@ -35,7 +27,7 @@ import websocket
 from collections import deque
 from datetime import datetime, timezone
 
-# ==================== КОНФИГУРАЦИЯ (BYBIT) ====================
+# ==================== КОНФИГУРАЦИЯ ====================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 BASE_URL = "https://api.bybit.com/v5/market"
@@ -135,6 +127,10 @@ STATE_FILE = os.path.join(WORK_DIR, "bybit_state.json")
 TRADES_LOG_FILE = os.path.join(WORK_DIR, "bybit_trades.json")
 LOG_FILE = os.path.join(WORK_DIR, "bybit_scanner.log")
 MAX_STATUS_PAIRS = 20
+
+# UI: сколько кнопок TradingView показывать
+TV_BUTTONS_CONSOLIDATION = 20   # = MAX_STATUS_PAIRS (все боковики из текста)
+TV_BUTTONS_CANDIDATES = 3       # все кандидаты из текста
 
 # ==================== ЛОГИРОВАНИЕ ====================
 os.makedirs(WORK_DIR, exist_ok=True)
@@ -296,19 +292,52 @@ def portfolio_risk_used():
             total += dist * v.get("size_fraction", 1.0)
     return total
 
-# ==================== СЛУЖЕБНЫЕ ====================
-def send_telegram(text):
+# ==================== TELEGRAM (с кнопками) ====================
+def send_telegram(text, buttons=None):
+    """Отправка сообщения в Telegram.
+    
+    buttons: список списков словарей {"text": "...", "url": "..."}
+    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     for i in range(0, len(text), 4000):
         chunk = text[i:i + 4000]
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": chunk,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if buttons:
+            payload["reply_markup"] = json.dumps({"inline_keyboard": buttons})
         try:
-            requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID,
-                                     "text": chunk, "parse_mode": "HTML"},
-                          timeout=10)
+            requests.post(url, data=payload, timeout=10)
         except Exception as e:
             logger.error("Ошибка отправки Telegram: %s", e)
+
+def tradingview_url(symbol: str) -> str:
+    """Прямая ссылка на график TradingView (Bybit spot)."""
+    return f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol}"
+
+def build_tv_buttons(consolidation_list, close_calls):
+    """Кнопка TradingView для КАЖДОЙ монеты из списков."""
+    buttons = []
+    # Секция 1: кандидаты (первыми — они ближе всего к входу)
+    for i, s in enumerate(close_calls[:TV_BUTTONS_CANDIDATES], 1):
+        sym = s["pair"]
+        buttons.append([{
+            "text": f"🎯 {i}. {sym} · ADX {s['adx_1d']:.0f}",
+            "url": tradingview_url(sym),
+        }])
+    # Секция 2: боковики (все из текста)
+    for i, item in enumerate(consolidation_list[:TV_BUTTONS_CONSOLIDATION], 1):
+        sym = item["pair"]
+        buttons.append([{
+            "text": f"📦 {i}. {sym} · {item['upper_level']:.6f}",
+            "url": tradingview_url(sym),
+        }])
+    return buttons
 
 def save_state(state_data):
     with state_lock:
@@ -746,7 +775,7 @@ def fetch_current_prices(pairs):
             prices[sym] = t["last"]
     return prices
 
-# ==================== СКОРИНГ ВХОДА (WS, 15m) ====================
+# ==================== СКОРИНГ ВХОДА ====================
 def find_fresh_cross(df, window=FRESH_CROSS_WINDOW):
     ml, ms = df["macd_line"], df["macd_signal"]
     for ago in range(0, window):
@@ -1162,7 +1191,9 @@ def on_message(ws, message):
                     f"📦 <b>ПРОБОЙ БОКОВИКА (WS)</b>\nПара: {symbol}\n"
                     f"Цена: {breakout_sig['entry']:.8f}\n"
                     f"SL: {breakout_sig['stop']:.8f} · TP: {breakout_sig['target']:.8f}\n"
-                    f"Объём: {breakout_sig['vol_ratio']:.1f}×")
+                    f"Объём: {breakout_sig['vol_ratio']:.1f}×",
+                    buttons=[[{"text": f"📈 Открыть {symbol}",
+                               "url": tradingview_url(symbol)}]])
                 continue
 
             with breakout_cache_lock:
@@ -1186,7 +1217,9 @@ def on_message(ws, message):
                 f"Пара: {symbol} · {sig['strategy']}\n"
                 f"Цена: {sig['entry']:.8f}\n"
                 f"SL: {sig['stop']:.8f} · TP: {sig['target']:.8f}\n"
-                f"<i>{' · '.join(sig['parts'])}</i>")
+                f"<i>{' · '.join(sig['parts'])}</i>",
+                buttons=[[{"text": f"📈 Открыть {symbol}",
+                           "url": tradingview_url(symbol)}]])
     except Exception as e:
         logger.error("Ошибка WebSocket: %s", e)
 
@@ -1220,7 +1253,7 @@ def watchdog_loop():
             except Exception:
                 pass
 
-# ==================== ФОНОВОЕ СКАНИРОВАНИЕ (REST) ====================
+# ==================== ФОНОВОЕ СКАНИРОВАНИЕ ====================
 TIMEFRAME_PARAMS = {
     "15m": {"bybit_interval": "15",  "min_bars": 80,  "ema_fast": 9,  "ema_slow": 21},
     "1h":  {"bybit_interval": "60",  "min_bars": 80,  "ema_fast": 9,  "ema_slow": 21},
@@ -1330,7 +1363,9 @@ def background_scan_loop():
                             f"Цена: {current_price:.8f}\n"
                             f"SL: {breakout['stop']:.8f} · TP: {breakout['target']:.8f}\n"
                             f"Дней в боковике: {breakout['days']} · "
-                            f"объём ×1.8 · ADX {breakout['adx']:.0f}")
+                            f"объём ×1.8 · ADX {breakout['adx']:.0f}",
+                            buttons=[[{"text": f"📈 Открыть {pair}",
+                                       "url": tradingview_url(pair)}]])
                     messages = []
                     time_stopped = False
                     with state_lock:
@@ -1425,7 +1460,9 @@ def background_scan_loop():
                             f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>\nПара: {pair}\n"
                             f"Цена: {current_price:.8f}\n"
                             f"SL: {breakout['stop']:.8f} · TP: {breakout['target']:.8f}\n"
-                            f"Дней в боковике: {breakout['days']}")
+                            f"Дней в боковике: {breakout['days']}",
+                            buttons=[[{"text": f"📈 Открыть {pair}",
+                                       "url": tradingview_url(pair)}]])
                 except Exception as e:
                     logger.error("Ошибка во втором проходе %s: %s", pair, e)
                     continue
@@ -1461,7 +1498,7 @@ def background_scan_loop():
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
 
-# ==================== ОТПРАВКА СТАТУСА (v19.1 UI) ====================
+# ==================== ОТПРАВКА СТАТУСА ====================
 def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     with state_lock:
         open_snapshot = [(pair, dict(pos)) for pair, pos in state.items()
@@ -1478,7 +1515,7 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
                           if v.get("strategy") in breakout_strategies]
 
     lines = [
-        f"📡 <b>СТАТУС СКАНЕРА v19.0 (Bybit)</b> | "
+        f"📡 <b>СТАТУС СКАНЕРА v19.3 (Bybit)</b> | "
         f"<i>{datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         "🔹 <b>📊 ОБЩАЯ СТАТИСТИКА</b>",
@@ -1518,7 +1555,7 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         lines.append("💤 <b>Открытых позиций нет.</b>")
         lines.append("━━━━━━━━━━━━━━━━━━━━━")
 
-    # ===== 🔵 ТОП КАНДИДАТОВ (сворачиваемый, голубой, жирный) =====
+    # ===== 🔵 ТОП КАНДИДАТОВ =====
     close_calls = [s for s in scan_summary if s["trend_score"] >= 2]
     close_calls.sort(key=lambda s: s.get("macd_gap_pct", 999))
     if close_calls:
@@ -1553,7 +1590,7 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         lines.append("</blockquote>")
         lines.append("━━━━━━━━━━━━━━━━━━━━━")
 
-    # ===== 🟡 МОНЕТЫ В БОКОВИКЕ (сворачиваемый, жёлтый, жирный) =====
+    # ===== 🟡 МОНЕТЫ В БОКОВИКЕ =====
     if consolidation_list:
         cons = []
         for i, item in enumerate(consolidation_list[:MAX_STATUS_PAIRS], 1):
@@ -1579,7 +1616,13 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     lines.append("━━━━━━━━━━━━━━━━━━━━━")
     lines.append("🔄 Следующий статус через 2 ч. · лимиты: "
                  f"{MAX_OPEN_POSITIONS} поз. / {MAX_TRADES_PER_HOUR} сделок в час")
-    send_telegram("\n".join(lines))
+    lines.append("")
+    lines.append("👇 <b>Кнопки TradingView для каждой монеты:</b>")
+    lines.append("🎯 <i>кандидаты</i> · 📦 <i>боковики</i>")
+
+    # Кнопки TradingView — для каждой монеты из списков
+    buttons = build_tv_buttons(consolidation_list, close_calls)
+    send_telegram("\n".join(lines), buttons=buttons)
 
 # ==================== MAIN ====================
 def handle_stop(signum, _frame):
@@ -1589,7 +1632,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v19.1 «HYBRID+ PRO» (Bybit) ...")
+    logger.info("Запуск бота v19.3 «HYBRID+ PRO» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
     state = load_state()
@@ -1653,10 +1696,10 @@ if __name__ == "__main__":
     threading.Thread(target=market_context_loop, daemon=True).start()
 
     send_telegram(
-        f"🟢 <b>СКАНЕР v19.1 «HYBRID+ PRO» ЗАПУЩЕН</b>\n"
+        f"🟢 <b>СКАНЕР v19.3 «HYBRID+ PRO» ЗАПУЩЕН</b>\n"
         f"WS: {len(PAIRS_WS)} пар + динамическая подписка\n"
         f"Тренд 3/3: {q3} · BTC-контекст: {'OK' if market_allows_longs() else 'БЛОК'}\n"
         f"Лимиты: {MAX_OPEN_POSITIONS} поз. / {MAX_TRADES_PER_HOUR} сделок в час / "
         f"порог score {MIN_SIGNAL_SCORE}/10\n"
-        f"UI: сворачиваемые списки, цветные заголовки, подсветка готовых монет")
+        f"UI: кнопка TradingView для каждой монеты")
     background_scan_loop()
