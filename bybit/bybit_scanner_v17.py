@@ -2,20 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v19.8 «HYBRID+ PRO» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
+BYBIT SCANNER v19.5 «HYBRID+ PRO» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
-ИСПРАВЛЕНО В v19.8 (относительно v19.5):
-• /start и /stop: подписчики хранятся в subscribers.json, работает polling-поток;
-  сообщения уходят ВСЕМ подписчикам (основной чат добавляется автоматически)
-• Сворачиваемые списки <blockquote expandable>: ТОП КАНДИДАТОВ и МОНЕТЫ В БОКОВИКЕ;
-  при разворачивании видны ВСЕ монеты списка
-• Нарезка длинных списков на части ПО ГРАНИЦАМ МОНЕТ: каждая часть —
-  самодостаточное сообщение со своим <blockquote>, HTML не рвётся
-• Кликабельные HTML-ссылки TradingView сохранены
-• Сохранено всё из v19.5: проверка ответа Telegram, fallback без разметки,
-  BTC-контекст, circuit breaker, сектора, sizing, retest, breakout-кэш, watchdog
+ИСПРАВЛЕНО В v19.5:
+  • send_telegram теперь ПРОВЕРЯЕТ ответ Telegram и ЛОГИРУЕТ отказ
+  • Безопасная нарезка на чанки по границам строк (не рвёт HTML-теги)
+  • При ошибке парсинга HTML — повтор без разметки (текст всё равно дойдёт)
+  • Убран <blockquote expandable> (ломался при длинных списках)
+  • HTML-ссылки TradingView остались (они в пределах одной строки)
 ==============================================================================
 """
 import json
@@ -64,6 +60,7 @@ CONSOLIDATION_MAX_RANGE_PCT = 24.0
 CONSOLIDATION_MAX_ADX = 25
 
 WS_EXTRA_SYMBOLS = 50
+
 RETEST_ENABLED = True
 RETEST_TOUCH_TOLERANCE_PCT = 0.8
 RETEST_SL_ATR = 1.5
@@ -126,13 +123,11 @@ BREAKOUT_CACHE_SIZE = 60
 CLEANUP_AFTER_DAYS = 14
 WS_SILENCE_TIMEOUT = 90
 
-EXPAND_CHUNK_LIMIT = 3800   # макс. символов в одном сворачиваемом сообщении
-
 WORK_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(WORK_DIR, "bybit_state.json")
 TRADES_LOG_FILE = os.path.join(WORK_DIR, "bybit_trades.json")
-SUBSCRIBERS_FILE = os.path.join(WORK_DIR, "subscribers.json")
 LOG_FILE = os.path.join(WORK_DIR, "bybit_scanner.log")
+MAX_STATUS_PAIRS = 15   # было 20 — уменьшено чтобы не упираться в лимит Telegram
 
 # ==================== ЛОГИРОВАНИЕ ====================
 os.makedirs(WORK_DIR, exist_ok=True)
@@ -167,9 +162,10 @@ SESSION = requests.Session()
 
 market_context = {"ok": True, "reason": "", "ts": 0.0}
 market_context_lock = threading.RLock()
+
 cb_state = {"consec": 0, "paused_until": 0.0, "day": "", "day_pnl": 0.0}
 cb_lock = threading.Lock()
-subscribers_lock = threading.Lock()
+
 _http_failures = 0
 _http_open_until = 0.0
 
@@ -293,86 +289,9 @@ def portfolio_risk_used():
             total += dist * v.get("size_fraction", 1.0)
     return total
 
-# ==================== TELEGRAM: ПОДПИСЧИКИ ====================
-def load_subscribers():
-    with subscribers_lock:
-        try:
-            if os.path.exists(SUBSCRIBERS_FILE):
-                with open(SUBSCRIBERS_FILE, "r") as f:
-                    ids = list(set(int(x) for x in json.load(f).get("ids", [])))
-                    if ids:
-                        return ids
-        except Exception as e:
-            logger.error("Ошибка загрузки подписчиков: %s", e)
-    ids = []
-    if TELEGRAM_CHAT_ID:
-        try:
-            ids.append(int(TELEGRAM_CHAT_ID))
-        except (TypeError, ValueError):
-            pass
-    return ids
-
-def save_subscribers(ids):
-    with subscribers_lock:
-        try:
-            tmp = SUBSCRIBERS_FILE + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump({"ids": sorted(set(int(x) for x in ids))}, f, indent=2)
-            os.replace(tmp, SUBSCRIBERS_FILE)
-        except Exception as e:
-            logger.error("Ошибка сохранения подписчиков: %s", e)
-
-def add_subscriber(chat_id):
-    ids = load_subscribers()
-    if chat_id in ids:
-        _send_to_one(chat_id, "✅ Вы уже подписаны на уведомления сканера.")
-        return
-    ids.append(chat_id)
-    save_subscribers(ids)
-    logger.info("➕ Новый подписчик: %d (всего %d)", chat_id, len(ids))
-    _send_to_one(chat_id,
-                 "🟢 <b>Подписка оформлена!</b>\n"
-                 "Вы будете получать: входы/выходы, пробои боковиков и статусы каждые 2 часа.\n"
-                 "Отписаться: /stop")
-
-def remove_subscriber(chat_id):
-    ids = load_subscribers()
-    if chat_id in ids:
-        ids.remove(chat_id)
-        save_subscribers(ids)
-        logger.info("➖ Отписка: %d (осталось %d)", chat_id, len(ids))
-    _send_to_one(chat_id, "🔴 Вы отписаны. Подписаться снова: /start")
-
-def polling_loop():
-    """Приём /start и /stop от пользователей (long polling)."""
-    if not TELEGRAM_BOT_TOKEN:
-        logger.warning("Polling не запущен: нет TELEGRAM_BOT_TOKEN")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    offset = 0
-    logger.info("Polling /start запущен")
-    while True:
-        try:
-            r = requests.get(url, params={"offset": offset, "timeout": 30}, timeout=40)
-            data = r.json()
-            if data.get("ok"):
-                for u in data.get("result", []):
-                    offset = max(offset, u["update_id"] + 1)
-                    msg = u.get("message") or {}
-                    text = (msg.get("text") or "").strip().lower()
-                    cid = (msg.get("chat") or {}).get("id")
-                    if not cid:
-                        continue
-                    if text == "/start":
-                        add_subscriber(int(cid))
-                    elif text == "/stop":
-                        remove_subscriber(int(cid))
-        except Exception as e:
-            logger.warning("Polling ошибка: %s", e)
-        time.sleep(2)
-
-# ==================== TELEGRAM: ОТПРАВКА ====================
+# ==================== TELEGRAM (ИСПРАВЛЕНО) ====================
 def _split_html_safe(text, limit=3900):
+    """Режем по границам строк, чтобы не порвать HTML-теги."""
     chunks, cur = [], ""
     for line in text.split("\n"):
         if cur and len(cur) + len(line) + 1 > limit:
@@ -383,15 +302,21 @@ def _split_html_safe(text, limit=3900):
         chunks.append(cur)
     return chunks or [""]
 
-def _send_to_one(chat_id, text):
-    if not TELEGRAM_BOT_TOKEN:
+
+def send_telegram(text):
+    """Отправка с проверкой ответа и fallback без разметки."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram НЕ настроен: пустой токен или chat_id")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     for chunk in _split_html_safe(text):
         sent = False
         for parse_mode in ("HTML", None):
-            payload = {"chat_id": chat_id, "text": chunk,
-                       "disable_web_page_preview": True}
+            payload = {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": chunk,
+                "disable_web_page_preview": True,
+            }
             if parse_mode:
                 payload["parse_mode"] = parse_mode
             try:
@@ -407,19 +332,10 @@ def _send_to_one(chat_id, text):
         if not sent:
             logger.error("Сообщение НЕ доставлено даже без разметки")
 
-def send_telegram(text):
-    """Отправка ВСЕМ подписчикам."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram НЕ настроен: пустой токен или chat_id")
-        return
-    for chat_id in load_subscribers():
-        _send_to_one(chat_id, text)
-
 def tv_link(symbol: str) -> str:
     url = f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol}"
     return f'<a href="{url}">📈 {symbol}</a>'
 
-# ==================== СОСТОЯНИЕ И СДЕЛКИ ====================
 def save_state(state_data):
     with state_lock:
         try:
@@ -1204,8 +1120,7 @@ def on_message(ws, message):
                                         "Stop-Loss", pos.get("strategy", "?"),
                                         pos.get("entry_time"), size, frac)
                         exit_messages.append(
-                            f"🔴 <b>СТОП-ЛОСС (WS)</b>\n"
-                            f"Пара: {tv_link(symbol)}\n"
+                            f"🔴 <b>СТОП-ЛОСС (WS)</b>\nПара: {tv_link(symbol)}\n"
                             f"Цена: {exit_price:.8f}\n"
                             f"Результат: <b>{pnl:+.2f}%</b>"
                             + ("" if frac == 1.0 else " (оставшиеся 50%)"))
@@ -1219,8 +1134,7 @@ def on_message(ws, message):
                                         "Take-Profit", pos.get("strategy", "?"),
                                         pos.get("entry_time"), size, frac)
                         exit_messages.append(
-                            f"🟢 <b>ТЕЙК-ПРОФИТ (WS)</b>\n"
-                            f"Пара: {tv_link(symbol)}\n"
+                            f"🟢 <b>ТЕЙК-ПРОФИТ (WS)</b>\nПара: {tv_link(symbol)}\n"
                             f"Цена: {pos['target']:.8f}\n"
                             f"Результат: <b>{pnl:+.2f}%</b>"
                             + ("" if frac == 1.0 else " (оставшиеся 50%)"))
@@ -1241,8 +1155,7 @@ def on_message(ws, message):
                         state[symbol] = pos
                         save_state(state)
                         exit_messages.append(
-                            f"💰 <b>ЧАСТИЧНЫЙ TP (50%)</b>\n"
-                            f"Пара: {tv_link(symbol)}\n"
+                            f"💰 <b>ЧАСТИЧНЫЙ TP (50%)</b>\nПара: {tv_link(symbol)}\n"
                             f"Зафиксировано: <b>{pnl:+.2f}%</b> на половину позиции\n"
                             f"Стоп переведён в безубыток")
             for msg in exit_messages:
@@ -1254,6 +1167,7 @@ def on_message(ws, message):
             if last_processed_closed.get(symbol) == closed_start:
                 continue
             last_processed_closed[symbol] = closed_start
+
             df = pd.DataFrame(list(buf))
             df["ema_fast"] = ema(df["close"], 9)
             df["ema_slow"] = ema(df["close"], 21)
@@ -1277,6 +1191,7 @@ def on_message(ws, message):
                     f"SL: {breakout_sig['stop']:.8f} · TP: {breakout_sig['target']:.8f}\n"
                     f"Объём: {breakout_sig['vol_ratio']:.1f}×")
                 continue
+
             with breakout_cache_lock:
                 level = breakout_cache.get(symbol)
             sig = evaluate_ws_retest(df, symbol, level)
@@ -1578,79 +1493,7 @@ def background_scan_loop():
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
 
-# ==================== СТАТУС: БЛОКИ МОНЕТ И СВОРАЧИВАНИЕ ====================
-def _build_cand_blocks(scan_summary):
-    """Каждый блок = 4 строки одной монеты-кандидата (ВСЕ кандидаты)."""
-    blocks = []
-    close_calls = [s for s in scan_summary if s["trend_score"] >= 2]
-    close_calls.sort(key=lambda s: s.get("macd_gap_pct", 999))
-    for i, s in enumerate(close_calls, 1):
-        gap = s.get("macd_gap_pct", 0)
-        if gap < 0:
-            proximity = "⏳ Близко к кроссу (ждём)"
-            highlight = gap > -0.25
-        elif gap < 0.5:
-            proximity = "🟡 Кросс недавно — окно 3 свечи активно"
-            highlight = True
-        else:
-            proximity = "⚠️ Кросс был давно"
-            highlight = False
-        extra = " · ADX↑" if s.get("adx_slope_up") else ""
-        vol = s.get("vol_ratio", 0.0)
-        vol_txt = f" · объём {vol:.1f}×" if vol >= MIN_VOL_MULT else ""
-        sym_link = tv_link(s["pair"])
-        head = (f"🟢 <b>▶ {i}. {sym_link} ◀</b> 🟢" if highlight
-                else f"<b>   {i}. {sym_link}</b>")
-        blocks.append([
-            head,
-            f"  Тренд: {s['trend_score']}/3 | ADX: {s['adx_1d']:.0f}{extra}"
-            f" | RSI(4h): {s['rsi_4h']:.0f}{vol_txt}",
-            f"  Цена: ~{s['close_price']:.8f}",
-            f"  <i>{proximity}</i>",
-        ])
-    return blocks
-
-def _build_cons_blocks(consolidation_list):
-    """Каждый блок = 3 строки одной монеты в боковике (ВСЕ монеты)."""
-    blocks = []
-    for i, item in enumerate(consolidation_list, 1):
-        dry = " 🥀" if item.get("vol_trend", 1.0) <= 0.9 else ""
-        ready = (item.get("range_pct", 99) < 15.0 and item.get("adx", 99) < 15)
-        sym_link = tv_link(item["pair"])
-        head = (f"🟢 <b>▶ {i}. {sym_link} ◀</b> – {item['days']} дн.{dry} 🟢" if ready
-                else f"<b>   {i}. {sym_link}</b> – {item['days']} дн.{dry}")
-        blocks.append([
-            head,
-            f"  📏 Диапазон: {item['range_pct']:.1f}% | ADX: {item['adx']:.0f}",
-            f"  🚀 Пробой выше: {item['upper_level']:.6f}",
-        ])
-    return blocks
-
-def _send_expandable_blocks(title, blocks):
-    """Сворачиваемые списки: режем ПО ГРАНИЦАМ МОНЕТ, каждая часть самодостаточна."""
-    if not blocks:
-        return
-    base = len(title) + 80
-    chunks, cur, cur_size = [], [], base
-    for b in blocks:
-        b_size = sum(len(l) for l in b) + len(b)
-        if cur and cur_size + b_size > EXPAND_CHUNK_LIMIT:
-            chunks.append(cur)
-            cur, cur_size = [], base
-        cur.append(b)
-        cur_size += b_size
-    if cur:
-        chunks.append(cur)
-    for idx, ch in enumerate(chunks, 1):
-        lines = ["<blockquote expandable>", title]
-        if len(chunks) > 1:
-            lines.append(f"<i>часть {idx} из {len(chunks)} · всего монет: {len(blocks)}</i>")
-        lines.append("━━━━━━━━━━━━━━━━━━━━━")
-        for b in ch:
-            lines.extend(b)
-        lines.append("</blockquote>")
-        send_telegram("\n".join(lines))
-
+# ==================== ОТПРАВКА СТАТУСА (без blockquote) ====================
 def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     with state_lock:
         open_snapshot = [(pair, dict(pos)) for pair, pos in state.items()
@@ -1659,19 +1502,21 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         q3 = sum(1 for v in trend_cache.values() if v["score"] == 3)
     with market_context_lock:
         mok, mreason = market_context["ok"], market_context["reason"]
+
     breakout_strategies = ("breakout", "breakout_ws", "breakout_retest")
     confluence_positions = [(p, v) for p, v in open_snapshot
                             if v.get("strategy") not in breakout_strategies]
     breakout_positions = [(p, v) for p, v in open_snapshot
                           if v.get("strategy") in breakout_strategies]
+
     lines = [
-        f"📡 <b>СТАТУС СКАНЕРА v19.8 (Bybit)</b> | "
+        f"📡 <b>СТАТУС СКАНЕРА v19.5 (Bybit)</b> | "
         f"<i>{datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         "🔹 <b>📊 ОБЩАЯ СТАТИСТИКА</b>",
         f"🔹 Отслеживается пар (WS): <b>{len(PAIRS_WS)}</b> + доп. подписка",
         f"🔹 🧠 Тренд-кэш 3/3: <b>{q3}</b> пар",
-        f"🔹  BTC-контекст: <b>{'OK' if mok else 'БЛОК: ' + mreason}</b>",
+        f"🔹 🌍 BTC-контекст: <b>{'OK' if mok else 'БЛОК: ' + mreason}</b>",
         f"🔹 🎯 В боковике найдено: <b>{len(consolidation_list)}</b>",
         f"🔹 💰 Открытых позиций: <b>{len(open_snapshot)}/{MAX_OPEN_POSITIONS}</b>",
         f"🔹 👉 Входов за цикл: <b>{found_buy}</b> · 👈 Выходов: <b>{found_sell}</b>",
@@ -1679,6 +1524,7 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     if not cb_can_trade():
         lines.append("🔹 🛑 Circuit breaker: <b>входы на паузе</b>")
     lines.append("━━━━━━━━━━━━━━━━━━━━━")
+
     if confluence_positions:
         lines.append("🟢 <b>💰 ПОЗИЦИИ (CONFLUENCE / PULLBACK)</b>")
         for pair, pos in confluence_positions:
@@ -1689,6 +1535,7 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
                          f"🎯 Цель: {pos.get('target', 0):.8f}"
                          + (" | 💰 50% зафикс." if pos.get("partial_done") else ""))
         lines.append("━━━━━━━━━━━━━━━━━━━━━")
+
     if breakout_positions:
         lines.append("📦 <b>💰 ПОЗИЦИИ (BREAKOUT / RETEST)</b>")
         for pair, pos in breakout_positions:
@@ -1698,28 +1545,69 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
             lines.append(f"  🍊 Стоп: {pos.get('stop', 0):.8f} | "
                          f"🎯 Цель: {pos.get('target', 0):.8f}")
         lines.append("━━━━━━━━━━━━━━━━━━━━━")
+
     if not open_snapshot:
         lines.append("💤 <b>Открытых позиций нет.</b>")
         lines.append("━━━━━━━━━━━━━━━━━━━━━")
+
+    # ===== 🔵 ТОП КАНДИДАТОВ (без blockquote) =====
+    close_calls = [s for s in scan_summary if s["trend_score"] >= 2]
+    close_calls.sort(key=lambda s: s.get("macd_gap_pct", 999))
+    if close_calls:
+        lines.append("🔵🔵🔵 <b>ТОП КАНДИДАТОВ (CONFLUENCE)</b> 🔵🔵🔵")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+        for i, s in enumerate(close_calls[:3], 1):
+            gap = s.get("macd_gap_pct", 0)
+            if gap < 0:
+                proximity = "⏳ Близко к кроссу (ждём)"
+                highlight = gap > -0.25
+            elif gap < 0.5:
+                proximity = "🟡 Кросс недавно — окно 3 свечи активно"
+                highlight = True
+            else:
+                proximity = "⚠️ Кросс был давно"
+                highlight = False
+            extra = " · ADX↑" if s.get("adx_slope_up") else ""
+            vol = s.get("vol_ratio", 0.0)
+            vol_txt = f" · объём {vol:.1f}×" if vol >= MIN_VOL_MULT else ""
+            sym_link = tv_link(s['pair'])
+            if highlight:
+                head = f"🟢 <b>▶ {i}. {sym_link} ◀</b> 🟢"
+            else:
+                head = f"<b>   {i}. {sym_link}</b>"
+            lines.append(head)
+            lines.append(f"  Тренд: {s['trend_score']}/3 | ADX: {s['adx_1d']:.0f}{extra}"
+                         f" | RSI(4h): {s['rsi_4h']:.0f}{vol_txt}")
+            lines.append(f"  Цена: ~{s['close_price']:.8f}")
+            lines.append(f"  <i>{proximity}</i>")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+
+    # ===== 🟡 МОНЕТЫ В БОКОВИКЕ (без blockquote) =====
+    if consolidation_list:
+        lines.append("🟡🟡🟡 <b>МОНЕТЫ В БОКОВИКЕ (30–60 ДНЕЙ)</b> 🟡🟡🟡")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+        for i, item in enumerate(consolidation_list[:MAX_STATUS_PAIRS], 1):
+            dry = " 🥀" if item.get("vol_trend", 1.0) <= 0.9 else ""
+            ready = (item.get("range_pct", 99) < 15.0 and item.get("adx", 99) < 15)
+            sym_link = tv_link(item['pair'])
+            if ready:
+                head = f"🟢 <b>▶ {i}. {sym_link} ◀</b> – {item['days']} дн.{dry} 🟢"
+            else:
+                head = f"<b>   {i}. {sym_link}</b> – {item['days']} дн.{dry}"
+            lines.append(head)
+            lines.append(f"  📏 Диапазон: {item['range_pct']:.1f}% | ADX: {item['adx']:.0f}")
+            lines.append(f"  🚀 Пробой выше: {item['upper_level']:.6f}")
+        if len(consolidation_list) > MAX_STATUS_PAIRS:
+            lines.append(f"... и ещё {len(consolidation_list) - MAX_STATUS_PAIRS} пар")
+    else:
+        lines.append("📦 <b>Боковиков не найдено</b>")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("🔄 Следующий статус через 2 ч. · лимиты: "
+                 f"{MAX_OPEN_POSITIONS} поз. / {MAX_TRADES_PER_HOUR} сделок в час")
+    lines.append("")
+    lines.append("👇 <i>Тапни синюю ссылку 📈 с тикером — откроется TradingView</i>")
     send_telegram("\n".join(lines))
-
-    cand_blocks = _build_cand_blocks(scan_summary)
-    if cand_blocks:
-        _send_expandable_blocks("🔵🔵🔵 <b>ТОП КАНДИДАТОВ (CONFLUENCE)</b> 🔵🔵🔵",
-                                cand_blocks)
-    else:
-        send_telegram("😴 <b>Кандидатов на вход (Confluence) нет</b>")
-
-    cons_blocks = _build_cons_blocks(consolidation_list)
-    if cons_blocks:
-        _send_expandable_blocks("🟡🟡🟡 <b>МОНЕТЫ В БОКОВИКЕ (30–60 ДНЕЙ)</b> 🟡🟡",
-                                cons_blocks)
-    else:
-        send_telegram("📦 <b>Боковиков не найдено</b>")
-
-    send_telegram("🔄 Следующий статус через 2 ч. · лимиты: "
-                  f"{MAX_OPEN_POSITIONS} поз. / {MAX_TRADES_PER_HOUR} сделок в час\n"
-                  "👇 <i>Тапни синюю ссылку 📈 с тикером — откроется TradingView</i>")
 
 # ==================== MAIN ====================
 def handle_stop(signum, _frame):
@@ -1729,7 +1617,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v19.8 «HYBRID+ PRO» (Bybit) ...")
+    logger.info("Запуск бота v19.5 «HYBRID+ PRO» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
     state = load_state()
@@ -1748,18 +1636,8 @@ if __name__ == "__main__":
             pos.setdefault("size_fraction", 1.0)
     save_state(state)
 
-    # Инициализация подписчиков: основной чат добавляется автоматически
-    if TELEGRAM_CHAT_ID:
-        try:
-            main_id = int(TELEGRAM_CHAT_ID)
-            ids = load_subscribers()
-            if main_id not in ids:
-                ids.append(main_id)
-                save_subscribers(ids)
-        except (TypeError, ValueError):
-            pass
-
     refresh_market_context()
+
     retry_count = 0
     while not PAIRS_WS and retry_count < 3:
         PAIRS_WS = get_filtered_pairs(TOP_N)
@@ -1801,13 +1679,12 @@ if __name__ == "__main__":
     threading.Thread(target=watchdog_loop, daemon=True).start()
     threading.Thread(target=trend_cache_loop, daemon=True).start()
     threading.Thread(target=market_context_loop, daemon=True).start()
-    threading.Thread(target=polling_loop, daemon=True).start()
 
     send_telegram(
-        f"🟢 <b>СКАНЕР v19.8 «HYBRID+ PRO» ЗАПУЩЕН</b>\n"
+        f"🟢 <b>СКАНЕР v19.5 «HYBRID+ PRO» ЗАПУЩЕН</b>\n"
         f"WS: {len(PAIRS_WS)} пар + динамическая подписка\n"
         f"Тренд 3/3: {q3} · BTC-контекст: {'OK' if market_allows_longs() else 'БЛОК'}\n"
         f"Лимиты: {MAX_OPEN_POSITIONS} поз. / {MAX_TRADES_PER_HOUR} сделок в час / "
         f"порог score {MIN_SIGNAL_SCORE}/10\n"
-        f"UI: сворачиваемые списки · ссылки TradingView · /start для подписки")
+        f"UI: HTML-ссылки TradingView прямо в тексте")
     background_scan_loop()
