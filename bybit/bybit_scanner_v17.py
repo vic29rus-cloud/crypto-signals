@@ -2,18 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v19.7 «ONE-MSG» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
+BYBIT SCANNER v19.7.1 «ONE-MSG» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
-ГЛАВНОЕ В v19.7:
-• СТАТУС = ОДНО сообщение Telegram (не режется на части!)
-• Внутри него две сворачиваемые «менюшки» <blockquote expandable>:
+ГЛАВНОЕ В v19.7.1:
+• СТАТУС = ОДНО сообщение Telegram (не режется на части)
+• Внутри две сворачиваемые менюшки <blockquote expandable>:
   🔵 КАНДИДАТЫ и 🟡 БОКОВИКИ — открываются стрелкой
-• Списки компактные (по строке на монету) + авто-бюджет: если не влезает
-  в 4096 символов — сначала убираются ссылки, затем хвосты списков
-  с пометкой «… и ещё N»
-• Подписка людей: /start, /stop, /help (polling-поток, subscribers.json)
+• Списки компактные + авто-бюджет: если не влезает в 4000 символов —
+  сначала убираются ссылки, затем хвосты списков с пометкой «… и ещё N»
+• Подписка людей: /start, /stop, /help (polling, subscribers.json)
 ==============================================================================
 """
 import json
@@ -125,8 +124,8 @@ BREAKOUT_CACHE_SIZE = 60
 CLEANUP_AFTER_DAYS = 14
 WS_SILENCE_TIMEOUT = 90
 
-TG_MSG_LIMIT = 4096          # жёсткий лимит Telegram
-TG_SAFE_LIMIT = 4000         # рабочий бюджет статуса
+TG_MSG_LIMIT = 4096
+TG_SAFE_LIMIT = 4000
 
 WORK_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(WORK_DIR, "bybit_state.json")
@@ -297,7 +296,7 @@ def portfolio_risk_used():
             total += dist * v.get("size_fraction", 1.0)
     return total
 
-# ==================== TELEGRAM ====================
+# ==================== TELEGRAM: ПОДПИСЧИКИ ====================
 def _load_subscribers():
     global SUBSCRIBERS, MAIN_CHAT_ID
     ids = set()
@@ -365,23 +364,16 @@ def _post_telegram(chat_id, text):
             logger.error("Telegram отклонил (parse=%s, chat=%s): %s",
                          parse_mode, chat_id, desc)
             low = desc.lower()
-            if any(k in low for k in ("blocked", "chat not found", "deactivated", "kicked")):
+            if any(k in low for k in ("blocked", "chat not found",
+                                       "deactivated", "kicked")):
                 remove_subscriber(chat_id)
                 return False
         except Exception as e:
             logger.error("Ошибка отправки Telegram chat=%s: %s", chat_id, e)
     return False
 
-def _send_to_all(text):
-    """Одно и то же сообщение всем подписчикам (БЕЗ нарезки!)."""
-    if len(text) > TG_MSG_LIMIT:
-        text = text[:TG_MSG_LIMIT - 6] + " …"
-    with subscribers_lock:
-        targets = list(SUBSCRIBERS)
-    for cid in targets:
-        _post_telegram(cid, text)
-
 def _split_html_safe(text, limit=TG_SAFE_LIMIT):
+    """Нарезка по границам строк — используется для событийных алертов."""
     chunks, cur = [], ""
     for line in text.split("\n"):
         if cur and len(cur) + len(line) + 1 > limit:
@@ -391,6 +383,25 @@ def _split_html_safe(text, limit=TG_SAFE_LIMIT):
     if cur:
         chunks.append(cur)
     return chunks or [""]
+
+def _send_to_all_one(text):
+    """Отправляет ОДНО сообщение всем подписчикам (без нарезки).
+    Если текст превышает лимит Telegram — усекает с ellipsis,
+    сохраняя закрытие открытых HTML-тегов по возможности."""
+    if len(text) > TG_MSG_LIMIT:
+        # Безопасная усечка: не рвём теги по возможности.
+        # Отрезаем, убираем последний незакрытый тег-контекст грубо,
+        # затем добавляем многоточие.
+        cut = TG_MSG_LIMIT - 10
+        text = text[:cut].rstrip()
+        # Закрываем возможные незакрытые blockquote
+        if "<blockquote" in text and "</blockquote>" not in text.rsplit("<blockquote", 1)[1]:
+            text += "\n</blockquote>"
+        text += " …"
+    with subscribers_lock:
+        targets = list(SUBSCRIBERS)
+    for cid in targets:
+        _post_telegram(cid, text)
 
 def send_telegram(text):
     """Для событийных алертов: всем подписчикам, с безопасной нарезкой."""
@@ -407,7 +418,7 @@ def tv_link(symbol: str) -> str:
     return f'<a href="{url}">📈 {symbol}</a>'
 
 HELP_TEXT = (
-    "📡 <b>Bybit Scanner v19.7 — справка</b>\n"
+    "📡 <b>Bybit Scanner v19.7.1 — справка</b>\n"
     "Бот шлёт: входы/выходы, частичные TP и ОДИН статус каждые 2 часа.\n"
     "В статусе две сворачиваемые менюшки: 🔵 кандидаты и 🟡 боковики — "
     "нажми стрелку у цитаты, чтобы развернуть.\n"
@@ -446,9 +457,9 @@ def polling_loop():
                 if text == "/start":
                     if add_subscriber(int(cid)):
                         _post_telegram(cid,
-                                       "🟢 <b>Подписка оформлена!</b>\n"
-                                       "Бот присылает входы/выходы и статус каждые 2 часа.\n"
-                                       "/stop — отписаться, /help — справка.")
+                            "🟢 <b>Подписка оформлена!</b>\n"
+                            "Бот присылает входы/выходы и статус каждые 2 часа.\n"
+                            "/stop — отписаться, /help — справка.")
                     else:
                         _post_telegram(cid, "✅ Вы уже подписаны.")
                 elif text == "/stop":
@@ -527,7 +538,7 @@ def ema(series, period):
 def rsi(series, period=14):
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0.0).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0.0)).rolling(window=period).mean()
     rs = gain / loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
@@ -1615,7 +1626,7 @@ def background_scan_loop():
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
 
-# ==================== СТАТУС: ОДНО СООБЩЕНИЕ СО СВОРАЧИВАЕМЫМИ МЕНЮ ====================
+# ==================== СТАТУС: ОДНО СООБЩЕНИЕ ====================
 def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     with state_lock:
         open_snapshot = [(pair, dict(pos)) for pair, pos in state.items()
@@ -1631,7 +1642,7 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     now_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M")
 
     header = [
-        f"📡 <b>СТАТУС v19.7 (Bybit)</b> | <i>{now_str} UTC</i>",
+        f"📡 <b>СТАТУС v19.7.1 (Bybit)</b> | <i>{now_str} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔹 Пар WS: <b>{len(PAIRS_WS)}</b> · Тренд 3/3: <b>{q3}</b>",
         f"🔹 BTC: <b>{'OK' if mok else 'БЛОК: ' + mreason}</b>",
@@ -1720,8 +1731,6 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         lines += footer
         return "\n".join(lines)
 
-    # Бюджет: одно сообщение <= 4000 символов.
-    # Шаг 1: со ссылками. Шаг 2: без ссылок. Шаг 3: урезаем хвосты списков.
     text = None
     for with_links in (True, False):
         max_cand, max_cons = len(close_calls), len(consolidation_list)
@@ -1738,7 +1747,11 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         if len(text) <= TG_SAFE_LIMIT:
             break
 
-    _send_to_all(text)   # ОДНО сообщение всем подписчикам
+    # Финальная страховка: если всё ещё больше лимита, шлём супер-компактный вариант
+    if text is None or len(text) > TG_SAFE_LIMIT:
+        text = build(False, 3, 5)
+
+    _send_to_all_one(text)
     logger.info("Статус отправлен: %d символов, кандидатов %d, боковиков %d",
                 len(text), len(close_calls), len(consolidation_list))
 
@@ -1750,7 +1763,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v19.7 «ONE-MSG» (Bybit) ...")
+    logger.info("Запуск бота v19.7.1 «ONE-MSG» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
@@ -1817,8 +1830,8 @@ if __name__ == "__main__":
     threading.Thread(target=market_context_loop, daemon=True).start()
     threading.Thread(target=polling_loop, daemon=True).start()
 
-    _send_to_all(
-        f"🟢 <b>СКАНЕР v19.7 «ONE-MSG» ЗАПУЩЕН</b>\n"
+    _send_to_all_one(
+        f"🟢 <b>СКАНЕР v19.7.1 «ONE-MSG» ЗАПУЩЕН</b>\n"
         f"WS: {len(PAIRS_WS)} пар + динам. подписка\n"
         f"Тренд 3/3: {q3} · BTC: {'OK' if market_allows_longs() else 'БЛОК'}\n"
         f"Лимиты: {MAX_OPEN_POSITIONS} поз / {MAX_TRADES_PER_HOUR} в час · "
