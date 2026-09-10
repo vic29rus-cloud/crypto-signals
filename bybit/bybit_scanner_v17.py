@@ -2,16 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v19.7.2 «ONE-MSG» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
+BYBIT SCANNER v19.7.3 «ONE-MSG» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
-ГЛАВНОЕ В v19.7.2:
+ГЛАВНОЕ В v19.7.3:
 • СТАТУС = ОДНО сообщение Telegram, две сворачиваемые менюшки:
   🔵 ТОП КАНДИДАТОВ и 🟡 МОНЕТЫ В БОКОВИКЕ (тап → раскрыть)
-• Cosmetic-фильтр статуса: из списка кандидатов убираются «мёртвые»
-  (RSI/ADX вне зоны входа, микро-капы), T3/3 + кросс поднимаются наверх
-  с пометкой ✨ (НЕ влияет на реальные входы)
+• Кандидаты: 💰 текущая цена + 🎯~ примерная цена входа
+• Боковики: 💰 текущая цена + 🚀 уровень пробоя
+• Cosmetic-фильтр статуса: убирает RSI/ADX вне зоны и микро-капы,
+  T3/3 + свежий кросс поднимаются наверх с пометкой ✨
 • Подписка: /start, /stop, /help (polling, subscribers.json)
 ==============================================================================
 """
@@ -419,11 +420,10 @@ def tv_link(symbol: str) -> str:
     return f'<a href="{url}">📈 {symbol}</a>'
 
 HELP_TEXT = (
-    "📡 <b>Bybit Scanner v19.7.2 — справка</b>\n"
+    "📡 <b>Bybit Scanner v19.7.3 — справка</b>\n"
     "Бот шлёт: входы/выходы, частичные TP и ОДИН статус каждые 2 часа.\n"
-    "В статусе две сворачиваемые менюшки: 🔵 кандидаты и 🟡 боковики — "
-    "нажми стрелку у цитаты, чтобы развернуть.\n"
-    "📈 Синяя ссылка-тикер открывает график TradingView.\n"
+    "В статусе две сворачиваемые менюшки: 🔵 кандидаты и 🟡 боковики.\n"
+    "💰 текущая цена · 🎯~ примерная цена входа · 🚀 уровень пробоя.\n"
     "✨ = T3/3 + свежий кросс (полная готовность).\n"
     "Команды: /stop — отписаться, /help — справка."
 )
@@ -1472,18 +1472,22 @@ def background_scan_loop():
                                       if results.get(k) and results[k]["ema_fast"] > results[k]["ema_slow"])
                     macd_gap_pct = ((r4h["macd_line"] - r4h["macd_signal"])
                                     / r4h["close"] * 100 if r4h["close"] else 0.0)
+                    current_price = current_prices.get(pair, r4h["close"])
                     scan_summary.append({
                         "pair": pair, "trend_score": trend_score,
                         "rsi_4h": r4h["rsi"], "adx_1d": r1d["adx"],
                         "adx_slope_up": r4h.get("adx_slope_up", False),
                         "vol_ratio": r4h.get("vol_ratio", 0.0),
-                        "macd_gap_pct": macd_gap_pct, "close_price": r4h["close"],
+                        "macd_gap_pct": macd_gap_pct,
+                        "close_price": r4h["close"],
+                        "current_price": current_price,
                     })
-                    current_price = current_prices.get(pair, r4h["close"])
                     cons = detect_consolidation(df_daily)
                     if cons and pair not in consolidation_seen:
                         consolidation_seen.add(pair)
-                        consolidation_list.append({"pair": pair, **cons})
+                        consolidation_list.append({"pair": pair,
+                                                    "current_price": current_price,
+                                                    **cons})
                     breakout = try_open_breakout(pair, df_daily, current_price, now_iso)
                     if breakout:
                         found_buy += 1
@@ -1583,7 +1587,9 @@ def background_scan_loop():
                     cons = detect_consolidation(df_daily)
                     if cons and pair not in consolidation_seen:
                         consolidation_seen.add(pair)
-                        consolidation_list.append({"pair": pair, **cons})
+                        consolidation_list.append({"pair": pair,
+                                                    "current_price": current_price,
+                                                    **cons})
                     breakout = try_open_breakout(pair, df_daily, current_price, now_iso)
                     if breakout:
                         found_buy += 1
@@ -1628,7 +1634,7 @@ def background_scan_loop():
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
 
-# ==================== СТАТУС: ОДНО СООБЩЕНИЕ (v19.7.2) ====================
+# ==================== СТАТУС: ОДНО СООБЩЕНИЕ (v19.7.3) ====================
 def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     with state_lock:
         open_snapshot = [(pair, dict(pos)) for pair, pos in state.items()
@@ -1643,9 +1649,8 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     breakout_strategies = ("breakout", "breakout_ws", "breakout_retest")
     now_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M")
 
-    # === ШАПКА ===
     header = [
-        f"📡 <b>СТАТУС v19.7.2 (Bybit)</b> | <i>{now_str} UTC</i>",
+        f"📡 <b>СТАТУС v19.7.3 (Bybit)</b> | <i>{now_str} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔹 Пар WS: <b>{len(PAIRS_WS)}</b> · Тренд 3/3: <b>{q3}</b>",
         f"🔹 BTC: <b>{'OK' if mok else 'БЛОК: ' + mreason}</b>",
@@ -1670,7 +1675,6 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     else:
         pos_lines.append("💰 Позиций нет")
 
-    # === КАНДИДАТЫ: cosmetic-фильтр + умная сортировка ===
     valid_calls = [
         s for s in scan_summary
         if s["trend_score"] >= 2
@@ -1681,7 +1685,6 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     valid_calls.sort(key=lambda s: (-s["trend_score"],
                                      s.get("macd_gap_pct", 999)))
 
-    # === БОКОВИКИ ===
     consolidation_list = sorted(consolidation_list,
                                 key=lambda x: (-x["days"], x.get("vol_trend", 1.0)))
 
@@ -1700,22 +1703,28 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         vol_txt = f" · V{vol:.1f}x" if vol >= MIN_VOL_MULT else ""
         up = "↑" if s.get("adx_slope_up") else ""
         ready_tag = " ✨" if is_ready else ""
+        # 💰 текущая цена · 🎯~ примерная цена входа (по закрытию сигнальной свечи)
+        cur = s.get("current_price") or s.get("close_price", 0)
+        entry = s.get("close_price", 0)
         return (f"{mark}{i}. {name}{ready_tag} · T{s['trend_score']}/3 · "
                 f"ADX{s['adx_1d']:.0f}{up} · RSI{s['rsi_4h']:.0f}{vol_txt} · "
-                f"~{s['close_price']:.6g} · {prox}")
+                f"💰{cur:.6g} 🎯~{entry:.6g} · {prox}")
 
     def cons_line(i, item, with_link):
         dry = " 🥀" if item.get("vol_trend", 1.0) <= 0.9 else ""
         ready = item.get("range_pct", 99) < 15.0 and item.get("adx", 99) < 15
         name = tv_link(item["pair"]) if with_link else item["pair"]
         mark = "🟢" if ready else ""
+        cur = item.get("current_price", 0)
+        cur_txt = f" 💰{cur:.6g}" if cur else ""
         return (f"{mark}{i}. {name} · {item['days']}д · {item['range_pct']:.1f}% · "
-                f"ADX{item['adx']:.0f}{dry} · 🚀{item['upper_level']:.6g}")
+                f"ADX{item['adx']:.0f}{dry} · 🚀{item['upper_level']:.6g}{cur_txt}")
 
     footer = [
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔄 Следующий статус через 2 ч · лимиты {MAX_OPEN_POSITIONS} поз / "
         f"{MAX_TRADES_PER_HOUR} в час",
+        "💰 текущая · 🎯~ вход · 🚀 пробой · ✨ готов · 🥀 объём↓",
         "👇 Тапни 📈-ссылку в списке — график TradingView",
     ]
 
@@ -1777,7 +1786,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v19.7.2 «ONE-MSG» (Bybit) ...")
+    logger.info("Запуск бота v19.7.3 «ONE-MSG» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
@@ -1845,12 +1854,12 @@ if __name__ == "__main__":
     threading.Thread(target=polling_loop, daemon=True).start()
 
     _send_to_all_one(
-        f"🟢 <b>СКАНЕР v19.7.2 «ONE-MSG» ЗАПУЩЕН</b>\n"
+        f"🟢 <b>СКАНЕР v19.7.3 «ONE-MSG» ЗАПУЩЕН</b>\n"
         f"WS: {len(PAIRS_WS)} пар + динам. подписка\n"
         f"Тренд 3/3: {q3} · BTC: {'OK' if market_allows_longs() else 'БЛОК'}\n"
         f"Лимиты: {MAX_OPEN_POSITIONS} поз / {MAX_TRADES_PER_HOUR} в час · "
         f"порог score {MIN_SIGNAL_SCORE}/10\n"
         f"📋 Статус = ОДНО сообщение: менюшки 🔵 и 🟡 открываются стрелкой\n"
-        f"✨ = T3/3 + свежий кросс · 👥 {len(SUBSCRIBERS)} подписчиков\n"
-        f"/start · /stop · /help")
+        f"💰 текущая · 🎯~ вход · 🚀 пробой\n"
+        f"👥 Подписчиков: {len(SUBSCRIBERS)} · /start · /stop · /help")
     background_scan_loop()
