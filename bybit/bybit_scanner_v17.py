@@ -2,18 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v19.7.3 «ONE-MSG» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
+BYBIT SCANNER v19.8.1 «BTC-ADAPTIVE+HOT» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
-ГЛАВНОЕ В v19.7.3:
-• СТАТУС = ОДНО сообщение Telegram, две сворачиваемые менюшки:
-  🔵 ТОП КАНДИДАТОВ и 🟡 МОНЕТЫ В БОКОВИКЕ (тап → раскрыть)
-• Кандидаты: 💰 текущая цена + 🎯~ примерная цена входа
-• Боковики: 💰 текущая цена + 🚀 уровень пробоя
-• Cosmetic-фильтр статуса: убирает RSI/ADX вне зоны и микро-капы,
-  T3/3 + свежий кросс поднимаются наверх с пометкой ✨
-• Подписка: /start, /stop, /help (polling, subscribers.json)
+НОВОЕ В v19.8.1 (относительно v19.8.0):
+• Боковики сортируются по % до пробоя (самые горячие — наверх).
+• Метки готовности к пробою:
+  🔥 — цена ≤1% от 🚀 (на грани)
+  ⚡ — цена ≤3% от 🚀 (готовится)
+  🟢 — цена ≤5% от 🚀 (близко)
+• Показывается до ~30 боковиков (вместо 6) за счёт компактного формата.
+• Кандидаты остались как в v19.8.0 (T3/3 наверх, ✨ = полная готовность).
+• Вся логика BTC-адаптивного фильтра сохранена.
 ==============================================================================
 """
 import json
@@ -68,9 +69,15 @@ RETEST_TOUCH_TOLERANCE_PCT = 0.8
 RETEST_SL_ATR = 1.5
 RETEST_TP_ATR = 4.0
 
+# --- АДАПТИВНЫЙ BTC-ФИЛЬТР ---
 BTC_CONTEXT_ENABLED = True
 BTC_CONTEXT_TTL = 300
-BTC_DROP_6H_PCT = -3.0
+BTC_DROP_6H_PCT = -5.0
+BTC_ADX_BLOCK_THRESHOLD = 35
+BTC_ALLOW_STRONG_WHEN_BLOCKED = True
+BTC_STRONG_MIN_TREND_SCORE = 3
+BTC_STRONG_MIN_SCORE = 8
+BTC_STRONG_SIZE_MULT = 0.5
 
 CB_MAX_CONSEC_LOSSES = 4
 CB_PAUSE_SECONDS = 6 * 3600
@@ -119,11 +126,15 @@ PULLBACK_TP_ATR = 5.0
 PULLBACK_MAX_DEPTH_PCT = 0.05
 PULLBACK_MIN_PRIOR_MOVE_PCT = 0.03
 
-# --- Cosmetic-фильтры ТОЛЬКО для статуса (не влияют на реальные входы) ---
 STATUS_RSI_MIN, STATUS_RSI_MAX = 35, 75
 STATUS_ADX_MIN, STATUS_ADX_MAX = 18, 55
 STATUS_MIN_PRICE = 0.0001
 STATUS_READY_SCORE = 3
+
+# --- ПОРОГИ «ГОРЯЧЕСТИ» БОКОВИКОВ (v19.8.1) ---
+HOT_DIST_PCT_1 = 1.0    # 🔥 — на грани
+HOT_DIST_PCT_2 = 3.0    # ⚡ — готовится
+HOT_DIST_PCT_3 = 5.0    # 🟢 — близко
 
 TREND_CACHE_REFRESH_SECONDS = 1800
 TREND_CACHE_INITIAL_LIMIT = 60
@@ -251,8 +262,8 @@ def refresh_market_context():
                 adx_val = adx(df).iloc[-2]
                 if chg_6h <= BTC_DROP_6H_PCT:
                     ok, reason = False, f"BTC {chg_6h:.1f}% за 6ч"
-                elif ef < es and not pd.isna(adx_val) and adx_val > 25:
-                    ok, reason = False, "BTC нисходящий тренд (ADX>25)"
+                elif ef < es and not pd.isna(adx_val) and adx_val > BTC_ADX_BLOCK_THRESHOLD:
+                    ok, reason = False, f"BTC нисходящий тренд (ADX>{BTC_ADX_BLOCK_THRESHOLD:.0f})"
         except Exception as e:
             logger.debug("market context: %s", e)
     with market_context_lock:
@@ -271,6 +282,16 @@ def market_allows_longs():
     with market_context_lock:
         return market_context["ok"]
 
+def is_strong_signal_for_blocked_market(signal):
+    if not BTC_ALLOW_STRONG_WHEN_BLOCKED:
+        return False
+    trend_score = signal.get("trend_score", 0)
+    score = signal.get("score", 0)
+    if isinstance(score, str):
+        return False
+    return (trend_score >= BTC_STRONG_MIN_TREND_SCORE
+            and score >= BTC_STRONG_MIN_SCORE)
+
 # ==================== СЕКТОРА И РАЗМЕР ====================
 def sector_of(symbol):
     base = symbol.replace("USDT", "")
@@ -284,12 +305,15 @@ def sector_slot_free(symbol):
               if v.get("position") == "open" and sector_of(p) == sec)
     return cnt < MAX_SECTOR_POSITIONS
 
-def position_size_fraction(score, rr, atr_pct, portfolio_risk_pct, stop_dist_pct):
+def position_size_fraction(score, rr, atr_pct, portfolio_risk_pct, stop_dist_pct,
+                            btc_blocked=False):
     base = RISK_PER_TRADE_PCT / 100.0
     conf = (0.5 + (score / 10.0) * 0.5) if isinstance(score, int) else 0.7
     vol_mult = 0.5 if atr_pct > 5 else 0.7 if atr_pct > 3 else 0.85 if atr_pct > 1.5 else 1.0
     rr_mult = 1.0 if rr >= 3 else 0.9 if rr >= 2 else 0.7 if rr >= 1.5 else 0.5
     size = base * conf * vol_mult * rr_mult
+    if btc_blocked:
+        size *= BTC_STRONG_SIZE_MULT
     remaining = MAX_PORTFOLIO_RISK_PCT - portfolio_risk_pct
     max_add = remaining / stop_dist_pct if stop_dist_pct > 0 else 0.0
     size = min(size, max(max_add, 0.0))
@@ -353,7 +377,6 @@ def remove_subscriber(cid):
     return True
 
 def _post_telegram(chat_id, text):
-    """Одна отправка одному чату: HTML, при ошибке парсинга — без разметки."""
     if not TELEGRAM_BOT_TOKEN:
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -380,7 +403,6 @@ def _post_telegram(chat_id, text):
     return False
 
 def _split_html_safe(text, limit=TG_SAFE_LIMIT):
-    """Нарезка по границам строк — используется для событийных алертов."""
     chunks, cur = [], ""
     for line in text.split("\n"):
         if cur and len(cur) + len(line) + 1 > limit:
@@ -392,8 +414,6 @@ def _split_html_safe(text, limit=TG_SAFE_LIMIT):
     return chunks or [""]
 
 def _send_to_all_one(text):
-    """Отправляет ОДНО сообщение всем подписчикам (без нарезки).
-    Если текст превышает лимит Telegram — усекает безопасно."""
     if len(text) > TG_MSG_LIMIT:
         cut = TG_MSG_LIMIT - 10
         text = text[:cut].rstrip()
@@ -406,7 +426,6 @@ def _send_to_all_one(text):
         _post_telegram(cid, text)
 
 def send_telegram(text):
-    """Для событийных алертов: всем подписчикам, с безопасной нарезкой."""
     if not TELEGRAM_BOT_TOKEN:
         return
     for chunk in _split_html_safe(text):
@@ -420,11 +439,12 @@ def tv_link(symbol: str) -> str:
     return f'<a href="{url}">📈 {symbol}</a>'
 
 HELP_TEXT = (
-    "📡 <b>Bybit Scanner v19.7.3 — справка</b>\n"
+    "📡 <b>Bybit Scanner v19.8.1 — справка</b>\n"
     "Бот шлёт: входы/выходы, частичные TP и ОДИН статус каждые 2 часа.\n"
-    "В статусе две сворачиваемые менюшки: 🔵 кандидаты и 🟡 боковики.\n"
-    "💰 текущая цена · 🎯~ примерная цена входа · 🚀 уровень пробоя.\n"
-    "✨ = T3/3 + свежий кросс (полная готовность).\n"
+    "🟢 Адаптивный BTC-фильтр: при БЛОК BTC сильные сигналы (T3/3 + score≥8) "
+    "проходят с уменьшенным размером ×0.5.\n"
+    "🔥 горячий боковик (≤1% до пробоя) · ⚡ готовится (≤3%) · 🟢 близко (≤5%).\n"
+    "💰 текущая цена · 🎯~ вход · 🚀 пробой · ✨ готов · 🥀 объём↓\n"
     "Команды: /stop — отписаться, /help — справка."
 )
 
@@ -706,13 +726,14 @@ def check_exit(results, pos):
         return True, "Разворот", r4h["close"]
     return False, "", 0.0
 
-def can_enter(pair, signal_risk_pct=None):
+def can_enter(pair, signal=None, signal_risk_pct=None):
     now = time.time()
     trade_times[:] = [t for t in trade_times if now - t < 3600]
     if not cb_can_trade():
         return False
     if not market_allows_longs():
-        return False
+        if signal is None or not is_strong_signal_for_blocked_market(signal):
+            return False
     old_state = state.get(pair, {})
     if old_state.get("position") == "open":
         return False
@@ -997,7 +1018,8 @@ def evaluate_ws_entry(df, symbol):
     if not _rr_ok(entry, stop, target):
         return None
     return {"entry": entry, "stop": stop, "target": target, "atr": atr_value,
-            "score": score, "parts": parts, "strategy": "ws_15m"}
+            "score": score, "parts": parts, "strategy": "ws_15m",
+            "trend_score": ti["score"]}
 
 def evaluate_ws_pullback(df, symbol):
     if not PULLBACK_ENABLED or len(df) < MIN_BARS + 1:
@@ -1044,7 +1066,7 @@ def evaluate_ws_pullback(df, symbol):
     if not _rr_ok(entry, stop, target):
         return None
     return {"entry": entry, "stop": stop, "target": target, "atr": atr_value,
-            "score": "PB",
+            "score": "PB", "trend_score": ti["score"],
             "parts": [f"Откат к EMA21 · тренд 3/3 · объём {vol_ratio:.1f}×"],
             "strategy": "ws_pullback"}
 
@@ -1081,23 +1103,30 @@ def evaluate_ws_retest(df, symbol, level):
     if not _rr_ok(entry, stop, target):
         return None
     mem["above"] = False
+    ti = get_trend(symbol)
     return {"entry": entry, "stop": stop, "target": target, "atr": atr_val,
-            "score": "RT",
+            "score": "RT", "trend_score": (ti["score"] if ti else 0),
             "parts": [f"Retest уровня {level:.6f} · отскок"],
             "strategy": "breakout_retest"}
 
 # ==================== ОТКРЫТИЕ ПОЗИЦИИ ====================
 def open_position(symbol, sig, closed_start):
+    btc_blocked = not market_allows_longs()
+    if btc_blocked and not is_strong_signal_for_blocked_market(sig):
+        return None
     risk_pct = (sig["entry"] - sig["stop"]) / sig["entry"] * 100
-    if not can_enter(symbol, risk_pct):
+    if not can_enter(symbol, signal=sig, signal_risk_pct=risk_pct):
         return None
     old_state = state.get(symbol, {})
     if old_state.get("last_signal_candle") == closed_start:
         return None
     rr = (sig["target"] - sig["entry"]) / (sig["entry"] - sig["stop"])
     atr_pct = sig["atr"] / sig["entry"] * 100
-    size = position_size_fraction(sig["score"] if isinstance(sig["score"], int) else 6,
-                                  rr, atr_pct, portfolio_risk_used(), risk_pct)
+    size = position_size_fraction(
+        sig["score"] if isinstance(sig["score"], int) else 6,
+        rr, atr_pct, portfolio_risk_used(), risk_pct,
+        btc_blocked=btc_blocked,
+    )
     new_state = old_state.copy()
     new_state.update({
         "position": "open",
@@ -1111,6 +1140,7 @@ def open_position(symbol, sig, closed_start):
         "strategy": sig["strategy"],
         "score": sig["score"],
         "size_fraction": size,
+        "btc_blocked_entry": btc_blocked,
     })
     state[symbol] = new_state
     trade_times.append(time.time())
@@ -1148,15 +1178,22 @@ def try_ws_breakout(symbol, new_candle, df):
         return None
     closed_start = int(df.iloc[-2]["start"])
     risk_pct = (entry - stop) / entry * 100
+    ti = get_trend(symbol)
+    trend_score = ti["score"] if ti else 0
+    pseudo_sig = {"trend_score": trend_score, "score": 7}
+    btc_blocked = not market_allows_longs()
+    if btc_blocked and not is_strong_signal_for_blocked_market(pseudo_sig):
+        return None
     with state_lock:
-        if not can_enter(symbol, risk_pct):
+        if not can_enter(symbol, signal=pseudo_sig, signal_risk_pct=risk_pct):
             return None
         old_state = state.get(symbol, {})
         if old_state.get("last_signal_candle") == closed_start:
             return None
         rr = (target - entry) / (entry - stop)
         size = position_size_fraction(7, rr, atr_val / entry * 100,
-                                      portfolio_risk_used(), risk_pct)
+                                      portfolio_risk_used(), risk_pct,
+                                      btc_blocked=btc_blocked)
         new_state = old_state.copy()
         new_state.update({
             "position": "open",
@@ -1170,6 +1207,7 @@ def try_ws_breakout(symbol, new_candle, df):
             "strategy": "breakout_ws",
             "score": "BWS",
             "size_fraction": size,
+            "btc_blocked_entry": btc_blocked,
         })
         state[symbol] = new_state
         trade_times.append(time.time())
@@ -1321,8 +1359,10 @@ def on_message(ws, message):
 
             breakout_sig = try_ws_breakout(symbol, new_candle, df)
             if breakout_sig:
+                btc_blocked = not market_allows_longs()
+                extra = " ⚠️BTC-БЛОК ×0.5" if btc_blocked else ""
                 send_telegram(
-                    f"📦 <b>ПРОБОЙ БОКОВИКА (WS)</b>\n"
+                    f"📦 <b>ПРОБОЙ БОКОВИКА (WS)</b>{extra}\n"
                     f"Пара: {tv_link(symbol)}\n"
                     f"Цена: {breakout_sig['entry']:.8f}\n"
                     f"SL: {breakout_sig['stop']:.8f} · TP: {breakout_sig['target']:.8f}\n"
@@ -1343,8 +1383,10 @@ def on_message(ws, message):
                 continue
             score_txt = (f" · score {sig['score']}/10"
                          if isinstance(sig["score"], int) else f" · {sig['score']}")
+            btc_blocked = not market_allows_longs()
+            extra = " ⚠️BTC-БЛОК ×0.5" if btc_blocked else ""
             send_telegram(
-                f"🟢 <b>ВХОД (WS{score_txt})</b>\n"
+                f"🟢 <b>ВХОД (WS{score_txt})</b>{extra}\n"
                 f"Пара: {tv_link(symbol)} · {sig['strategy']}\n"
                 f"Цена: {sig['entry']:.8f}\n"
                 f"SL: {sig['stop']:.8f} · TP: {sig['target']:.8f}\n"
@@ -1391,7 +1433,7 @@ TIMEFRAME_PARAMS = {
     "1w":  {"bybit_interval": "W",   "min_bars": 50,  "ema_fast": 10, "ema_slow": 30},
 }
 
-def try_open_breakout(pair, df_daily, current_price, now_iso):
+def try_open_breakout(pair, df_daily, current_price, now_iso, r4h=None):
     breakout = check_breakout(df_daily, current_price)
     if not breakout:
         return None
@@ -1401,8 +1443,14 @@ def try_open_breakout(pair, df_daily, current_price, now_iso):
     if stop_distance_pct < MIN_STOP_DISTANCE_PCT:
         return None
     risk_pct = (current_price - breakout["stop"]) / current_price * 100
+    ti = get_trend(pair)
+    trend_score = ti["score"] if ti else 0
+    pseudo_sig = {"trend_score": trend_score, "score": 7}
+    btc_blocked = not market_allows_longs()
+    if btc_blocked and not is_strong_signal_for_blocked_market(pseudo_sig):
+        return None
     with state_lock:
-        if not can_enter(pair, risk_pct):
+        if not can_enter(pair, signal=pseudo_sig, signal_risk_pct=risk_pct):
             return None
         old_state = state.get(pair, {})
         if old_state.get("last_signal_candle") == daily_closed_start:
@@ -1410,7 +1458,8 @@ def try_open_breakout(pair, df_daily, current_price, now_iso):
         rr = (breakout["target"] - current_price) / (current_price - breakout["stop"])
         atr_val = (current_price - breakout["stop"]) / ATR_MULT_SL
         size = position_size_fraction(7, rr, atr_val / current_price * 100,
-                                      portfolio_risk_used(), risk_pct)
+                                      portfolio_risk_used(), risk_pct,
+                                      btc_blocked=btc_blocked)
         new_state = old_state.copy()
         new_state.update({
             "position": "open", "entry_price": current_price,
@@ -1420,6 +1469,7 @@ def try_open_breakout(pair, df_daily, current_price, now_iso):
             "last_signal_candle": daily_closed_start,
             "strategy": "breakout", "score": "BO",
             "size_fraction": size,
+            "btc_blocked_entry": btc_blocked,
         })
         state[pair] = new_state
         trade_times.append(time.time())
@@ -1488,11 +1538,14 @@ def background_scan_loop():
                         consolidation_list.append({"pair": pair,
                                                     "current_price": current_price,
                                                     **cons})
-                    breakout = try_open_breakout(pair, df_daily, current_price, now_iso)
+                    breakout = try_open_breakout(pair, df_daily, current_price,
+                                                  now_iso, r4h=r4h)
                     if breakout:
                         found_buy += 1
+                        btc_blocked = not market_allows_longs()
+                        extra = " ⚠️BTC-БЛОК ×0.5" if btc_blocked else ""
                         send_telegram(
-                            f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>\n"
+                            f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>{extra}\n"
                             f"Пара: {tv_link(pair)}\n"
                             f"Цена: {current_price:.8f}\n"
                             f"SL: {breakout['stop']:.8f} · TP: {breakout['target']:.8f}\n"
@@ -1593,8 +1646,10 @@ def background_scan_loop():
                     breakout = try_open_breakout(pair, df_daily, current_price, now_iso)
                     if breakout:
                         found_buy += 1
+                        btc_blocked = not market_allows_longs()
+                        extra = " ⚠️BTC-БЛОК ×0.5" if btc_blocked else ""
                         send_telegram(
-                            f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>\n"
+                            f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>{extra}\n"
                             f"Пара: {tv_link(pair)}\n"
                             f"Цена: {current_price:.8f}\n"
                             f"SL: {breakout['stop']:.8f} · TP: {breakout['target']:.8f}\n"
@@ -1634,7 +1689,7 @@ def background_scan_loop():
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
 
-# ==================== СТАТУС: ОДНО СООБЩЕНИЕ (v19.7.3) ====================
+# ==================== СТАТУС: ОДНО СООБЩЕНИЕ (v19.8.1) ====================
 def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     with state_lock:
         open_snapshot = [(pair, dict(pos)) for pair, pos in state.items()
@@ -1649,11 +1704,15 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     breakout_strategies = ("breakout", "breakout_ws", "breakout_retest")
     now_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M")
 
+    btc_state_str = "OK" if mok else f"БЛОК: {mreason}"
+    if not mok and BTC_ALLOW_STRONG_WHEN_BLOCKED:
+        btc_state_str += " · сильные T3/3 score≥8 → ×0.5"
+
     header = [
-        f"📡 <b>СТАТУС v19.7.3 (Bybit)</b> | <i>{now_str} UTC</i>",
+        f"📡 <b>СТАТУС v19.8.1 (Bybit)</b> | <i>{now_str} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔹 Пар WS: <b>{len(PAIRS_WS)}</b> · Тренд 3/3: <b>{q3}</b>",
-        f"🔹 BTC: <b>{'OK' if mok else 'БЛОК: ' + mreason}</b>",
+        f"🔹 BTC: <b>{btc_state_str}</b>",
         f"🔹 Боковиков: <b>{len(consolidation_list)}</b> · "
         f"Позиций: <b>{len(open_snapshot)}/{MAX_OPEN_POSITIONS}</b>",
         f"🔹 Входов: <b>{found_buy}</b> · Выходов: <b>{found_sell}</b> · 👥 {subs_count}",
@@ -1671,6 +1730,8 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
                     f"🛑{pos.get('stop', 0):.8f} 🎯{pos.get('target', 0):.8f} · {et}")
             if pos.get("partial_done"):
                 line += " · 💰50%"
+            if pos.get("btc_blocked_entry"):
+                line += " · ⚠️BTC×0.5"
             pos_lines.append(line)
     else:
         pos_lines.append("💰 Позиций нет")
@@ -1685,8 +1746,15 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     valid_calls.sort(key=lambda s: (-s["trend_score"],
                                      s.get("macd_gap_pct", 999)))
 
-    consolidation_list = sorted(consolidation_list,
-                                key=lambda x: (-x["days"], x.get("vol_trend", 1.0)))
+    # Сортировка боковиков по % до пробоя (горячие сверху)
+    def _hot_score(item):
+        cur = item.get("current_price", 0)
+        lvl = item.get("upper_level", 0)
+        if cur <= 0 or lvl <= 0:
+            return 999
+        dist_pct = (lvl - cur) / cur * 100
+        return max(dist_pct, 0)
+    consolidation_list = sorted(consolidation_list, key=_hot_score)
 
     def cand_line(i, s, with_link):
         gap = s.get("macd_gap_pct", 0)
@@ -1700,30 +1768,41 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         is_ready = s["trend_score"] == 3 and gap < 0.5
         mark = "🟢" if is_ready else ("🟡" if hl else "")
         vol = s.get("vol_ratio", 0.0)
-        vol_txt = f" · V{vol:.1f}x" if vol >= MIN_VOL_MULT else ""
+        vol_txt = f" V{vol:.1f}x" if vol >= MIN_VOL_MULT else ""
         up = "↑" if s.get("adx_slope_up") else ""
-        ready_tag = " ✨" if is_ready else ""
-        # 💰 текущая цена · 🎯~ примерная цена входа (по закрытию сигнальной свечи)
+        ready_tag = "✨" if is_ready else ""
         cur = s.get("current_price") or s.get("close_price", 0)
         entry = s.get("close_price", 0)
-        return (f"{mark}{i}. {name}{ready_tag} · T{s['trend_score']}/3 · "
-                f"ADX{s['adx_1d']:.0f}{up} · RSI{s['rsi_4h']:.0f}{vol_txt} · "
-                f"💰{cur:.6g} 🎯~{entry:.6g} · {prox}")
+        return (f"{mark}{i}.{name}{ready_tag} T{s['trend_score']} "
+                f"ADX{s['adx_1d']:.0f}{up} RSI{s['rsi_4h']:.0f}{vol_txt} "
+                f"💰{cur:.6g} 🎯~{entry:.6g} {prox}")
 
     def cons_line(i, item, with_link):
-        dry = " 🥀" if item.get("vol_trend", 1.0) <= 0.9 else ""
-        ready = item.get("range_pct", 99) < 15.0 and item.get("adx", 99) < 15
+        dry = "🥀" if item.get("vol_trend", 1.0) <= 0.9 else ""
         name = tv_link(item["pair"]) if with_link else item["pair"]
-        mark = "🟢" if ready else ""
         cur = item.get("current_price", 0)
-        cur_txt = f" 💰{cur:.6g}" if cur else ""
-        return (f"{mark}{i}. {name} · {item['days']}д · {item['range_pct']:.1f}% · "
-                f"ADX{item['adx']:.0f}{dry} · 🚀{item['upper_level']:.6g}{cur_txt}")
+        lvl = item.get("upper_level", 0)
+        if cur > 0 and lvl > 0:
+            dist_pct = (lvl - cur) / cur * 100
+        else:
+            dist_pct = 999
+        if dist_pct <= HOT_DIST_PCT_1:
+            mark = "🔥"
+        elif dist_pct <= HOT_DIST_PCT_2:
+            mark = "⚡"
+        elif dist_pct <= HOT_DIST_PCT_3:
+            mark = "🟢"
+        else:
+            mark = ""
+        dist_txt = f"({dist_pct:.1f}%)" if dist_pct < 999 else ""
+        return (f"{mark}{i}.{name} {item['days']}д {item['range_pct']:.0f}% "
+                f"ADX{item['adx']:.0f}{dry} 🚀{lvl:.6g} 💰{cur:.6g}{dist_txt}")
 
     footer = [
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔄 Следующий статус через 2 ч · лимиты {MAX_OPEN_POSITIONS} поз / "
         f"{MAX_TRADES_PER_HOUR} в час",
+        "🔥≤1% ⚡≤3% 🟢≤5% — % до пробоя боковика",
         "💰 текущая · 🎯~ вход · 🚀 пробой · ✨ готов · 🥀 объём↓",
         "👇 Тапни 📈-ссылку в списке — график TradingView",
     ]
@@ -1762,8 +1841,8 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
             text = build(with_links, max_cand, max_cons)
             if len(text) <= TG_SAFE_LIMIT:
                 break
-            if max_cons > 6:
-                max_cons = max(6, max_cons - 10)
+            if max_cons > 25:
+                max_cons = max(25, max_cons - 10)
             elif max_cand > 3:
                 max_cand = max(3, max_cand - 3)
             else:
@@ -1772,7 +1851,7 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
             break
 
     if text is None or len(text) > TG_SAFE_LIMIT:
-        text = build(False, 3, 5)
+        text = build(False, 3, 25)
 
     _send_to_all_one(text)
     logger.info("Статус отправлен: %d символов, кандидатов %d, боковиков %d",
@@ -1786,7 +1865,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v19.7.3 «ONE-MSG» (Bybit) ...")
+    logger.info("Запуск бота v19.8.1 «BTC-ADAPTIVE+HOT» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
@@ -1806,6 +1885,7 @@ if __name__ == "__main__":
             pos.setdefault("breakeven_moved", False)
             pos.setdefault("highest_close", pos.get("entry_price", 0))
             pos.setdefault("size_fraction", 1.0)
+            pos.setdefault("btc_blocked_entry", False)
     save_state(state)
 
     refresh_market_context()
@@ -1854,12 +1934,12 @@ if __name__ == "__main__":
     threading.Thread(target=polling_loop, daemon=True).start()
 
     _send_to_all_one(
-        f"🟢 <b>СКАНЕР v19.7.3 «ONE-MSG» ЗАПУЩЕН</b>\n"
+        f"🟢 <b>СКАНЕР v19.8.1 «BTC-ADAPTIVE+HOT» ЗАПУЩЕН</b>\n"
         f"WS: {len(PAIRS_WS)} пар + динам. подписка\n"
         f"Тренд 3/3: {q3} · BTC: {'OK' if market_allows_longs() else 'БЛОК'}\n"
+        f"🟢 BTC-адаптив: при БЛОК сильные (T3/3+score≥8) → ×0.5\n"
+        f"🔥≤1% ⚡≤3% 🟢≤5% — сортировка боковиков по % до пробоя\n"
         f"Лимиты: {MAX_OPEN_POSITIONS} поз / {MAX_TRADES_PER_HOUR} в час · "
         f"порог score {MIN_SIGNAL_SCORE}/10\n"
-        f"📋 Статус = ОДНО сообщение: менюшки 🔵 и 🟡 открываются стрелкой\n"
-        f"💰 текущая · 🎯~ вход · 🚀 пробой\n"
         f"👥 Подписчиков: {len(SUBSCRIBERS)} · /start · /stop · /help")
     background_scan_loop()
