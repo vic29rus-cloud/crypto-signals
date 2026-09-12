@@ -2,18 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v19.8.2 «TOP-10 HOT» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
+BYBIT SCANNER v20.0 «WS-REALTIME-HOT» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
-НОВОЕ В v19.8.2 (относительно v19.8.1):
-• В статусе показываются РОВНО 10 кандидатов + 10 боковиков —
-  только самые горячие (ближайшие ко входу).
-• Ссылки TradingView работают ВСЕГДА (не жертвуем кликабельностью).
-• Убран fallback без ссылок — если не влезает, режем списки, но
-  ссылки сохраняем.
-• Все метки сохранены: 🔥⚡🟢✨⏳🟡⚠️↑🥀
-• В footer добавлена пометка "показаны 10 самых горячих".
+НОВОЕ В v20.0 (относительно v19.9.1):
+• ⚡ WS-REALTIME-HOT: отдельный WebSocket на канал `tickers` для горячих монет
+• Динамическая подписка: топ-10 кандидатов + топ-10 боковиков + близкие к алерту
+• На каждом тике — мгновенная проверка входа (не ждём 15m закрытия)
+• Автодополнение: раз в 15 минут сканируем все 200 пар и добавляем горячие
+• 🛡 PEAK-GUARD сохранён (RSI≤70, дрейф≤1%, топ-15% диапазона)
+• Все прежние функции: BTC-адаптив, circuit breaker, сектора, top-10+10.
 ==============================================================================
 """
 import json
@@ -68,7 +67,7 @@ RETEST_TOUCH_TOLERANCE_PCT = 0.8
 RETEST_SL_ATR = 1.5
 RETEST_TP_ATR = 4.0
 
-# --- АДАПТИВНЫЙ BTC-ФИЛЬТР ---
+# --- BTC-ФИЛЬТР ---
 BTC_CONTEXT_ENABLED = True
 BTC_CONTEXT_TTL = 300
 BTC_DROP_6H_PCT = -5.0
@@ -130,14 +129,31 @@ STATUS_ADX_MIN, STATUS_ADX_MAX = 18, 55
 STATUS_MIN_PRICE = 0.0001
 STATUS_READY_SCORE = 3
 
+# --- 🛡 PEAK-GUARD ---
+PEAK_GUARD_ENABLED = True
+PEAK_LOOKBACK_CANDLES = 20
+PEAK_MAX_POSITION_PCT = 85
+PEAK_MIN_DIST_TO_MAX_PCT = 1.5
+PEAK_MAX_RSI = 70
+PEAK_MAX_DRIFT_PCT = 1.0
+
 # --- ПОРОГИ «ГОРЯЧЕСТИ» БОКОВИКОВ ---
 HOT_DIST_PCT_1 = 1.0
 HOT_DIST_PCT_2 = 3.0
 HOT_DIST_PCT_3 = 5.0
 
-# --- ЛИМИТЫ ОТОБРАЖЕНИЯ В СТАТУСЕ ---
 MAX_SHOW_CANDIDATES = 10
 MAX_SHOW_CONSOLIDATIONS = 10
+
+# --- ⚡ WS-REALTIME-HOT (v20.0) ---
+WS_TICKERS_ENABLED = True
+WS_TICKERS_MAX_PAIRS = 40          # максимум пар в tickers-подписке
+WS_TICKERS_REFRESH_SEC = 900       # обновление списка (15 мин)
+WS_HOT_COOLDOWN_SEC = 60           # cooldown на попытку входа по одной паре
+WS_HOT_MIN_RR = 1.5
+WS_HOT_MIN_VOL = 1.2
+WS_HOT_BREAKOUT_VOL = 1.8
+WS_HOT_MAX_DRIFT_PCT = 1.0
 
 TREND_CACHE_REFRESH_SECONDS = 1800
 TREND_CACHE_INITIAL_LIMIT = 60
@@ -193,6 +209,20 @@ cb_lock = threading.Lock()
 SUBSCRIBERS = set()
 subscribers_lock = threading.RLock()
 MAIN_CHAT_ID = None
+
+# ⚡ Кэш горячих монет (обновляется при формировании статуса)
+HOT_PAIRS_CACHE = {"candidates": [], "consolidations": [], "ts": 0.0}
+HOT_PAIRS_LOCK = threading.RLock()
+HOT_LAST_CHECK = {}   # symbol -> ts последней попытки входа
+
+# ⚡ WebSocket tickers — текущие подписки
+WS_TICKER_PAIRS = set()
+WS_TICKER_PAIRS_LOCK = threading.RLock()
+WS_TICKERS_APP = None
+WS_TICKERS_CONNECTED = threading.Event()
+
+# 🛡 PEAK-GUARD: кэш последних проверок (для дедупликации алертов)
+LAST_PEAK_ALERT = {}  # symbol -> ts
 
 _http_failures = 0
 _http_open_until = 0.0
@@ -294,6 +324,51 @@ def is_strong_signal_for_blocked_market(signal):
         return False
     return (trend_score >= BTC_STRONG_MIN_TREND_SCORE
             and score >= BTC_STRONG_MIN_SCORE)
+
+# ==================== 🛡 PEAK-GUARD ====================
+def check_peak_guard(df, entry_price):
+    if not PEAK_GUARD_ENABLED:
+        return True, "", {}
+    try:
+        if df is None or len(df) < PEAK_LOOKBACK_CANDLES:
+            return True, "", {}
+        window = df.tail(PEAK_LOOKBACK_CANDLES)
+        local_high = float(window["high"].max())
+        local_low = float(window["low"].min())
+        if local_high <= local_low or entry_price <= 0:
+            return True, "", {}
+        position_pct = (entry_price - local_low) / (local_high - local_low) * 100
+        dist_to_max_pct = (local_high - entry_price) / entry_price * 100
+        metrics = {"position_pct": round(position_pct, 1),
+                   "dist_to_max_pct": round(dist_to_max_pct, 2),
+                   "local_high": local_high, "local_low": local_low}
+        if position_pct > PEAK_MAX_POSITION_PCT:
+            return False, f"цена в верхних {100 - PEAK_MAX_POSITION_PCT:.0f}% ({position_pct:.0f}%)", metrics
+        if dist_to_max_pct < PEAK_MIN_DIST_TO_MAX_PCT:
+            return False, f"слишком близко к максимуму ({dist_to_max_pct:.2f}%)", metrics
+        return True, "", metrics
+    except Exception as e:
+        logger.debug("peak_guard error: %s", e)
+        return True, "", {}
+
+def check_peak_guard_rsi(rsi_val):
+    if not PEAK_GUARD_ENABLED:
+        return True, ""
+    if rsi_val is None or pd.isna(rsi_val):
+        return True, ""
+    if rsi_val > PEAK_MAX_RSI:
+        return False, f"RSI {rsi_val:.0f} > {PEAK_MAX_RSI}"
+    return True, ""
+
+def check_peak_guard_drift(current_price, entry_price):
+    if not PEAK_GUARD_ENABLED:
+        return True, ""
+    if entry_price <= 0 or current_price <= 0:
+        return True, ""
+    drift_pct = abs(current_price - entry_price) / entry_price * 100
+    if drift_pct > PEAK_MAX_DRIFT_PCT:
+        return False, f"цена ушла на {drift_pct:.1f}%"
+    return True, ""
 
 # ==================== СЕКТОРА И РАЗМЕР ====================
 def sector_of(symbol):
@@ -442,12 +517,12 @@ def tv_link(symbol: str) -> str:
     return f'<a href="{url}">📈 {symbol}</a>'
 
 HELP_TEXT = (
-    "📡 <b>Bybit Scanner v19.8.2 — справка</b>\n"
+    "📡 <b>Bybit Scanner v20.0 — справка</b>\n"
     "Бот шлёт: входы/выходы, частичные TP и ОДИН статус каждые 2 часа.\n"
-    "🟢 BTC-адаптив: при БЛОК сильные (T3/3+score≥8) → размер ×0.5.\n"
+    "⚡ WS-REALTIME-HOT: мгновенная цена для топ-40 горячих монет.\n"
+    "🛡 PEAK-GUARD: не входим на пике (RSI≤70, дрейф≤1%).\n"
     "🔥≤1% ⚡≤3% 🟢≤5% — сортировка боковиков по % до пробоя.\n"
-    "💰 текущая · 🎯~ вход · 🚀 пробой · ✨ готов · 🥀 объём↓\n"
-    "Показываются 10 самых горячих кандидатов и 10 ближайших боковиков.\n"
+    "💰 текущая · 🎯~ вход · 🚀 пробой · ✨ готов · 🥀 объём↓ · ⛔ пик\n"
     "Команды: /stop — отписаться, /help — справка."
 )
 
@@ -1150,7 +1225,7 @@ def open_position(symbol, sig, closed_start):
     save_state(state)
     return new_state
 
-# ==================== БЫСТРЫЙ BREAKOUT ЧЕРЕЗ WS ====================
+# ==================== БЫСТРЫЙ BREAKOUT ЧЕРЕЗ WS (kline) ====================
 def try_ws_breakout(symbol, new_candle, df):
     with breakout_cache_lock:
         level = breakout_cache.get(symbol)
@@ -1218,9 +1293,221 @@ def try_ws_breakout(symbol, new_candle, df):
     return {"entry": entry, "stop": stop, "target": target,
             "vol_ratio": vol_ratio, "level": level}
 
-# ==================== WEBSOCKET ====================
+# ==================== ⚡ WS-REALTIME-HOT (v20.0) ====================
+def update_ticker_subscription():
+    """
+    Обновляет список пар для подписки на tickers-канал.
+    Основа: HOT_PAIRS_CACHE (топ-10 кандидатов + топ-10 боковиков).
+    Дополняем: монеты из 200, близкие к алерту (<3% до пробоя, gap<0.5%).
+    Максимум WS_TICKERS_MAX_PAIRS.
+    """
+    if not WS_TICKERS_ENABLED:
+        return
+    with HOT_PAIRS_LOCK:
+        cands = list(HOT_PAIRS_CACHE["candidates"])
+        cons = list(HOT_PAIRS_CACHE["consolidations"])
+    base_symbols = set()
+    for s in cands:
+        base_symbols.add(s["pair"])
+    for item in cons:
+        base_symbols.add(item["pair"])
+    # Дополняем: близкие к алертам из всех 200 пар
+    with state_lock:
+        open_pairs = set(p for p, v in state.items() if v.get("position") == "open")
+    for sym in PAIRS_WS:
+        if len(base_symbols) >= WS_TICKERS_MAX_PAIRS:
+            break
+        if sym in base_symbols:
+            continue
+        # Проверяем: есть ли в breakout_cache (боковик) и близко ли
+        with breakout_cache_lock:
+            lvl = breakout_cache.get(sym)
+        if lvl and lvl > 0:
+            # Найдём текущую цену из ohlc_buffers
+            buf = ohlc_buffers.get(sym)
+            if buf and len(buf) > 0:
+                cur = float(buf[-1]["close"])
+                if cur > 0 and (lvl - cur) / cur * 100 < 3.0:
+                    base_symbols.add(sym)
+                    continue
+    new_subset = set(list(base_symbols)[:WS_TICKERS_MAX_PAIRS])
+    # Сравниваем с текущей подпиской
+    with WS_TICKER_PAIRS_LOCK:
+        old_subset = set(WS_TICKER_PAIRS)
+    to_add = new_subset - old_subset
+    to_remove = old_subset - new_subset
+    if not to_add and not to_remove:
+        return
+    # Обновляем WS-подписку
+    app = WS_TICKERS_APP
+    if app is not None and WS_TICKERS_CONNECTED.is_set():
+        try:
+            if to_add:
+                args = [f"tickers.{s}" for s in to_add]
+                for i in range(0, len(args), 100):
+                    app.send(json.dumps({"op": "subscribe",
+                                         "args": args[i:i + 100]}))
+            if to_remove:
+                args = [f"tickers.{s}" for s in to_remove]
+                for i in range(0, len(args), 100):
+                    app.send(json.dumps({"op": "unsubscribe",
+                                         "args": args[i:i + 100]}))
+            logger.info("⚡ WS-tickers обновлён: +%d -%d (всего %d)",
+                        len(to_add), len(to_remove), len(new_subset))
+        except Exception as e:
+            logger.warning("WS-tickers send error: %s", e)
+    with WS_TICKER_PAIRS_LOCK:
+        WS_TICKER_PAIRS.clear()
+        WS_TICKER_PAIRS.update(new_subset)
+
+def _open_on_tick(symbol, cur_price, source="tick"):
+    """Проверяет возможность входа на текущем тике (для hot-пары)."""
+    if not WS_TICKERS_ENABLED:
+        return
+    # Cooldown
+    now_ts = time.time()
+    last = HOT_LAST_CHECK.get(symbol, 0)
+    if now_ts - last < WS_HOT_COOLDOWN_SEC:
+        return
+    # Проверяем, что это кандидат или боковик
+    with HOT_PAIRS_LOCK:
+        cands = HOT_PAIRS_CACHE["candidates"]
+        cons = HOT_PAIRS_CACHE["consolidations"]
+    cand = next((s for s in cands if s["pair"] == symbol), None)
+    con = next((item for item in cons if item["pair"] == symbol), None)
+    if not cand and not con:
+        return
+    buf = ohlc_buffers.get(symbol)
+    if not buf or len(buf) < MIN_BARS + 1:
+        return
+    df = pd.DataFrame(list(buf))
+    if len(df) < MIN_BARS:
+        return
+    df["ema_fast"] = ema(df["close"], 9)
+    df["ema_slow"] = ema(df["close"], 21)
+    df["macd_line"] = ema(df["close"], 12) - ema(df["close"], 26)
+    df["macd_signal"] = ema(df["macd_line"], 9)
+    df["atr"] = atr(df)
+    df["rsi"] = rsi(df["close"])
+    df["adx"] = adx(df)
+    df["vol_sma"] = df["volume"].rolling(20).mean()
+    df["adx_slope_up"] = df["adx"] > df["adx"].shift(3)
+    df["ema_cross_up"] = ((df["ema_fast"] > df["ema_slow"])
+                          & (df["ema_fast"].shift(1) <= df["ema_slow"].shift(1)))
+    df["vol_ratio"] = df["volume"] / df["vol_sma"].replace(0, np.nan)
+
+    # --- Проверка кандидата ---
+    if cand:
+        entry_ref = cand.get("close_price", 0)
+        if entry_ref > 0:
+            drift_ok, _ = check_peak_guard_drift(cur_price, entry_ref)
+            if not drift_ok:
+                return
+        sig = evaluate_ws_entry(df, symbol)
+        if sig is None:
+            return
+        peak_ok, peak_reason, _ = check_peak_guard(df, cur_price)
+        if not peak_ok:
+            if now_ts - LAST_PEAK_ALERT.get(symbol, 0) > 600:
+                logger.info("⛔ HOT cand %s: %s", symbol, peak_reason)
+                LAST_PEAK_ALERT[symbol] = now_ts
+            return
+        rsi_ok, rsi_reason = check_peak_guard_rsi(float(df["rsi"].iloc[-2]))
+        if not rsi_ok:
+            return
+        rr = (sig["target"] - sig["entry"]) / (sig["entry"] - sig["stop"])
+        if rr < WS_HOT_MIN_RR:
+            return
+        HOT_LAST_CHECK[symbol] = now_ts
+        with state_lock:
+            opened = open_position(symbol, sig, int(df.iloc[-2]["start"]))
+        if opened:
+            logger.info("⚡ WS-REALTIME ВХОД (cand) %s @ %.6g", symbol, sig["entry"])
+            btc_blocked = not market_allows_longs()
+            extra = " ⚠️BTC-БЛОК ×0.5" if btc_blocked else ""
+            send_telegram(
+                f"⚡ <b>WS-REALTIME ВХОД</b>{extra}\n"
+                f"Пара: {tv_link(symbol)}\n"
+                f"Цена: {sig['entry']:.8f}\n"
+                f"SL: {sig['stop']:.8f} · TP: {sig['target']:.8f}\n"
+                f"<i>{' · '.join(sig['parts'])}</i>")
+        return
+
+    # --- Проверка боковика ---
+    if con:
+        lvl = con.get("upper_level", 0)
+        if lvl <= 0:
+            return
+        if cur_price < lvl * (1 + BREAKOUT_MIN_TRIGGER_PCT / 100):
+            return
+        if cur_price > lvl * (1 + MAX_BREAKOUT_DISTANCE_PCT / 100):
+            return
+        vol_ratio = (float(df["volume"].iloc[-1] / df["vol_sma"].iloc[-1])
+                     if not pd.isna(df["vol_sma"].iloc[-1]) and df["vol_sma"].iloc[-1] > 0 else 0.0)
+        if vol_ratio < WS_HOT_BREAKOUT_VOL:
+            return
+        peak_ok, _, _ = check_peak_guard(df, cur_price)
+        if not peak_ok:
+            return
+        atr_val = float(df["atr"].iloc[-2]) if not pd.isna(df["atr"].iloc[-2]) else 0.0
+        if atr_val <= 0:
+            return
+        entry = cur_price
+        stop = entry - atr_val * ATR_MULT_SL
+        target = entry + atr_val * ATR_MULT_TP
+        if stop >= entry or target <= entry:
+            return
+        if (entry - stop) / entry * 100 < MIN_STOP_DISTANCE_PCT:
+            return
+        rr = (target - entry) / (entry - stop)
+        if rr < WS_HOT_MIN_RR:
+            return
+        ti = get_trend(symbol)
+        trend_score = ti["score"] if ti else 0
+        pseudo_sig = {"trend_score": trend_score, "score": 7}
+        btc_blocked = not market_allows_longs()
+        if btc_blocked and not is_strong_signal_for_blocked_market(pseudo_sig):
+            return
+        HOT_LAST_CHECK[symbol] = now_ts
+        with state_lock:
+            if not can_enter(symbol, signal=pseudo_sig,
+                             signal_risk_pct=(entry - stop) / entry * 100):
+                return
+            old_state = state.get(symbol, {})
+            closed_start = int(df.iloc[-2]["start"]) if len(df) >= 2 else 0
+            if old_state.get("last_signal_candle") == closed_start:
+                return
+            size = position_size_fraction(7, rr, atr_val / entry * 100,
+                                          portfolio_risk_used(),
+                                          (entry - stop) / entry * 100,
+                                          btc_blocked=btc_blocked)
+            new_state = old_state.copy()
+            new_state.update({
+                "position": "open", "entry_price": entry,
+                "stop": stop, "target": target, "atr_ref": atr_val,
+                "entry_time": datetime.now(timezone.utc).isoformat(),
+                "last_signal_candle": closed_start,
+                "last_entry_ts": time.time(),
+                "strategy": "breakout_realtime", "score": "RT",
+                "size_fraction": size,
+                "btc_blocked_entry": btc_blocked,
+            })
+            state[symbol] = new_state
+            trade_times.append(time.time())
+            save_state(state)
+        logger.info("⚡ WS-REALTIME ПРОБОЙ %s @ %.6g (уровень %.6g, vol ×%.1f)",
+                    symbol, entry, lvl, vol_ratio)
+        extra = " ⚠️BTC-БЛОК ×0.5" if btc_blocked else ""
+        send_telegram(
+            f"⚡ <b>WS-REALTIME ПРОБОЙ</b>{extra}\n"
+            f"Пара: {tv_link(symbol)}\n"
+            f"Уровень: {lvl:.6g} → цена {entry:.6g}\n"
+            f"SL: {stop:.8f} · TP: {target:.8f}\n"
+            f"Объём: ×{vol_ratio:.1f}")
+
+# ==================== WEBSOCKET: KLINE (основной) ====================
 def on_open(ws):
-    logger.info("WebSocket подключен. Подписка на %d пар...", len(PAIRS_WS))
+    logger.info("WS kline подключен. Подписка на %d пар...", len(PAIRS_WS))
     args = [f"kline.{TIMEFRAME}.{p}" for p in PAIRS_WS]
     for i in range(0, len(args), 100):
         ws.send(json.dumps({"op": "subscribe", "args": args[i:i + 100]}))
@@ -1380,6 +1667,15 @@ def on_message(ws, message):
                 sig = evaluate_ws_pullback(df, symbol)
             if sig is None:
                 continue
+            cur_price_ws = float(new_candle["close"])
+            peak_ok, peak_reason, _ = check_peak_guard(df, cur_price_ws)
+            if not peak_ok:
+                logger.info("⛔ PEAK-GUARD отклонил %s: %s", symbol, peak_reason)
+                continue
+            rsi_ok, rsi_reason = check_peak_guard_rsi(float(df["rsi"].iloc[-2]))
+            if not rsi_ok:
+                logger.info("⛔ PEAK-GUARD (RSI) отклонил %s: %s", symbol, rsi_reason)
+                continue
             with state_lock:
                 opened = open_position(symbol, sig, closed_start)
             if opened is None:
@@ -1395,7 +1691,7 @@ def on_message(ws, message):
                 f"SL: {sig['stop']:.8f} · TP: {sig['target']:.8f}\n"
                 f"<i>{' · '.join(sig['parts'])}</i>")
     except Exception as e:
-        logger.error("Ошибка WebSocket: %s", e)
+        logger.error("Ошибка WS kline: %s", e)
 
 def on_error(ws, error):
     logger.error("WS ошибка: %s", error)
@@ -1426,6 +1722,96 @@ def watchdog_loop():
                 WS_APP.close()
             except Exception:
                 pass
+
+# ==================== ⚡ WEBSOCKET TICKERS ====================
+def on_tickers_open(ws):
+    logger.info("⚡ WS tickers подключен. Подписка на %d пар...",
+                len(WS_TICKER_PAIRS))
+    WS_TICKERS_CONNECTED.set()
+    with WS_TICKER_PAIRS_LOCK:
+        pairs = list(WS_TICKER_PAIRS)
+    if pairs:
+        args = [f"tickers.{s}" for s in pairs]
+        for i in range(0, len(args), 100):
+            try:
+                ws.send(json.dumps({"op": "subscribe",
+                                    "args": args[i:i + 100]}))
+            except Exception as e:
+                logger.warning("WS tickers subscribe error: %s", e)
+            time.sleep(0.1)
+    threading.Thread(target=tickers_pinger, args=(ws,), daemon=True).start()
+
+def tickers_pinger(ws):
+    while True:
+        time.sleep(20)
+        try:
+            ws.send(json.dumps({"op": "ping"}))
+        except Exception:
+            return
+
+def on_tickers_message(ws, message):
+    try:
+        data = json.loads(message)
+        if data.get("topic", "").startswith("tickers."):
+            for item in data.get("data", []):
+                symbol = item.get("symbol", "")
+                if symbol not in WS_TICKER_PAIRS:
+                    continue
+                try:
+                    cur_price = float(item.get("lastPrice", 0))
+                except (TypeError, ValueError):
+                    continue
+                if cur_price <= 0:
+                    continue
+                # Обновляем последнюю свечу в ohlc_buffers текущей ценой
+                buf = ohlc_buffers.get(symbol)
+                if buf and len(buf) > 0:
+                    buf[-1]["close"] = cur_price
+                    if cur_price > buf[-1]["high"]:
+                        buf[-1]["high"] = cur_price
+                    if cur_price < buf[-1]["low"]:
+                        buf[-1]["low"] = cur_price
+                # Проверяем вход
+                _open_on_tick(symbol, cur_price, source="tick")
+    except Exception as e:
+        logger.error("Ошибка WS tickers: %s", e)
+
+def on_tickers_error(ws, error):
+    logger.error("WS tickers ошибка: %s", error)
+
+def on_tickers_close(ws, close_status_code, close_msg):
+    logger.warning("WS tickers закрыт (%s). Переподключение...", close_status_code)
+    WS_TICKERS_CONNECTED.clear()
+    time.sleep(5)
+
+def run_tickers_websocket():
+    global WS_TICKERS_APP
+    while True:
+        WS_TICKERS_APP = websocket.WebSocketApp(
+            WS_URL,
+            on_open=on_tickers_open,
+            on_message=on_tickers_message,
+            on_error=on_tickers_error,
+            on_close=on_tickers_close,
+        )
+        try:
+            WS_TICKERS_APP.run_forever(ping_interval=30, ping_timeout=10)
+        except Exception as e:
+            logger.error("WS tickers критическая ошибка: %s", e)
+        WS_TICKERS_CONNECTED.clear()
+        time.sleep(5)
+
+def tickers_refresh_loop():
+    """Раз в WS_TICKERS_REFRESH_SEC обновляет список подписок tickers."""
+    first = True
+    while True:
+        if not first:
+            time.sleep(WS_TICKERS_REFRESH_SEC)
+        first = False
+        try:
+            update_ticker_subscription()
+        except Exception as e:
+            logger.error("update_ticker_subscription: %s", e)
 
 # ==================== ФОНОВОЕ СКАНИРОВАНИЕ ====================
 TIMEFRAME_PARAMS = {
@@ -1687,12 +2073,17 @@ def background_scan_loop():
                 logger.error("Ошибка очистки state: %s", e)
 
             send_status(scan_summary, consolidation_list, found_buy, found_sell)
+            # ⚡ Обновляем WS-tickers после нового статуса
+            try:
+                update_ticker_subscription()
+            except Exception as e:
+                logger.error("update_ticker_subscription (status): %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
         except Exception as e:
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
 
-# ==================== СТАТУС: ОДНО СООБЩЕНИЕ (v19.8.2) ====================
+# ==================== СТАТУС: ОДНО СООБЩЕНИЕ (v20.0) ====================
 def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     with state_lock:
         open_snapshot = [(pair, dict(pos)) for pair, pos in state.items()
@@ -1703,8 +2094,10 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         mok, mreason = market_context["ok"], market_context["reason"]
     with subscribers_lock:
         subs_count = len(SUBSCRIBERS)
+    with WS_TICKER_PAIRS_LOCK:
+        tickers_count = len(WS_TICKER_PAIRS)
 
-    breakout_strategies = ("breakout", "breakout_ws", "breakout_retest")
+    breakout_strategies = ("breakout", "breakout_ws", "breakout_retest", "breakout_realtime")
     now_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M")
 
     btc_state_str = "OK" if mok else f"БЛОК: {mreason}"
@@ -1712,13 +2105,15 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         btc_state_str += " · сильные T3/3 score≥8 → ×0.5"
 
     header = [
-        f"📡 <b>СТАТУС v19.8.2 (Bybit)</b> | <i>{now_str} UTC</i>",
+        f"📡 <b>СТАТУС v20.0 (Bybit)</b> | <i>{now_str} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
-        f"🔹 Пар WS: <b>{len(PAIRS_WS)}</b> · Тренд 3/3: <b>{q3}</b>",
+        f"🔹 Пар WS kline: <b>{len(PAIRS_WS)}</b> · Тренд 3/3: <b>{q3}</b>",
+        f"🔹 ⚡ WS tickers: <b>{tickers_count}</b> горячих пар (мгновенная цена)",
         f"🔹 BTC: <b>{btc_state_str}</b>",
         f"🔹 Боковиков: <b>{len(consolidation_list)}</b> · "
         f"Позиций: <b>{len(open_snapshot)}/{MAX_OPEN_POSITIONS}</b>",
         f"🔹 Входов: <b>{found_buy}</b> · Выходов: <b>{found_sell}</b> · 👥 {subs_count}",
+        f"🔹 🛡 PEAK-GUARD: <b>{'ON' if PEAK_GUARD_ENABLED else 'OFF'}</b>",
     ]
     if not cb_can_trade():
         header.append("🔹 🛑 Circuit breaker: <b>входы на паузе</b>")
@@ -1739,7 +2134,6 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     else:
         pos_lines.append("💰 Позиций нет")
 
-    # Фильтр кандидатов (cosmetic)
     valid_calls = [
         s for s in scan_summary
         if s["trend_score"] >= 2
@@ -1750,7 +2144,6 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     valid_calls.sort(key=lambda s: (-s["trend_score"],
                                      s.get("macd_gap_pct", 999)))
 
-    # Сортировка боковиков по % до пробоя (горячие сверху)
     def _hot_score(item):
         cur = item.get("current_price", 0)
         lvl = item.get("upper_level", 0)
@@ -1760,9 +2153,13 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         return max(dist_pct, 0)
     consolidation_list = sorted(consolidation_list, key=_hot_score)
 
-    # Ограничение показа: 10 + 10
     valid_calls = valid_calls[:MAX_SHOW_CANDIDATES]
     consolidation_list = consolidation_list[:MAX_SHOW_CONSOLIDATIONS]
+
+    with HOT_PAIRS_LOCK:
+        HOT_PAIRS_CACHE["candidates"] = list(valid_calls)
+        HOT_PAIRS_CACHE["consolidations"] = list(consolidation_list)
+        HOT_PAIRS_CACHE["ts"] = time.time()
 
     def cand_line(i, s, with_link):
         gap = s.get("macd_gap_pct", 0)
@@ -1773,17 +2170,35 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         else:
             prox, hl = "⚠️", False
         name = tv_link(s["pair"]) if with_link else s["pair"]
-        is_ready = s["trend_score"] == 3 and gap < 0.5
-        mark = "🟢" if is_ready else ("🟡" if hl else "")
+        cur = s.get("current_price") or s.get("close_price", 0)
+        entry = s.get("close_price", 0)
+        buf = ohlc_buffers.get(s["pair"])
+        peak_ok, peak_reason, _ = (True, "", {})
+        if buf and len(buf) >= PEAK_LOOKBACK_CANDLES:
+            df_pk = pd.DataFrame(list(buf))
+            peak_ok, peak_reason, _ = check_peak_guard(df_pk, cur)
+        drift_pct = abs(cur - entry) / entry * 100 if entry > 0 else 0
+        drift_ok = drift_pct <= PEAK_MAX_DRIFT_PCT
+        is_ready = (s["trend_score"] == 3 and gap < 0.5
+                    and peak_ok and drift_ok)
+        if is_ready:
+            mark = "🟢"
+        elif not peak_ok:
+            mark = "⛔"
+        elif not drift_ok:
+            mark = "⚠️"
+        elif hl:
+            mark = "🟡"
+        else:
+            mark = ""
         vol = s.get("vol_ratio", 0.0)
         vol_txt = f" V{vol:.1f}x" if vol >= MIN_VOL_MULT else ""
         up = "↑" if s.get("adx_slope_up") else ""
         ready_tag = "✨" if is_ready else ""
-        cur = s.get("current_price") or s.get("close_price", 0)
-        entry = s.get("close_price", 0)
+        drift_txt = f" ⚠️+{drift_pct:.1f}%" if not drift_ok else ""
         return (f"{mark}{i}.{name}{ready_tag} T{s['trend_score']} "
                 f"ADX{s['adx_1d']:.0f}{up} RSI{s['rsi_4h']:.0f}{vol_txt} "
-                f"💰{cur:.6g} 🎯~{entry:.6g} {prox}")
+                f"💰{cur:.6g} 🎯~{entry:.6g}{drift_txt} {prox}")
 
     def cons_line(i, item, with_link):
         dry = "🥀" if item.get("vol_trend", 1.0) <= 0.9 else ""
@@ -1810,11 +2225,12 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔄 Следующий статус через 2 ч · лимиты {MAX_OPEN_POSITIONS} поз / "
         f"{MAX_TRADES_PER_HOUR} в час",
-        f"ℹ️ Показаны {MAX_SHOW_CANDIDATES} самых горячих кандидатов "
-        f"и {MAX_SHOW_CONSOLIDATIONS} ближайших боковиков.",
-        "🔥≤1% ⚡≤3% 🟢≤5% — % до пробоя боковика",
-        "💰 текущая · 🎯~ вход · 🚀 пробой · ✨ готов · 🥀 объём↓",
-        "👇 Тапни 📈-ссылку в списке — график TradingView",
+        f"ℹ️ Показаны {MAX_SHOW_CANDIDATES} кандидатов + "
+        f"{MAX_SHOW_CONSOLIDATIONS} боковиков.",
+        f"⚡ WS-tickers следит за {tickers_count} горячими монетами в реальном времени",
+        "🛡 PEAK-GUARD: не входим на пике (RSI≤70, дрейф≤1%, топ-15%)",
+        "🔥≤1% ⚡≤3% 🟢≤5% — % до пробоя · 🥀 объём↓ · ⛔ пик · ⚠️ дрейф",
+        "👇 Тапни 📈-ссылку — TradingView",
     ]
 
     def build(with_links, max_cand, max_cons):
@@ -1840,7 +2256,6 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         lines += footer
         return "\n".join(lines)
 
-    # ВСЕГДА со ссылками. Если не влезает — режем по одному, но ссылки сохраняем.
     text = build(True, len(valid_calls), len(consolidation_list))
     if len(text) > TG_SAFE_LIMIT:
         for max_cand in range(len(valid_calls), 2, -1):
@@ -1854,8 +2269,8 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         text = build(True, 5, 5)
 
     _send_to_all_one(text)
-    logger.info("Статус отправлен: %d символов, кандидатов %d, боковиков %d",
-                len(text), len(valid_calls), len(consolidation_list))
+    logger.info("Статус: %d символов, кандидатов %d, боковиков %d, tickers %d",
+                len(text), len(valid_calls), len(consolidation_list), tickers_count)
 
 # ==================== MAIN ====================
 def handle_stop(signum, _frame):
@@ -1865,7 +2280,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v19.8.2 «TOP-10 HOT» (Bybit) ...")
+    logger.info("Запуск бота v20.0 «WS-REALTIME-HOT» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
@@ -1927,21 +2342,25 @@ if __name__ == "__main__":
                 last_processed_closed[pair] = int(list(ohlc_buffers[pair])[-2]["start"])
         time.sleep(0.1)
 
+    # Стартуем потоки
     threading.Thread(target=run_websocket, daemon=True).start()
     threading.Thread(target=watchdog_loop, daemon=True).start()
     threading.Thread(target=trend_cache_loop, daemon=True).start()
     threading.Thread(target=market_context_loop, daemon=True).start()
     threading.Thread(target=polling_loop, daemon=True).start()
+    # ⚡ WS-tickers
+    threading.Thread(target=run_tickers_websocket, daemon=True).start()
+    threading.Thread(target=tickers_refresh_loop, daemon=True).start()
 
     _send_to_all_one(
-        f"🟢 <b>СКАНЕР v19.8.2 «TOP-10 HOT» ЗАПУЩЕН</b>\n"
-        f"WS: {len(PAIRS_WS)} пар + динам. подписка\n"
+        f"🟢 <b>СКАНЕР v20.0 «WS-REALTIME-HOT» ЗАПУЩЕН</b>\n"
+        f"WS kline: {len(PAIRS_WS)} пар · динам. подписка\n"
+        f"⚡ WS tickers: до {WS_TICKERS_MAX_PAIRS} горячих пар в реальном времени\n"
         f"Тренд 3/3: {q3} · BTC: {'OK' if market_allows_longs() else 'БЛОК'}\n"
+        f"🛡 PEAK-GUARD: не входим на пике (RSI≤{PEAK_MAX_RSI}, "
+        f"дрейф≤{PEAK_MAX_DRIFT_PCT}%)\n"
         f"🟢 BTC-адаптив: при БЛОК сильные (T3/3+score≥8) → ×0.5\n"
-        f"🔥≤1% ⚡≤3% 🟢≤5% — сортировка боковиков по % до пробоя\n"
         f"ℹ️ Показ: {MAX_SHOW_CANDIDATES} кандидатов + "
-        f"{MAX_SHOW_CONSOLIDATIONS} боковиков (все со ссылками TradingView)\n"
-        f"Лимиты: {MAX_OPEN_POSITIONS} поз / {MAX_TRADES_PER_HOUR} в час · "
-        f"порог score {MIN_SIGNAL_SCORE}/10\n"
+        f"{MAX_SHOW_CONSOLIDATIONS} боковиков\n"
         f"👥 Подписчиков: {len(SUBSCRIBERS)} · /start · /stop · /help")
     background_scan_loop()
