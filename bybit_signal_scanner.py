@@ -2,16 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v19.8.0 «BTC-ADAPTIVE» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
+BYBIT SCANNER v19.9.1 «REALTIME-HOT + PEAK-GUARD» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
-НОВОЕ В v19.8.0 (Вариант C — адаптивный BTC-фильтр):
-• Ослаблен жёсткий BTC-фильтр: -5% за 6ч (было -3%), ADX>35 (было 25).
-  Теперь бот блокируется только при РЕАЛЬНО сильном нисходящем тренде BTC.
-• Разрешение сильных сигналов при БЛОК: если T3/3 + score >= 8 — вход
-  РАЗРЕШЁН, но размер позиции автоматически режется на 50%.
-• Всё остальное как в v19.7.3: интерфейс, подписки, 💰/🎯~/🚀, свёртки.
+НОВОЕ В v19.9.1 (относительно v19.9.0):
+• 🛡 PEAK-GUARD — защита от входа на локальном максимуме:
+  - цена не должна быть в верхних 15% диапазона последних 20 свечей
+  - расстояние до локального максимума ≥ 1.5%
+  - RSI ≤ 70 (не перекуплен)
+  - дрейф от 🎯~ ≤ 1% (сигнал свежий)
+• Проверка работает и в WS-входе, и в hot_monitor, и в cosmetic-метке статуса.
+• Метка 🛡 — «peak-guard прошёл, можно входить».
+• Метка ⛔ — «упущен, цена у пика» — показываем, но не входим.
 ==============================================================================
 """
 import json
@@ -66,16 +69,15 @@ RETEST_TOUCH_TOLERANCE_PCT = 0.8
 RETEST_SL_ATR = 1.5
 RETEST_TP_ATR = 4.0
 
-# --- АДАПТИВНЫЙ BTC-ФИЛЬТР (v19.8.0, Вариант C) ---
+# --- BTC-ФИЛЬТР ---
 BTC_CONTEXT_ENABLED = True
 BTC_CONTEXT_TTL = 300
-BTC_DROP_6H_PCT = -5.0                # ослаблено (было -3.0)
-BTC_ADX_BLOCK_THRESHOLD = 35          # ослаблено (было 25)
-# Разрешение сильных сигналов при БЛОК:
+BTC_DROP_6H_PCT = -5.0
+BTC_ADX_BLOCK_THRESHOLD = 35
 BTC_ALLOW_STRONG_WHEN_BLOCKED = True
-BTC_STRONG_MIN_TREND_SCORE = 3        # T3/3
-BTC_STRONG_MIN_SCORE = 8              # score >= 8
-BTC_STRONG_SIZE_MULT = 0.5            # размер позиции ×0.5
+BTC_STRONG_MIN_TREND_SCORE = 3
+BTC_STRONG_MIN_SCORE = 8
+BTC_STRONG_SIZE_MULT = 0.5
 
 CB_MAX_CONSEC_LOSSES = 4
 CB_PAUSE_SECONDS = 6 * 3600
@@ -128,6 +130,32 @@ STATUS_RSI_MIN, STATUS_RSI_MAX = 35, 75
 STATUS_ADX_MIN, STATUS_ADX_MAX = 18, 55
 STATUS_MIN_PRICE = 0.0001
 STATUS_READY_SCORE = 3
+
+# --- 🛡 PEAK-GUARD (v19.9.1) ---
+PEAK_GUARD_ENABLED = True
+PEAK_LOOKBACK_CANDLES = 20        # последних N свечей для расчёта диапазона
+PEAK_MAX_POSITION_PCT = 85        # цена не в верхних 15% диапазона
+PEAK_MIN_DIST_TO_MAX_PCT = 1.5    # минимум 1.5% до локального максимума
+PEAK_MAX_RSI = 70                 # не входить при RSI > 70
+PEAK_MAX_DRIFT_PCT = 1.0          # цена не ушла от 🎯~ > 1%
+
+# --- ПОРОГИ «ГОРЯЧЕСТИ» БОКОВИКОВ ---
+HOT_DIST_PCT_1 = 1.0
+HOT_DIST_PCT_2 = 3.0
+HOT_DIST_PCT_3 = 5.0
+
+# --- ЛИМИТЫ ОТОБРАЖЕНИЯ В СТАТУСЕ ---
+MAX_SHOW_CANDIDATES = 10
+MAX_SHOW_CONSOLIDATIONS = 10
+
+# --- ⚡ REALTIME-HOT MONITOR ---
+HOT_MONITOR_ENABLED = True
+HOT_MONITOR_INTERVAL_SEC = 60
+HOT_MONITOR_COOLDOWN_SEC = 300
+HOT_MONITOR_MIN_RR = 1.5
+HOT_MONITOR_MIN_VOL = 1.2
+HOT_MONITOR_BREAKOUT_VOL = 1.8
+HOT_MONITOR_MAX_DRIFT_PCT = 1.0
 
 TREND_CACHE_REFRESH_SECONDS = 1800
 TREND_CACHE_INITIAL_LIMIT = 60
@@ -183,6 +211,10 @@ cb_lock = threading.Lock()
 SUBSCRIBERS = set()
 subscribers_lock = threading.RLock()
 MAIN_CHAT_ID = None
+
+HOT_PAIRS_CACHE = {"candidates": [], "consolidations": [], "ts": 0.0}
+HOT_PAIRS_LOCK = threading.RLock()
+HOT_LAST_CHECK = {}
 
 _http_failures = 0
 _http_open_until = 0.0
@@ -240,9 +272,8 @@ def cb_can_trade():
     with cb_lock:
         return time.time() >= cb_state["paused_until"]
 
-# ==================== BTC-КОНТЕКСТ (АДАПТИВНЫЙ v19.8.0) ====================
+# ==================== BTC-КОНТЕКСТ ====================
 def refresh_market_context():
-    """Обновляет контекст BTC с ОСЛАБЛЕННЫМИ порогами."""
     ok, reason = True, ""
     if BTC_CONTEXT_ENABLED:
         try:
@@ -277,16 +308,73 @@ def market_allows_longs():
         return market_context["ok"]
 
 def is_strong_signal_for_blocked_market(signal):
-    """Определяет, можно ли пропустить сильный сигнал при БЛОК BTC.
-    Условия: T3/3 + score >= 8."""
     if not BTC_ALLOW_STRONG_WHEN_BLOCKED:
         return False
     trend_score = signal.get("trend_score", 0)
     score = signal.get("score", 0)
-    if isinstance(score, str):  # "PB", "RT", "BWS" — не считаем
+    if isinstance(score, str):
         return False
     return (trend_score >= BTC_STRONG_MIN_TREND_SCORE
             and score >= BTC_STRONG_MIN_SCORE)
+
+# ==================== 🛡 PEAK-GUARD (v19.9.1) ====================
+def check_peak_guard(df, entry_price):
+    """
+    Проверяет, что вход НЕ на локальном максимуме.
+    Возвращает (ok: bool, reason: str, metrics: dict).
+    df — DataFrame с колонками high/low/close, как минимум PEAK_LOOKBACK_CANDLES строк.
+    entry_price — предполагаемая цена входа.
+    """
+    if not PEAK_GUARD_ENABLED:
+        return True, "", {}
+    try:
+        if df is None or len(df) < PEAK_LOOKBACK_CANDLES:
+            return True, "", {}
+        window = df.tail(PEAK_LOOKBACK_CANDLES)
+        local_high = float(window["high"].max())
+        local_low = float(window["low"].min())
+        if local_high <= local_low or entry_price <= 0:
+            return True, "", {}
+        # Позиция цены в диапазоне 0..100%
+        position_pct = (entry_price - local_low) / (local_high - local_low) * 100
+        # Расстояние до локального максимума
+        dist_to_max_pct = (local_high - entry_price) / entry_price * 100
+        metrics = {
+            "position_pct": round(position_pct, 1),
+            "dist_to_max_pct": round(dist_to_max_pct, 2),
+            "local_high": local_high,
+            "local_low": local_low,
+        }
+        # Условия блокировки
+        if position_pct > PEAK_MAX_POSITION_PCT:
+            return False, f"цена в верхних {100 - PEAK_MAX_POSITION_PCT:.0f}% диапазона ({position_pct:.0f}%)", metrics
+        if dist_to_max_pct < PEAK_MIN_DIST_TO_MAX_PCT:
+            return False, f"слишком близко к максимуму ({dist_to_max_pct:.2f}%)", metrics
+        return True, "", metrics
+    except Exception as e:
+        logger.debug("peak_guard error: %s", e)
+        return True, "", {}
+
+def check_peak_guard_by_rsi(rsi_val):
+    """Дополнительная проверка RSI — не перекуплен ли."""
+    if not PEAK_GUARD_ENABLED:
+        return True, ""
+    if rsi_val is None or pd.isna(rsi_val):
+        return True, ""
+    if rsi_val > PEAK_MAX_RSI:
+        return False, f"RSI {rsi_val:.0f} > {PEAK_MAX_RSI} (перекуплен)"
+    return True, ""
+
+def check_peak_guard_by_drift(current_price, entry_price):
+    """Проверка дрейфа цены от 🎯~."""
+    if not PEAK_GUARD_ENABLED:
+        return True, ""
+    if entry_price <= 0 or current_price <= 0:
+        return True, ""
+    drift_pct = abs(current_price - entry_price) / entry_price * 100
+    if drift_pct > PEAK_MAX_DRIFT_PCT:
+        return False, f"цена ушла от входа на {drift_pct:.1f}%"
+    return True, ""
 
 # ==================== СЕКТОРА И РАЗМЕР ====================
 def sector_of(symbol):
@@ -303,13 +391,11 @@ def sector_slot_free(symbol):
 
 def position_size_fraction(score, rr, atr_pct, portfolio_risk_pct, stop_dist_pct,
                             btc_blocked=False):
-    """Рассчитывает размер позиции. Если BTC заблокирован — ×0.5 (Вариант C)."""
     base = RISK_PER_TRADE_PCT / 100.0
     conf = (0.5 + (score / 10.0) * 0.5) if isinstance(score, int) else 0.7
     vol_mult = 0.5 if atr_pct > 5 else 0.7 if atr_pct > 3 else 0.85 if atr_pct > 1.5 else 1.0
     rr_mult = 1.0 if rr >= 3 else 0.9 if rr >= 2 else 0.7 if rr >= 1.5 else 0.5
     size = base * conf * vol_mult * rr_mult
-    # Снижение размера при заблокированном BTC
     if btc_blocked:
         size *= BTC_STRONG_SIZE_MULT
     remaining = MAX_PORTFOLIO_RISK_PCT - portfolio_risk_pct
@@ -437,11 +523,12 @@ def tv_link(symbol: str) -> str:
     return f'<a href="{url}">📈 {symbol}</a>'
 
 HELP_TEXT = (
-    "📡 <b>Bybit Scanner v19.8.0 — справка</b>\n"
+    "📡 <b>Bybit Scanner v19.9.1 — справка</b>\n"
     "Бот шлёт: входы/выходы, частичные TP и ОДИН статус каждые 2 часа.\n"
-    "🟢 Адаптивный BTC-фильтр: при БЛОК BTC сильные сигналы (T3/3 + score≥8) "
-    "проходят с уменьшенным размером ×0.5.\n"
-    "💰 текущая цена · 🎯~ вход · 🚀 пробой · ✨ готов · 🥀 объём↓\n"
+    "⚡ REALTIME-HOT: топ-10 кандидатов и боковиков проверяются каждые 60 сек.\n"
+    "🛡 PEAK-GUARD: не входим на локальном максимуме (RSI≤70, дрейф≤1%).\n"
+    "🔥≤1% ⚡≤3% 🟢≤5% — сортировка боковиков по % до пробоя.\n"
+    "💰 текущая · 🎯~ вход · 🚀 пробой · ✨ готов · 🥀 объём↓ · ⛔ пик\n"
     "Команды: /stop — отписаться, /help — справка."
 )
 
@@ -724,13 +811,10 @@ def check_exit(results, pos):
     return False, "", 0.0
 
 def can_enter(pair, signal=None, signal_risk_pct=None):
-    """Универсальная проверка возможности входа.
-    signal — словарь с trend_score и score, для адаптивного BTC-фильтра."""
     now = time.time()
     trade_times[:] = [t for t in trade_times if now - t < 3600]
     if not cb_can_trade():
         return False
-    # BTC-фильтр: либо OK, либо сильный сигнал
     if not market_allows_longs():
         if signal is None or not is_strong_signal_for_blocked_market(signal):
             return False
@@ -1111,9 +1195,7 @@ def evaluate_ws_retest(df, symbol, level):
 
 # ==================== ОТКРЫТИЕ ПОЗИЦИИ ====================
 def open_position(symbol, sig, closed_start):
-    """Открывает позицию. Учитывает адаптивный BTC-фильтр (×0.5 при БЛОК)."""
     btc_blocked = not market_allows_longs()
-    # Если BTC заблокирован, но сигнал сильный — пропускаем, но с меньшим размером
     if btc_blocked and not is_strong_signal_for_blocked_market(sig):
         return None
     risk_pct = (sig["entry"] - sig["stop"]) / sig["entry"] * 100
@@ -1182,8 +1264,7 @@ def try_ws_breakout(symbol, new_candle, df):
     risk_pct = (entry - stop) / entry * 100
     ti = get_trend(symbol)
     trend_score = ti["score"] if ti else 0
-    # Синтетический сигнал для BTC-фильтра
-    pseudo_sig = {"trend_score": trend_score, "score": 7}   # BWS всегда score 7
+    pseudo_sig = {"trend_score": trend_score, "score": 7}
     btc_blocked = not market_allows_longs()
     if btc_blocked and not is_strong_signal_for_blocked_market(pseudo_sig):
         return None
@@ -1217,6 +1298,184 @@ def try_ws_breakout(symbol, new_candle, df):
         save_state(state)
     return {"entry": entry, "stop": stop, "target": target,
             "vol_ratio": vol_ratio, "level": level}
+
+# ==================== ⚡ REALTIME-HOT MONITOR (v19.9.1) ====================
+def hot_monitor_once():
+    """
+    Один проход мониторинга горячих монет.
+    Проверяет топ-10 кандидатов и топ-10 боковиков на предмет быстрого входа.
+    """
+    with HOT_PAIRS_LOCK:
+        if not HOT_PAIRS_CACHE["candidates"] and not HOT_PAIRS_CACHE["consolidations"]:
+            return
+        cands = list(HOT_PAIRS_CACHE["candidates"])
+        cons = list(HOT_PAIRS_CACHE["consolidations"])
+    if not cands and not cons:
+        return
+    all_symbols = list({s["pair"] for s in cands} | {s["pair"] for s in cons})
+    if not all_symbols:
+        return
+    prices = fetch_current_prices(all_symbols)
+    now_ts = time.time()
+
+    # --- Проверка кандидатов ---
+    for s in cands:
+        sym = s["pair"]
+        cur_price = prices.get(sym)
+        if not cur_price or cur_price <= 0:
+            continue
+        last_check = HOT_LAST_CHECK.get(f"cand_{sym}", 0)
+        if now_ts - last_check < HOT_MONITOR_COOLDOWN_SEC:
+            continue
+        entry = s.get("close_price", 0)
+        if entry <= 0:
+            continue
+        # Проверка дрейфа
+        drift_ok, _ = check_peak_guard_by_drift(cur_price, entry)
+        if not drift_ok:
+            continue
+        # Достаём df из ohlc_buffers
+        buf = ohlc_buffers.get(sym)
+        if not buf or len(buf) < MIN_BARS + 1:
+            continue
+        df = pd.DataFrame(list(buf))
+        if len(df) < MIN_BARS:
+            continue
+        df["ema_fast"] = ema(df["close"], 9)
+        df["ema_slow"] = ema(df["close"], 21)
+        df["macd_line"] = ema(df["close"], 12) - ema(df["close"], 26)
+        df["macd_signal"] = ema(df["macd_line"], 9)
+        df["atr"] = atr(df)
+        df["rsi"] = rsi(df["close"])
+        df["adx"] = adx(df)
+        df["vol_sma"] = df["volume"].rolling(20).mean()
+        df["vol_ratio"] = df["volume"] / df["vol_sma"].replace(0, np.nan)
+        sig = evaluate_ws_entry(df, sym)
+        if sig is None:
+            continue
+        # 🛡 PEAK-GUARD на текущей цене
+        peak_ok, peak_reason, _ = check_peak_guard(df, cur_price)
+        if not peak_ok:
+            logger.info("⛔ HOT candidate %s: %s", sym, peak_reason)
+            continue
+        rsi_ok, rsi_reason = check_peak_guard_by_rsi(sig.get("atr") and df["rsi"].iloc[-2])
+        if not rsi_ok:
+            logger.info("⛔ HOT candidate %s: %s", sym, rsi_reason)
+            continue
+        rr = (sig["target"] - sig["entry"]) / (sig["entry"] - sig["stop"])
+        if rr < HOT_MONITOR_MIN_RR:
+            continue
+        HOT_LAST_CHECK[f"cand_{sym}"] = now_ts
+        with state_lock:
+            opened = open_position(sym, sig, int(df.iloc[-2]["start"]))
+        if opened:
+            logger.info("⚡ REALTIME ВХОД (кандидат) %s @ %.6g", sym, sig["entry"])
+            btc_blocked = not market_allows_longs()
+            extra = " ⚠️BTC-БЛОК ×0.5" if btc_blocked else ""
+            send_telegram(
+                f"⚡ <b>REALTIME ВХОД (кандидат)</b>{extra}\n"
+                f"Пара: {tv_link(sym)}\n"
+                f"Цена: {sig['entry']:.8f}\n"
+                f"SL: {sig['stop']:.8f} · TP: {sig['target']:.8f}\n"
+                f"<i>{' · '.join(sig['parts'])}</i>")
+
+    # --- Проверка боковиков ---
+    for item in cons:
+        sym = item["pair"]
+        cur_price = prices.get(sym)
+        lvl = item.get("upper_level", 0)
+        if not cur_price or cur_price <= 0 or lvl <= 0:
+            continue
+        last_check = HOT_LAST_CHECK.get(f"cons_{sym}", 0)
+        if now_ts - last_check < HOT_MONITOR_COOLDOWN_SEC:
+            continue
+        # Пробой: цена выше уровня + запас ≥ BREAKOUT_MIN_TRIGGER_PCT
+        if cur_price < lvl * (1 + BREAKOUT_MIN_TRIGGER_PCT / 100):
+            continue
+        # Не улетела слишком далеко
+        if cur_price > lvl * (1 + MAX_BREAKOUT_DISTANCE_PCT / 100):
+            continue
+        buf = ohlc_buffers.get(sym)
+        if not buf or len(buf) < MIN_BARS + 1:
+            continue
+        df = pd.DataFrame(list(buf))
+        df["atr"] = atr(df)
+        df["vol_sma"] = df["volume"].rolling(20).mean()
+        df["vol_ratio"] = df["volume"] / df["vol_sma"].replace(0, np.nan)
+        vol_ratio = (float(df["volume"].iloc[-1] / df["vol_sma"].iloc[-1])
+                     if not pd.isna(df["vol_sma"].iloc[-1]) and df["vol_sma"].iloc[-1] > 0 else 0.0)
+        if vol_ratio < HOT_MONITOR_BREAKOUT_VOL:
+            continue
+        # 🛡 PEAK-GUARD
+        peak_ok, peak_reason, _ = check_peak_guard(df, cur_price)
+        if not peak_ok:
+            logger.info("⛔ HOT breakout %s: %s", sym, peak_reason)
+            continue
+        atr_val = float(df["atr"].iloc[-2]) if not pd.isna(df["atr"].iloc[-2]) else 0.0
+        if atr_val <= 0:
+            continue
+        entry = cur_price
+        stop = entry - atr_val * ATR_MULT_SL
+        target = entry + atr_val * ATR_MULT_TP
+        if stop >= entry or target <= entry:
+            continue
+        if (entry - stop) / entry * 100 < MIN_STOP_DISTANCE_PCT:
+            continue
+        rr = (target - entry) / (entry - stop)
+        if rr < HOT_MONITOR_MIN_RR:
+            continue
+        ti = get_trend(sym)
+        trend_score = ti["score"] if ti else 0
+        pseudo_sig = {"trend_score": trend_score, "score": 7}
+        btc_blocked = not market_allows_longs()
+        if btc_blocked and not is_strong_signal_for_blocked_market(pseudo_sig):
+            continue
+        HOT_LAST_CHECK[f"cons_{sym}"] = now_ts
+        with state_lock:
+            if not can_enter(sym, signal=pseudo_sig,
+                             signal_risk_pct=(entry - stop) / entry * 100):
+                continue
+            old_state = state.get(sym, {})
+            closed_start = int(df.iloc[-2]["start"]) if len(df) >= 2 else 0
+            if old_state.get("last_signal_candle") == closed_start:
+                continue
+            size = position_size_fraction(7, rr, atr_val / entry * 100,
+                                          portfolio_risk_used(),
+                                          (entry - stop) / entry * 100,
+                                          btc_blocked=btc_blocked)
+            new_state = old_state.copy()
+            new_state.update({
+                "position": "open", "entry_price": entry,
+                "stop": stop, "target": target, "atr_ref": atr_val,
+                "entry_time": datetime.now(timezone.utc).isoformat(),
+                "last_signal_candle": closed_start,
+                "last_entry_ts": time.time(),
+                "strategy": "breakout_realtime", "score": "RT",
+                "size_fraction": size,
+                "btc_blocked_entry": btc_blocked,
+            })
+            state[sym] = new_state
+            trade_times.append(time.time())
+            save_state(state)
+        logger.info("⚡ REALTIME ПРОБОЙ %s @ %.6g (уровень %.6g, vol ×%.1f)",
+                    sym, entry, lvl, vol_ratio)
+        extra = " ⚠️BTC-БЛОК ×0.5" if btc_blocked else ""
+        send_telegram(
+            f"⚡ <b>REALTIME ПРОБОЙ БОКОВИКА</b>{extra}\n"
+            f"Пара: {tv_link(sym)}\n"
+            f"Уровень: {lvl:.6g} → цена {entry:.6g}\n"
+            f"SL: {stop:.8f} · TP: {target:.8f}\n"
+            f"Объём: ×{vol_ratio:.1f}")
+
+def hot_monitor_loop():
+    logger.info("⚡ REALTIME-HOT monitor запущен (интервал %d c)", HOT_MONITOR_INTERVAL_SEC)
+    while True:
+        try:
+            if HOT_MONITOR_ENABLED:
+                hot_monitor_once()
+        except Exception as e:
+            logger.error("hot_monitor_once ошибка: %s", e)
+        time.sleep(HOT_MONITOR_INTERVAL_SEC)
 
 # ==================== WEBSOCKET ====================
 def on_open(ws):
@@ -1379,6 +1638,16 @@ def on_message(ws, message):
             if sig is None:
                 sig = evaluate_ws_pullback(df, symbol)
             if sig is None:
+                continue
+            # 🛡 PEAK-GUARD — блокируем вход на пике
+            cur_price_ws = float(new_candle["close"])
+            peak_ok, peak_reason, peak_metrics = check_peak_guard(df, cur_price_ws)
+            if not peak_ok:
+                logger.info("⛔ PEAK-GUARD отклонил %s: %s", symbol, peak_reason)
+                continue
+            rsi_ok, rsi_reason = check_peak_guard_by_rsi(float(df["rsi"].iloc[-2]))
+            if not rsi_ok:
+                logger.info("⛔ PEAK-GUARD (RSI) отклонил %s: %s", symbol, rsi_reason)
                 continue
             with state_lock:
                 opened = open_position(symbol, sig, closed_start)
@@ -1692,7 +1961,7 @@ def background_scan_loop():
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
 
-# ==================== СТАТУС: ОДНО СООБЩЕНИЕ (v19.8.0) ====================
+# ==================== СТАТУС: ОДНО СООБЩЕНИЕ (v19.9.1) ====================
 def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     with state_lock:
         open_snapshot = [(pair, dict(pos)) for pair, pos in state.items()
@@ -1704,7 +1973,7 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     with subscribers_lock:
         subs_count = len(SUBSCRIBERS)
 
-    breakout_strategies = ("breakout", "breakout_ws", "breakout_retest")
+    breakout_strategies = ("breakout", "breakout_ws", "breakout_retest", "breakout_realtime")
     now_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M")
 
     btc_state_str = "OK" if mok else f"БЛОК: {mreason}"
@@ -1712,13 +1981,15 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         btc_state_str += " · сильные T3/3 score≥8 → ×0.5"
 
     header = [
-        f"📡 <b>СТАТУС v19.8.0 (Bybit)</b> | <i>{now_str} UTC</i>",
+        f"📡 <b>СТАТУС v19.9.1 (Bybit)</b> | <i>{now_str} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔹 Пар WS: <b>{len(PAIRS_WS)}</b> · Тренд 3/3: <b>{q3}</b>",
         f"🔹 BTC: <b>{btc_state_str}</b>",
         f"🔹 Боковиков: <b>{len(consolidation_list)}</b> · "
         f"Позиций: <b>{len(open_snapshot)}/{MAX_OPEN_POSITIONS}</b>",
         f"🔹 Входов: <b>{found_buy}</b> · Выходов: <b>{found_sell}</b> · 👥 {subs_count}",
+        f"🔹 ⚡ HOT: <b>{'ON' if HOT_MONITOR_ENABLED else 'OFF'}</b> · "
+        f"🛡 PEAK-GUARD: <b>{'ON' if PEAK_GUARD_ENABLED else 'OFF'}</b>",
     ]
     if not cb_can_trade():
         header.append("🔹 🛑 Circuit breaker: <b>входы на паузе</b>")
@@ -1749,8 +2020,24 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     valid_calls.sort(key=lambda s: (-s["trend_score"],
                                      s.get("macd_gap_pct", 999)))
 
-    consolidation_list = sorted(consolidation_list,
-                                key=lambda x: (-x["days"], x.get("vol_trend", 1.0)))
+    def _hot_score(item):
+        cur = item.get("current_price", 0)
+        lvl = item.get("upper_level", 0)
+        if cur <= 0 or lvl <= 0:
+            return 999
+        dist_pct = (lvl - cur) / cur * 100
+        return max(dist_pct, 0)
+    consolidation_list = sorted(consolidation_list, key=_hot_score)
+
+    # Ограничение показа: 10 + 10
+    valid_calls = valid_calls[:MAX_SHOW_CANDIDATES]
+    consolidation_list = consolidation_list[:MAX_SHOW_CONSOLIDATIONS]
+
+    # ⚡ Обновляем кэш для hot_monitor
+    with HOT_PAIRS_LOCK:
+        HOT_PAIRS_CACHE["candidates"] = list(valid_calls)
+        HOT_PAIRS_CACHE["consolidations"] = list(consolidation_list)
+        HOT_PAIRS_CACHE["ts"] = time.time()
 
     def cand_line(i, s, with_link):
         gap = s.get("macd_gap_pct", 0)
@@ -1761,33 +2048,69 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         else:
             prox, hl = "⚠️", False
         name = tv_link(s["pair"]) if with_link else s["pair"]
-        is_ready = s["trend_score"] == 3 and gap < 0.5
-        mark = "🟢" if is_ready else ("🟡" if hl else "")
-        vol = s.get("vol_ratio", 0.0)
-        vol_txt = f" · V{vol:.1f}x" if vol >= MIN_VOL_MULT else ""
-        up = "↑" if s.get("adx_slope_up") else ""
-        ready_tag = " ✨" if is_ready else ""
         cur = s.get("current_price") or s.get("close_price", 0)
         entry = s.get("close_price", 0)
-        return (f"{mark}{i}. {name}{ready_tag} · T{s['trend_score']}/3 · "
-                f"ADX{s['adx_1d']:.0f}{up} · RSI{s['rsi_4h']:.0f}{vol_txt} · "
-                f"💰{cur:.6g} 🎯~{entry:.6g} · {prox}")
+        # 🛡 Проверка пика (для метки)
+        buf = ohlc_buffers.get(s["pair"])
+        peak_ok, peak_reason, _ = (True, "", {})
+        if buf and len(buf) >= PEAK_LOOKBACK_CANDLES:
+            df_pk = pd.DataFrame(list(buf))
+            peak_ok, peak_reason, _ = check_peak_guard(df_pk, cur)
+        # Дрейф от 🎯~
+        drift_pct = abs(cur - entry) / entry * 100 if entry > 0 else 0
+        drift_ok = drift_pct <= PEAK_MAX_DRIFT_PCT
+        # Итоговая готовность
+        is_ready = (s["trend_score"] == 3 and gap < 0.5
+                    and peak_ok and drift_ok)
+        if is_ready:
+            mark = "🟢"
+        elif not peak_ok:
+            mark = "⛔"
+        elif not drift_ok:
+            mark = "⚠️"
+        elif hl:
+            mark = "🟡"
+        else:
+            mark = ""
+        vol = s.get("vol_ratio", 0.0)
+        vol_txt = f" V{vol:.1f}x" if vol >= MIN_VOL_MULT else ""
+        up = "↑" if s.get("adx_slope_up") else ""
+        ready_tag = "✨" if is_ready else ""
+        drift_txt = f" ⚠️+{drift_pct:.1f}%" if not drift_ok else ""
+        return (f"{mark}{i}.{name}{ready_tag} T{s['trend_score']} "
+                f"ADX{s['adx_1d']:.0f}{up} RSI{s['rsi_4h']:.0f}{vol_txt} "
+                f"💰{cur:.6g} 🎯~{entry:.6g}{drift_txt} {prox}")
 
     def cons_line(i, item, with_link):
-        dry = " 🥀" if item.get("vol_trend", 1.0) <= 0.9 else ""
-        ready = item.get("range_pct", 99) < 15.0 and item.get("adx", 99) < 15
+        dry = "🥀" if item.get("vol_trend", 1.0) <= 0.9 else ""
         name = tv_link(item["pair"]) if with_link else item["pair"]
-        mark = "🟢" if ready else ""
         cur = item.get("current_price", 0)
-        cur_txt = f" 💰{cur:.6g}" if cur else ""
-        return (f"{mark}{i}. {name} · {item['days']}д · {item['range_pct']:.1f}% · "
-                f"ADX{item['adx']:.0f}{dry} · 🚀{item['upper_level']:.6g}{cur_txt}")
+        lvl = item.get("upper_level", 0)
+        if cur > 0 and lvl > 0:
+            dist_pct = (lvl - cur) / cur * 100
+        else:
+            dist_pct = 999
+        if dist_pct <= HOT_DIST_PCT_1:
+            mark = "🔥"
+        elif dist_pct <= HOT_DIST_PCT_2:
+            mark = "⚡"
+        elif dist_pct <= HOT_DIST_PCT_3:
+            mark = "🟢"
+        else:
+            mark = ""
+        dist_txt = f"({dist_pct:.1f}%)" if dist_pct < 999 else ""
+        return (f"{mark}{i}.{name} {item['days']}д {item['range_pct']:.0f}% "
+                f"ADX{item['adx']:.0f}{dry} 🚀{lvl:.6g} 💰{cur:.6g}{dist_txt}")
 
     footer = [
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔄 Следующий статус через 2 ч · лимиты {MAX_OPEN_POSITIONS} поз / "
         f"{MAX_TRADES_PER_HOUR} в час",
-        "💰 текущая · 🎯~ вход · 🚀 пробой · ✨ готов · 🥀 объём↓",
+        f"ℹ️ Показаны {MAX_SHOW_CANDIDATES} самых горячих кандидатов "
+        f"и {MAX_SHOW_CONSOLIDATIONS} ближайших боковиков.",
+        "⚡ HOT: проверка топ-10 каждые 60 сек (не только на закрытии свечи)",
+        "🛡 PEAK-GUARD: не входим на пике (RSI≤70, дрейф≤1%, топ-15% диапазона)",
+        "🔥≤1% ⚡≤3% 🟢≤5% — % до пробоя · 🥀 объём↓ · ⛔ пик · ⚠️ дрейф",
         "👇 Тапни 📈-ссылку в списке — график TradingView",
     ]
 
@@ -1800,8 +2123,6 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         if valid_calls:
             for i, s in enumerate(valid_calls[:max_cand], 1):
                 lines.append(cand_line(i, s, with_links))
-            if len(valid_calls) > max_cand:
-                lines.append(f"… и ещё {len(valid_calls) - max_cand}")
         else:
             lines.append("😴 готовых кандидатов нет")
         lines.append("</blockquote>")
@@ -1810,32 +2131,23 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         if consolidation_list:
             for i, item in enumerate(consolidation_list[:max_cons], 1):
                 lines.append(cons_line(i, item, with_links))
-            if len(consolidation_list) > max_cons:
-                lines.append(f"… и ещё {len(consolidation_list) - max_cons}")
         else:
             lines.append("📦 боковиков нет")
         lines.append("</blockquote>")
         lines += footer
         return "\n".join(lines)
 
-    text = None
-    for with_links in (True, False):
-        max_cand, max_cons = len(valid_calls), len(consolidation_list)
-        while True:
-            text = build(with_links, max_cand, max_cons)
+    text = build(True, len(valid_calls), len(consolidation_list))
+    if len(text) > TG_SAFE_LIMIT:
+        for max_cand in range(len(valid_calls), 2, -1):
+            for max_cons in range(len(consolidation_list), 2, -1):
+                text = build(True, max_cand, max_cons)
+                if len(text) <= TG_SAFE_LIMIT:
+                    break
             if len(text) <= TG_SAFE_LIMIT:
                 break
-            if max_cons > 6:
-                max_cons = max(6, max_cons - 10)
-            elif max_cand > 3:
-                max_cand = max(3, max_cand - 3)
-            else:
-                break
-        if text and len(text) <= TG_SAFE_LIMIT:
-            break
-
-    if text is None or len(text) > TG_SAFE_LIMIT:
-        text = build(False, 3, 5)
+    if len(text) > TG_SAFE_LIMIT:
+        text = build(True, 5, 5)
 
     _send_to_all_one(text)
     logger.info("Статус отправлен: %d символов, кандидатов %d, боковиков %d",
@@ -1849,7 +2161,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v19.8.0 «BTC-ADAPTIVE» (Bybit) ...")
+    logger.info("Запуск бота v19.9.1 «REALTIME-HOT + PEAK-GUARD» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
@@ -1916,15 +2228,18 @@ if __name__ == "__main__":
     threading.Thread(target=trend_cache_loop, daemon=True).start()
     threading.Thread(target=market_context_loop, daemon=True).start()
     threading.Thread(target=polling_loop, daemon=True).start()
+    threading.Thread(target=hot_monitor_loop, daemon=True).start()   # ⚡ v19.9.1
 
     _send_to_all_one(
-        f"🟢 <b>СКАНЕР v19.8.0 «BTC-ADAPTIVE» ЗАПУЩЕН</b>\n"
+        f"🟢 <b>СКАНЕР v19.9.1 «REALTIME-HOT + PEAK-GUARD» ЗАПУЩЕН</b>\n"
         f"WS: {len(PAIRS_WS)} пар + динам. подписка\n"
         f"Тренд 3/3: {q3} · BTC: {'OK' if market_allows_longs() else 'БЛОК'}\n"
-        f"🟢 Адаптивный BTC-фильтр: при БЛОК сильные сигналы (T3/3+score≥8) "
-        f"проходят с размером ×0.5\n"
-        f"Лимиты: {MAX_OPEN_POSITIONS} поз / {MAX_TRADES_PER_HOUR} в час · "
-        f"порог score {MIN_SIGNAL_SCORE}/10\n"
-        f"💰 текущая · 🎯~ вход · 🚀 пробой\n"
+        f"⚡ HOT: топ-10 кандидатов и боковиков проверяются каждые "
+        f"{HOT_MONITOR_INTERVAL_SEC} сек\n"
+        f"🛡 PEAK-GUARD: не входим на локальном максимуме "
+        f"(RSI≤{PEAK_MAX_RSI}, дрейф≤{PEAK_MAX_DRIFT_PCT}%)\n"
+        f"🟢 BTC-адаптив: при БЛОК сильные (T3/3+score≥8) → ×0.5\n"
+        f"ℹ️ Показ: {MAX_SHOW_CANDIDATES} кандидатов + "
+        f"{MAX_SHOW_CONSOLIDATIONS} боковиков (все со ссылками TradingView)\n"
         f"👥 Подписчиков: {len(SUBSCRIBERS)} · /start · /stop · /help")
     background_scan_loop()
