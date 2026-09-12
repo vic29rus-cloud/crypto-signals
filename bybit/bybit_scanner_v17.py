@@ -2,17 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v20.0 «WS-REALTIME-HOT» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
+BYBIT SCANNER v20.1 «WS-REALTIME-HOT-X» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
-НОВОЕ В v20.0 (относительно v19.9.1):
-• ⚡ WS-REALTIME-HOT: отдельный WebSocket на канал `tickers` для горячих монет
-• Динамическая подписка: топ-10 кандидатов + топ-10 боковиков + близкие к алерту
-• На каждом тике — мгновенная проверка входа (не ждём 15m закрытия)
-• Автодополнение: раз в 15 минут сканируем все 200 пар и добавляем горячие
-• 🛡 PEAK-GUARD сохранён (RSI≤70, дрейф≤1%, топ-15% диапазона)
-• Все прежние функции: BTC-адаптив, circuit breaker, сектора, top-10+10.
+НОВОЕ В v20.1 (относительно v20.0):
+• Раздельные квоты WS-tickers: 20 кандидатов + 20 боковиков (X-режим)
+• Расширенный пул «горячих»: не топ-10, а все близкие к кроссу/пробою
+• Пороги в константах: WS_HOT_NEAR_CROSS_PCT, WS_HOT_NEAR_BREAKOUT_PCT
+• Мягкая пересборка пула раз в 15 мин из ohlc_buffers (без REST)
+• Приоритет слотов: cand → cons → добор из недобора
+• Всё остальное как в v20.0: PEAK-GUARD, BTC-адаптив, WS kline+tickers
 ==============================================================================
 """
 import json
@@ -137,7 +137,7 @@ PEAK_MIN_DIST_TO_MAX_PCT = 1.5
 PEAK_MAX_RSI = 70
 PEAK_MAX_DRIFT_PCT = 1.0
 
-# --- ПОРОГИ «ГОРЯЧЕСТИ» БОКОВИКОВ ---
+# --- ПОРОГИ «ГОРЯЧЕСТИ» БОКОВИКОВ (для отображения) ---
 HOT_DIST_PCT_1 = 1.0
 HOT_DIST_PCT_2 = 3.0
 HOT_DIST_PCT_3 = 5.0
@@ -145,15 +145,21 @@ HOT_DIST_PCT_3 = 5.0
 MAX_SHOW_CANDIDATES = 10
 MAX_SHOW_CONSOLIDATIONS = 10
 
-# --- ⚡ WS-REALTIME-HOT (v20.0) ---
+# --- ⚡ WS-REALTIME-HOT (v20.1, X-режим) ---
 WS_TICKERS_ENABLED = True
-WS_TICKERS_MAX_PAIRS = 40          # максимум пар в tickers-подписке
-WS_TICKERS_REFRESH_SEC = 900       # обновление списка (15 мин)
-WS_HOT_COOLDOWN_SEC = 60           # cooldown на попытку входа по одной паре
+WS_TICKERS_MAX_PAIRS = 40               # общий максимум
+WS_TICKERS_QUOTA_CAND = 20              # квота кандидатов
+WS_TICKERS_QUOTA_CONS = 20              # квота боковиков
+WS_TICKERS_REFRESH_SEC = 900            # мягкая пересборка пула (15 мин)
+WS_HOT_COOLDOWN_SEC = 60                # cooldown на попытку входа по одной паре
 WS_HOT_MIN_RR = 1.5
 WS_HOT_MIN_VOL = 1.2
 WS_HOT_BREAKOUT_VOL = 1.8
 WS_HOT_MAX_DRIFT_PCT = 1.0
+
+# --- Пороги «близости» для попадания в пул (v20.1) ---
+WS_HOT_NEAR_CROSS_PCT = 0.5             # |macd_gap_pct| <= 0.5% → кандидат «на грани»
+WS_HOT_NEAR_BREAKOUT_PCT = 5.0          # % до пробоя <= 5% → боковик «почти готов»
 
 TREND_CACHE_REFRESH_SECONDS = 1800
 TREND_CACHE_INITIAL_LIMIT = 60
@@ -210,8 +216,15 @@ SUBSCRIBERS = set()
 subscribers_lock = threading.RLock()
 MAIN_CHAT_ID = None
 
-# ⚡ Кэш горячих монет (обновляется при формировании статуса)
-HOT_PAIRS_CACHE = {"candidates": [], "consolidations": [], "ts": 0.0}
+# ⚡ Расширенные пулы «горячих» пар (v20.1, X-режим)
+# В каждом пуле — список dict'ов, отсортированных по «близости».
+HOT_PAIRS_CACHE = {
+    "candidates_pool": [],      # все кандидаты с |macd_gap| <= порога
+    "consolidations_pool": [],  # все боковики с % до пробоя <= порога
+    "candidates": [],           # топ-10 для отображения в статусе
+    "consolidations": [],       # топ-10 для отображения в статусе
+    "ts": 0.0,
+}
 HOT_PAIRS_LOCK = threading.RLock()
 HOT_LAST_CHECK = {}   # symbol -> ts последней попытки входа
 
@@ -517,9 +530,9 @@ def tv_link(symbol: str) -> str:
     return f'<a href="{url}">📈 {symbol}</a>'
 
 HELP_TEXT = (
-    "📡 <b>Bybit Scanner v20.0 — справка</b>\n"
+    "📡 <b>Bybit Scanner v20.1 — справка</b>\n"
     "Бот шлёт: входы/выходы, частичные TP и ОДИН статус каждые 2 часа.\n"
-    "⚡ WS-REALTIME-HOT: мгновенная цена для топ-40 горячих монет.\n"
+    "⚡ WS-REALTIME-HOT-X: 20 кандидатов + 20 боковиков в реальном времени.\n"
     "🛡 PEAK-GUARD: не входим на пике (RSI≤70, дрейф≤1%).\n"
     "🔥≤1% ⚡≤3% 🟢≤5% — сортировка боковиков по % до пробоя.\n"
     "💰 текущая · 🎯~ вход · 🚀 пробой · ✨ готов · 🥀 объём↓ · ⛔ пик\n"
@@ -1293,52 +1306,158 @@ def try_ws_breakout(symbol, new_candle, df):
     return {"entry": entry, "stop": stop, "target": target,
             "vol_ratio": vol_ratio, "level": level}
 
-# ==================== ⚡ WS-REALTIME-HOT (v20.0) ====================
+# ==================== ⚡ WS-REALTIME-HOT-X (v20.1) ====================
+def _cand_hotness(s):
+    """Меньше = горячее. Для кандидата: близость MACD к кроссу."""
+    return abs(s.get("macd_gap_pct", 999))
+
+def _cons_hotness(item):
+    """Меньше = горячее. Для боковика: % до пробоя."""
+    cur = item.get("current_price", 0)
+    lvl = item.get("upper_level", 0)
+    if cur <= 0 or lvl <= 0:
+        return 999
+    return max((lvl - cur) / cur * 100, 0)
+
+def _rebuild_hot_pools_from_buffers():
+    """
+    Мягкая пересборка пулов из уже имеющихся ohlc_buffers (15m).
+    Без REST. Используется раз в WS_TICKERS_REFRESH_SEC между сканами.
+    Пулы обновляются только если новые данные «свежее» старых по горячести.
+    """
+    cand_pool = []
+    cons_pool = []
+    with state_lock:
+        open_pairs = set(p for p, v in state.items() if v.get("position") == "open")
+
+    for sym, buf in list(ohlc_buffers.items()):
+        if not buf or len(buf) < MIN_BARS:
+            continue
+        try:
+            df = pd.DataFrame(list(buf))
+            df["ema_fast"] = ema(df["close"], 9)
+            df["ema_slow"] = ema(df["close"], 21)
+            df["macd_line"] = ema(df["close"], 12) - ema(df["close"], 26)
+            df["macd_signal"] = ema(df["macd_line"], 9)
+            last = df.iloc[-2]
+            if pd.isna(last["macd_line"]) or pd.isna(last["macd_signal"]):
+                continue
+            macd_gap_pct = ((last["macd_line"] - last["macd_signal"])
+                            / last["close"] * 100) if last["close"] else 0.0
+            ti = get_trend(sym)
+            trend_score = ti["score"] if ti else 0
+            if (trend_score >= 2
+                    and abs(macd_gap_pct) <= WS_HOT_NEAR_CROSS_PCT):
+                cand_pool.append({
+                    "pair": sym,
+                    "macd_gap_pct": macd_gap_pct,
+                    "trend_score": trend_score,
+                    "close_price": float(last["close"]),
+                    "current_price": float(last["close"]),
+                    "source": "buffers",
+                })
+            with breakout_cache_lock:
+                lvl = breakout_cache.get(sym)
+            if lvl and lvl > 0:
+                cur = float(last["close"])
+                dist_pct = (lvl - cur) / cur * 100 if cur > 0 else 999
+                if 0 <= dist_pct <= WS_HOT_NEAR_BREAKOUT_PCT:
+                    cons_pool.append({
+                        "pair": sym,
+                        "upper_level": lvl,
+                        "current_price": cur,
+                        "dist_to_break_pct": dist_pct,
+                        "days": 0, "range_pct": 0.0, "adx": 0.0,
+                        "vol_trend": 1.0,
+                        "source": "buffers",
+                    })
+        except Exception as e:
+            logger.debug("_rebuild_hot_pools_from_buffers %s: %s", sym, e)
+
+    cand_pool.sort(key=_cand_hotness)
+    cons_pool.sort(key=_cons_hotness)
+
+    with HOT_PAIRS_LOCK:
+        # Если после скана пулы содержали данные, а теперь мягкая пересборка
+        # не нашла — оставляем старые, чтобы не «обнулить» подписку.
+        if cand_pool:
+            HOT_PAIRS_CACHE["candidates_pool"] = cand_pool
+        if cons_pool:
+            HOT_PAIRS_CACHE["consolidations_pool"] = cons_pool
+        HOT_PAIRS_CACHE["ts"] = time.time()
+    logger.debug("Мягкая пересборка пулов: cand=%d, cons=%d",
+                 len(cand_pool), len(cons_pool))
+
+
 def update_ticker_subscription():
     """
-    Обновляет список пар для подписки на tickers-канал.
-    Основа: HOT_PAIRS_CACHE (топ-10 кандидатов + топ-10 боковиков).
-    Дополняем: монеты из 200, близкие к алерту (<3% до пробоя, gap<0.5%).
-    Максимум WS_TICKERS_MAX_PAIRS.
+    v20.1 X-режим: раздельные квоты.
+      - до WS_TICKERS_QUOTA_CAND слотов — кандидаты (сортировка по |macd_gap|)
+      - до WS_TICKERS_QUOTA_CONS слотов — боковики (сортировка по % до пробоя)
+      - недобор в одной категории добирается из другой
+      - итог обрезается до WS_TICKERS_MAX_PAIRS
     """
     if not WS_TICKERS_ENABLED:
         return
     with HOT_PAIRS_LOCK:
-        cands = list(HOT_PAIRS_CACHE["candidates"])
-        cons = list(HOT_PAIRS_CACHE["consolidations"])
-    base_symbols = set()
-    for s in cands:
-        base_symbols.add(s["pair"])
-    for item in cons:
-        base_symbols.add(item["pair"])
-    # Дополняем: близкие к алертам из всех 200 пар
-    with state_lock:
-        open_pairs = set(p for p, v in state.items() if v.get("position") == "open")
-    for sym in PAIRS_WS:
-        if len(base_symbols) >= WS_TICKERS_MAX_PAIRS:
+        cand_pool = list(HOT_PAIRS_CACHE.get("candidates_pool") or [])
+        cons_pool = list(HOT_PAIRS_CACHE.get("consolidations_pool") or [])
+
+    cand_pool = sorted(cand_pool, key=_cand_hotness)
+    cons_pool = sorted(cons_pool, key=_cons_hotness)
+
+    picked = []
+    picked_set = set()
+
+    # 1) квота кандидатов
+    for s in cand_pool:
+        if len(picked) >= WS_TICKERS_QUOTA_CAND:
             break
-        if sym in base_symbols:
+        p = s["pair"]
+        if p in picked_set:
             continue
-        # Проверяем: есть ли в breakout_cache (боковик) и близко ли
-        with breakout_cache_lock:
-            lvl = breakout_cache.get(sym)
-        if lvl and lvl > 0:
-            # Найдём текущую цену из ohlc_buffers
-            buf = ohlc_buffers.get(sym)
-            if buf and len(buf) > 0:
-                cur = float(buf[-1]["close"])
-                if cur > 0 and (lvl - cur) / cur * 100 < 3.0:
-                    base_symbols.add(sym)
-                    continue
-    new_subset = set(list(base_symbols)[:WS_TICKERS_MAX_PAIRS])
-    # Сравниваем с текущей подпиской
+        picked.append(p)
+        picked_set.add(p)
+
+    # 2) квота боковиков
+    for item in cons_pool:
+        if len(picked) >= WS_TICKERS_QUOTA_CAND + WS_TICKERS_QUOTA_CONS:
+            break
+        p = item["pair"]
+        if p in picked_set:
+            continue
+        picked.append(p)
+        picked_set.add(p)
+
+    # 3) добираем недобор кандидатов из боковиков и наоборот
+    if len(picked) < WS_TICKERS_MAX_PAIRS:
+        for s in cand_pool:
+            if len(picked) >= WS_TICKERS_MAX_PAIRS:
+                break
+            p = s["pair"]
+            if p in picked_set:
+                continue
+            picked.append(p)
+            picked_set.add(p)
+    if len(picked) < WS_TICKERS_MAX_PAIRS:
+        for item in cons_pool:
+            if len(picked) >= WS_TICKERS_MAX_PAIRS:
+                break
+            p = item["pair"]
+            if p in picked_set:
+                continue
+            picked.append(p)
+            picked_set.add(p)
+
+    new_subset = set(picked[:WS_TICKERS_MAX_PAIRS])
+
     with WS_TICKER_PAIRS_LOCK:
         old_subset = set(WS_TICKER_PAIRS)
     to_add = new_subset - old_subset
     to_remove = old_subset - new_subset
     if not to_add and not to_remove:
         return
-    # Обновляем WS-подписку
+
     app = WS_TICKERS_APP
     if app is not None and WS_TICKERS_CONNECTED.is_set():
         try:
@@ -1352,7 +1471,7 @@ def update_ticker_subscription():
                 for i in range(0, len(args), 100):
                     app.send(json.dumps({"op": "unsubscribe",
                                          "args": args[i:i + 100]}))
-            logger.info("⚡ WS-tickers обновлён: +%d -%d (всего %d)",
+            logger.info("⚡ WS-tickers (X): +%d -%d (всего %d)",
                         len(to_add), len(to_remove), len(new_subset))
         except Exception as e:
             logger.warning("WS-tickers send error: %s", e)
@@ -1360,22 +1479,31 @@ def update_ticker_subscription():
         WS_TICKER_PAIRS.clear()
         WS_TICKER_PAIRS.update(new_subset)
 
+
+def _find_hot_entry(symbol):
+    """Возвращает (kind, item) где kind ∈ {'cand','cons'} или (None, None)."""
+    with HOT_PAIRS_LOCK:
+        cand_pool = HOT_PAIRS_CACHE.get("candidates_pool") or []
+        cons_pool = HOT_PAIRS_CACHE.get("consolidations_pool") or []
+    cand = next((s for s in cand_pool if s["pair"] == symbol), None)
+    con = next((item for item in cons_pool if item["pair"] == symbol), None)
+    if cand:
+        return "cand", cand
+    if con:
+        return "cons", con
+    return None, None
+
+
 def _open_on_tick(symbol, cur_price, source="tick"):
     """Проверяет возможность входа на текущем тике (для hot-пары)."""
     if not WS_TICKERS_ENABLED:
         return
-    # Cooldown
     now_ts = time.time()
     last = HOT_LAST_CHECK.get(symbol, 0)
     if now_ts - last < WS_HOT_COOLDOWN_SEC:
         return
-    # Проверяем, что это кандидат или боковик
-    with HOT_PAIRS_LOCK:
-        cands = HOT_PAIRS_CACHE["candidates"]
-        cons = HOT_PAIRS_CACHE["consolidations"]
-    cand = next((s for s in cands if s["pair"] == symbol), None)
-    con = next((item for item in cons if item["pair"] == symbol), None)
-    if not cand and not con:
+    kind, item = _find_hot_entry(symbol)
+    if kind is None:
         return
     buf = ohlc_buffers.get(symbol)
     if not buf or len(buf) < MIN_BARS + 1:
@@ -1396,9 +1524,9 @@ def _open_on_tick(symbol, cur_price, source="tick"):
                           & (df["ema_fast"].shift(1) <= df["ema_slow"].shift(1)))
     df["vol_ratio"] = df["volume"] / df["vol_sma"].replace(0, np.nan)
 
-    # --- Проверка кандидата ---
-    if cand:
-        entry_ref = cand.get("close_price", 0)
+    # --- Кандидат ---
+    if kind == "cand":
+        entry_ref = item.get("close_price", 0)
         if entry_ref > 0:
             drift_ok, _ = check_peak_guard_drift(cur_price, entry_ref)
             if not drift_ok:
@@ -1412,7 +1540,7 @@ def _open_on_tick(symbol, cur_price, source="tick"):
                 logger.info("⛔ HOT cand %s: %s", symbol, peak_reason)
                 LAST_PEAK_ALERT[symbol] = now_ts
             return
-        rsi_ok, rsi_reason = check_peak_guard_rsi(float(df["rsi"].iloc[-2]))
+        rsi_ok, _ = check_peak_guard_rsi(float(df["rsi"].iloc[-2]))
         if not rsi_ok:
             return
         rr = (sig["target"] - sig["entry"]) / (sig["entry"] - sig["stop"])
@@ -1433,9 +1561,9 @@ def _open_on_tick(symbol, cur_price, source="tick"):
                 f"<i>{' · '.join(sig['parts'])}</i>")
         return
 
-    # --- Проверка боковика ---
-    if con:
-        lvl = con.get("upper_level", 0)
+    # --- Боковик ---
+    if kind == "cons":
+        lvl = item.get("upper_level", 0)
         if lvl <= 0:
             return
         if cur_price < lvl * (1 + BREAKOUT_MIN_TRIGGER_PCT / 100):
@@ -1763,7 +1891,6 @@ def on_tickers_message(ws, message):
                     continue
                 if cur_price <= 0:
                     continue
-                # Обновляем последнюю свечу в ohlc_buffers текущей ценой
                 buf = ohlc_buffers.get(symbol)
                 if buf and len(buf) > 0:
                     buf[-1]["close"] = cur_price
@@ -1771,7 +1898,6 @@ def on_tickers_message(ws, message):
                         buf[-1]["high"] = cur_price
                     if cur_price < buf[-1]["low"]:
                         buf[-1]["low"] = cur_price
-                # Проверяем вход
                 _open_on_tick(symbol, cur_price, source="tick")
     except Exception as e:
         logger.error("Ошибка WS tickers: %s", e)
@@ -1802,16 +1928,18 @@ def run_tickers_websocket():
         time.sleep(5)
 
 def tickers_refresh_loop():
-    """Раз в WS_TICKERS_REFRESH_SEC обновляет список подписок tickers."""
+    """v20.1: раз в WS_TICKERS_REFRESH_SEC мягко пересобирает пулы
+    из ohlc_buffers (без REST) и обновляет подписку."""
     first = True
     while True:
         if not first:
             time.sleep(WS_TICKERS_REFRESH_SEC)
         first = False
         try:
+            _rebuild_hot_pools_from_buffers()
             update_ticker_subscription()
         except Exception as e:
-            logger.error("update_ticker_subscription: %s", e)
+            logger.error("tickers_refresh_loop: %s", e)
 
 # ==================== ФОНОВОЕ СКАНИРОВАНИЕ ====================
 TIMEFRAME_PARAMS = {
@@ -2073,7 +2201,6 @@ def background_scan_loop():
                 logger.error("Ошибка очистки state: %s", e)
 
             send_status(scan_summary, consolidation_list, found_buy, found_sell)
-            # ⚡ Обновляем WS-tickers после нового статуса
             try:
                 update_ticker_subscription()
             except Exception as e:
@@ -2083,7 +2210,7 @@ def background_scan_loop():
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
 
-# ==================== СТАТУС: ОДНО СООБЩЕНИЕ (v20.0) ====================
+# ==================== СТАТУС: ОДНО СООБЩЕНИЕ (v20.1) ====================
 def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     with state_lock:
         open_snapshot = [(pair, dict(pos)) for pair, pos in state.items()
@@ -2105,10 +2232,11 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         btc_state_str += " · сильные T3/3 score≥8 → ×0.5"
 
     header = [
-        f"📡 <b>СТАТУС v20.0 (Bybit)</b> | <i>{now_str} UTC</i>",
+        f"📡 <b>СТАТУС v20.1 «WS-REALTIME-HOT-X»</b> | <i>{now_str} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔹 Пар WS kline: <b>{len(PAIRS_WS)}</b> · Тренд 3/3: <b>{q3}</b>",
-        f"🔹 ⚡ WS tickers: <b>{tickers_count}</b> горячих пар (мгновенная цена)",
+        f"🔹 ⚡ WS tickers: <b>{tickers_count}</b>/{WS_TICKERS_MAX_PAIRS} "
+        f"(cand ≤{WS_TICKERS_QUOTA_CAND} · cons ≤{WS_TICKERS_QUOTA_CONS})",
         f"🔹 BTC: <b>{btc_state_str}</b>",
         f"🔹 Боковиков: <b>{len(consolidation_list)}</b> · "
         f"Позиций: <b>{len(open_snapshot)}/{MAX_OPEN_POSITIONS}</b>",
@@ -2134,6 +2262,7 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     else:
         pos_lines.append("💰 Позиций нет")
 
+    # ---- пул кандидатов (расширенный) ----
     valid_calls = [
         s for s in scan_summary
         if s["trend_score"] >= 2
@@ -2153,12 +2282,30 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         return max(dist_pct, 0)
     consolidation_list = sorted(consolidation_list, key=_hot_score)
 
-    valid_calls = valid_calls[:MAX_SHOW_CANDIDATES]
-    consolidation_list = consolidation_list[:MAX_SHOW_CONSOLIDATIONS]
+    # ---- топ-10 для отображения ----
+    display_calls = valid_calls[:MAX_SHOW_CANDIDATES]
+    display_cons = consolidation_list[:MAX_SHOW_CONSOLIDATIONS]
+
+    # ---- расширенные пулы для WS tickers ----
+    cand_pool = [s for s in valid_calls
+                 if abs(s.get("macd_gap_pct", 999)) <= WS_HOT_NEAR_CROSS_PCT]
+    cons_pool = []
+    for item in consolidation_list:
+        cur = item.get("current_price", 0)
+        lvl = item.get("upper_level", 0)
+        if cur <= 0 or lvl <= 0:
+            continue
+        dist_pct = (lvl - cur) / cur * 100
+        if 0 <= dist_pct <= WS_HOT_NEAR_BREAKOUT_PCT:
+            cons_pool.append(item)
+    cand_pool.sort(key=_cand_hotness)
+    cons_pool.sort(key=_cons_hotness)
 
     with HOT_PAIRS_LOCK:
-        HOT_PAIRS_CACHE["candidates"] = list(valid_calls)
-        HOT_PAIRS_CACHE["consolidations"] = list(consolidation_list)
+        HOT_PAIRS_CACHE["candidates"] = list(display_calls)
+        HOT_PAIRS_CACHE["consolidations"] = list(display_cons)
+        HOT_PAIRS_CACHE["candidates_pool"] = list(cand_pool)
+        HOT_PAIRS_CACHE["consolidations_pool"] = list(cons_pool)
         HOT_PAIRS_CACHE["ts"] = time.time()
 
     def cand_line(i, s, with_link):
@@ -2227,7 +2374,10 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         f"{MAX_TRADES_PER_HOUR} в час",
         f"ℹ️ Показаны {MAX_SHOW_CANDIDATES} кандидатов + "
         f"{MAX_SHOW_CONSOLIDATIONS} боковиков.",
-        f"⚡ WS-tickers следит за {tickers_count} горячими монетами в реальном времени",
+        f"⚡ WS-tickers (X): кандидаты ≤{WS_TICKERS_QUOTA_CAND} + "
+        f"боковики ≤{WS_TICKERS_QUOTA_CONS} в реальном времени",
+        f"🎯 Пороги: |MACD gap|≤{WS_HOT_NEAR_CROSS_PCT}% · "
+        f"до пробоя ≤{WS_HOT_NEAR_BREAKOUT_PCT}%",
         "🛡 PEAK-GUARD: не входим на пике (RSI≤70, дрейф≤1%, топ-15%)",
         "🔥≤1% ⚡≤3% 🟢≤5% — % до пробоя · 🥀 объём↓ · ⛔ пик · ⚠️ дрейф",
         "👇 Тапни 📈-ссылку — TradingView",
@@ -2239,16 +2389,16 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         lines.append("")
         lines.append("🔵🔵🔵 <b>ТОП КАНДИДАТОВ (CONFLUENCE)</b> 🔵🔵🔵")
         lines.append("<blockquote expandable>")
-        if valid_calls:
-            for i, s in enumerate(valid_calls[:max_cand], 1):
+        if display_calls:
+            for i, s in enumerate(display_calls[:max_cand], 1):
                 lines.append(cand_line(i, s, with_links))
         else:
             lines.append("😴 готовых кандидатов нет")
         lines.append("</blockquote>")
         lines.append("🟡🟡🟡 <b>МОНЕТЫ В БОКОВИКЕ (30–60 ДНЕЙ)</b> 🟡🟡🟡")
         lines.append("<blockquote expandable>")
-        if consolidation_list:
-            for i, item in enumerate(consolidation_list[:max_cons], 1):
+        if display_cons:
+            for i, item in enumerate(display_cons[:max_cons], 1):
                 lines.append(cons_line(i, item, with_links))
         else:
             lines.append("📦 боковиков нет")
@@ -2256,10 +2406,10 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         lines += footer
         return "\n".join(lines)
 
-    text = build(True, len(valid_calls), len(consolidation_list))
+    text = build(True, len(display_calls), len(display_cons))
     if len(text) > TG_SAFE_LIMIT:
-        for max_cand in range(len(valid_calls), 2, -1):
-            for max_cons in range(len(consolidation_list), 2, -1):
+        for max_cand in range(len(display_calls), 2, -1):
+            for max_cons in range(len(display_cons), 2, -1):
                 text = build(True, max_cand, max_cons)
                 if len(text) <= TG_SAFE_LIMIT:
                     break
@@ -2269,8 +2419,8 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         text = build(True, 5, 5)
 
     _send_to_all_one(text)
-    logger.info("Статус: %d символов, кандидатов %d, боковиков %d, tickers %d",
-                len(text), len(valid_calls), len(consolidation_list), tickers_count)
+    logger.info("Статус v20.1: %d символов · cand_pool=%d cons_pool=%d · tickers=%d",
+                len(text), len(cand_pool), len(cons_pool), tickers_count)
 
 # ==================== MAIN ====================
 def handle_stop(signum, _frame):
@@ -2280,7 +2430,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v20.0 «WS-REALTIME-HOT» (Bybit) ...")
+    logger.info("Запуск бота v20.1 «WS-REALTIME-HOT-X» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
@@ -2348,18 +2498,19 @@ if __name__ == "__main__":
     threading.Thread(target=trend_cache_loop, daemon=True).start()
     threading.Thread(target=market_context_loop, daemon=True).start()
     threading.Thread(target=polling_loop, daemon=True).start()
-    # ⚡ WS-tickers
     threading.Thread(target=run_tickers_websocket, daemon=True).start()
     threading.Thread(target=tickers_refresh_loop, daemon=True).start()
 
     _send_to_all_one(
-        f"🟢 <b>СКАНЕР v20.0 «WS-REALTIME-HOT» ЗАПУЩЕН</b>\n"
+        f"🟢 <b>СКАНЕР v20.1 «WS-REALTIME-HOT-X» ЗАПУЩЕН</b>\n"
         f"WS kline: {len(PAIRS_WS)} пар · динам. подписка\n"
-        f"⚡ WS tickers: до {WS_TICKERS_MAX_PAIRS} горячих пар в реальном времени\n"
+        f"⚡ WS tickers (X): квоты {WS_TICKERS_QUOTA_CAND} cand + "
+        f"{WS_TICKERS_QUOTA_CONS} cons (макс {WS_TICKERS_MAX_PAIRS})\n"
+        f"🎯 Пороги близости: |MACD gap|≤{WS_HOT_NEAR_CROSS_PCT}% · "
+        f"до пробоя ≤{WS_HOT_NEAR_BREAKOUT_PCT}%\n"
         f"Тренд 3/3: {q3} · BTC: {'OK' if market_allows_longs() else 'БЛОК'}\n"
         f"🛡 PEAK-GUARD: не входим на пике (RSI≤{PEAK_MAX_RSI}, "
         f"дрейф≤{PEAK_MAX_DRIFT_PCT}%)\n"
-        f"🟢 BTC-адаптив: при БЛОК сильные (T3/3+score≥8) → ×0.5\n"
         f"ℹ️ Показ: {MAX_SHOW_CANDIDATES} кандидатов + "
         f"{MAX_SHOW_CONSOLIDATIONS} боковиков\n"
         f"👥 Подписчиков: {len(SUBSCRIBERS)} · /start · /stop · /help")
