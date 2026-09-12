@@ -2,19 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v19.8.1 «BTC-ADAPTIVE+HOT» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
+BYBIT SCANNER v19.8.2 «TOP-10 HOT» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
-НОВОЕ В v19.8.1 (относительно v19.8.0):
-• Боковики сортируются по % до пробоя (самые горячие — наверх).
-• Метки готовности к пробою:
-  🔥 — цена ≤1% от 🚀 (на грани)
-  ⚡ — цена ≤3% от 🚀 (готовится)
-  🟢 — цена ≤5% от 🚀 (близко)
-• Показывается до ~30 боковиков (вместо 6) за счёт компактного формата.
-• Кандидаты остались как в v19.8.0 (T3/3 наверх, ✨ = полная готовность).
-• Вся логика BTC-адаптивного фильтра сохранена.
+НОВОЕ В v19.8.2 (относительно v19.8.1):
+• В статусе показываются РОВНО 10 кандидатов + 10 боковиков —
+  только самые горячие (ближайшие ко входу).
+• Ссылки TradingView работают ВСЕГДА (не жертвуем кликабельностью).
+• Убран fallback без ссылок — если не влезает, режем списки, но
+  ссылки сохраняем.
+• Все метки сохранены: 🔥⚡🟢✨⏳🟡⚠️↑🥀
+• В footer добавлена пометка "показаны 10 самых горячих".
 ==============================================================================
 """
 import json
@@ -131,10 +130,14 @@ STATUS_ADX_MIN, STATUS_ADX_MAX = 18, 55
 STATUS_MIN_PRICE = 0.0001
 STATUS_READY_SCORE = 3
 
-# --- ПОРОГИ «ГОРЯЧЕСТИ» БОКОВИКОВ (v19.8.1) ---
-HOT_DIST_PCT_1 = 1.0    # 🔥 — на грани
-HOT_DIST_PCT_2 = 3.0    # ⚡ — готовится
-HOT_DIST_PCT_3 = 5.0    # 🟢 — близко
+# --- ПОРОГИ «ГОРЯЧЕСТИ» БОКОВИКОВ ---
+HOT_DIST_PCT_1 = 1.0
+HOT_DIST_PCT_2 = 3.0
+HOT_DIST_PCT_3 = 5.0
+
+# --- ЛИМИТЫ ОТОБРАЖЕНИЯ В СТАТУСЕ ---
+MAX_SHOW_CANDIDATES = 10
+MAX_SHOW_CONSOLIDATIONS = 10
 
 TREND_CACHE_REFRESH_SECONDS = 1800
 TREND_CACHE_INITIAL_LIMIT = 60
@@ -439,12 +442,12 @@ def tv_link(symbol: str) -> str:
     return f'<a href="{url}">📈 {symbol}</a>'
 
 HELP_TEXT = (
-    "📡 <b>Bybit Scanner v19.8.1 — справка</b>\n"
+    "📡 <b>Bybit Scanner v19.8.2 — справка</b>\n"
     "Бот шлёт: входы/выходы, частичные TP и ОДИН статус каждые 2 часа.\n"
-    "🟢 Адаптивный BTC-фильтр: при БЛОК BTC сильные сигналы (T3/3 + score≥8) "
-    "проходят с уменьшенным размером ×0.5.\n"
-    "🔥 горячий боковик (≤1% до пробоя) · ⚡ готовится (≤3%) · 🟢 близко (≤5%).\n"
-    "💰 текущая цена · 🎯~ вход · 🚀 пробой · ✨ готов · 🥀 объём↓\n"
+    "🟢 BTC-адаптив: при БЛОК сильные (T3/3+score≥8) → размер ×0.5.\n"
+    "🔥≤1% ⚡≤3% 🟢≤5% — сортировка боковиков по % до пробоя.\n"
+    "💰 текущая · 🎯~ вход · 🚀 пробой · ✨ готов · 🥀 объём↓\n"
+    "Показываются 10 самых горячих кандидатов и 10 ближайших боковиков.\n"
     "Команды: /stop — отписаться, /help — справка."
 )
 
@@ -1689,7 +1692,7 @@ def background_scan_loop():
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
 
-# ==================== СТАТУС: ОДНО СООБЩЕНИЕ (v19.8.1) ====================
+# ==================== СТАТУС: ОДНО СООБЩЕНИЕ (v19.8.2) ====================
 def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     with state_lock:
         open_snapshot = [(pair, dict(pos)) for pair, pos in state.items()
@@ -1709,7 +1712,7 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         btc_state_str += " · сильные T3/3 score≥8 → ×0.5"
 
     header = [
-        f"📡 <b>СТАТУС v19.8.1 (Bybit)</b> | <i>{now_str} UTC</i>",
+        f"📡 <b>СТАТУС v19.8.2 (Bybit)</b> | <i>{now_str} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔹 Пар WS: <b>{len(PAIRS_WS)}</b> · Тренд 3/3: <b>{q3}</b>",
         f"🔹 BTC: <b>{btc_state_str}</b>",
@@ -1736,6 +1739,7 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
     else:
         pos_lines.append("💰 Позиций нет")
 
+    # Фильтр кандидатов (cosmetic)
     valid_calls = [
         s for s in scan_summary
         if s["trend_score"] >= 2
@@ -1755,6 +1759,10 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         dist_pct = (lvl - cur) / cur * 100
         return max(dist_pct, 0)
     consolidation_list = sorted(consolidation_list, key=_hot_score)
+
+    # Ограничение показа: 10 + 10
+    valid_calls = valid_calls[:MAX_SHOW_CANDIDATES]
+    consolidation_list = consolidation_list[:MAX_SHOW_CONSOLIDATIONS]
 
     def cand_line(i, s, with_link):
         gap = s.get("macd_gap_pct", 0)
@@ -1802,6 +1810,8 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔄 Следующий статус через 2 ч · лимиты {MAX_OPEN_POSITIONS} поз / "
         f"{MAX_TRADES_PER_HOUR} в час",
+        f"ℹ️ Показаны {MAX_SHOW_CANDIDATES} самых горячих кандидатов "
+        f"и {MAX_SHOW_CONSOLIDATIONS} ближайших боковиков.",
         "🔥≤1% ⚡≤3% 🟢≤5% — % до пробоя боковика",
         "💰 текущая · 🎯~ вход · 🚀 пробой · ✨ готов · 🥀 объём↓",
         "👇 Тапни 📈-ссылку в списке — график TradingView",
@@ -1816,8 +1826,6 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         if valid_calls:
             for i, s in enumerate(valid_calls[:max_cand], 1):
                 lines.append(cand_line(i, s, with_links))
-            if len(valid_calls) > max_cand:
-                lines.append(f"… и ещё {len(valid_calls) - max_cand}")
         else:
             lines.append("😴 готовых кандидатов нет")
         lines.append("</blockquote>")
@@ -1826,32 +1834,24 @@ def send_status(scan_summary, consolidation_list, found_buy, found_sell):
         if consolidation_list:
             for i, item in enumerate(consolidation_list[:max_cons], 1):
                 lines.append(cons_line(i, item, with_links))
-            if len(consolidation_list) > max_cons:
-                lines.append(f"… и ещё {len(consolidation_list) - max_cons}")
         else:
             lines.append("📦 боковиков нет")
         lines.append("</blockquote>")
         lines += footer
         return "\n".join(lines)
 
-    text = None
-    for with_links in (True, False):
-        max_cand, max_cons = len(valid_calls), len(consolidation_list)
-        while True:
-            text = build(with_links, max_cand, max_cons)
+    # ВСЕГДА со ссылками. Если не влезает — режем по одному, но ссылки сохраняем.
+    text = build(True, len(valid_calls), len(consolidation_list))
+    if len(text) > TG_SAFE_LIMIT:
+        for max_cand in range(len(valid_calls), 2, -1):
+            for max_cons in range(len(consolidation_list), 2, -1):
+                text = build(True, max_cand, max_cons)
+                if len(text) <= TG_SAFE_LIMIT:
+                    break
             if len(text) <= TG_SAFE_LIMIT:
                 break
-            if max_cons > 25:
-                max_cons = max(25, max_cons - 10)
-            elif max_cand > 3:
-                max_cand = max(3, max_cand - 3)
-            else:
-                break
-        if text and len(text) <= TG_SAFE_LIMIT:
-            break
-
-    if text is None or len(text) > TG_SAFE_LIMIT:
-        text = build(False, 3, 25)
+    if len(text) > TG_SAFE_LIMIT:
+        text = build(True, 5, 5)
 
     _send_to_all_one(text)
     logger.info("Статус отправлен: %d символов, кандидатов %d, боковиков %d",
@@ -1865,7 +1865,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v19.8.1 «BTC-ADAPTIVE+HOT» (Bybit) ...")
+    logger.info("Запуск бота v19.8.2 «TOP-10 HOT» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
@@ -1934,11 +1934,13 @@ if __name__ == "__main__":
     threading.Thread(target=polling_loop, daemon=True).start()
 
     _send_to_all_one(
-        f"🟢 <b>СКАНЕР v19.8.1 «BTC-ADAPTIVE+HOT» ЗАПУЩЕН</b>\n"
+        f"🟢 <b>СКАНЕР v19.8.2 «TOP-10 HOT» ЗАПУЩЕН</b>\n"
         f"WS: {len(PAIRS_WS)} пар + динам. подписка\n"
         f"Тренд 3/3: {q3} · BTC: {'OK' if market_allows_longs() else 'БЛОК'}\n"
         f"🟢 BTC-адаптив: при БЛОК сильные (T3/3+score≥8) → ×0.5\n"
         f"🔥≤1% ⚡≤3% 🟢≤5% — сортировка боковиков по % до пробоя\n"
+        f"ℹ️ Показ: {MAX_SHOW_CANDIDATES} кандидатов + "
+        f"{MAX_SHOW_CONSOLIDATIONS} боковиков (все со ссылками TradingView)\n"
         f"Лимиты: {MAX_OPEN_POSITIONS} поз / {MAX_TRADES_PER_HOUR} в час · "
         f"порог score {MIN_SIGNAL_SCORE}/10\n"
         f"👥 Подписчиков: {len(SUBSCRIBERS)} · /start · /stop · /help")
