@@ -2,20 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v20.3.1 «DIP-FIRST + BTC-BYPASS» — ЕДИНЫЙ ФАЙЛ VPS
+BYBIT SCANNER v21.0.0 «WT + SQUEEZE + DIP-FIRST» — ЕДИНЫЙ ФАЙЛ VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
-НОВОЕ В v20.3.1 (относительно v20.3.0):
-• 🔧 BTC-фильтр: dip-buy и BOTTOM-сигналы (Confluence/Pullback в нижних 30% дня)
-  обходят блок. Пороги ослаблены: -10%/6ч и ADX>55.
-  Теперь обычный нисходящий тренд BTC не блокирует входы.
-
-НОВОЕ В v20.3.0 (относительно v20.2.1):
-• 💎 RSI-DIPBUY переписан: «зона + отскок» вместо жёсткого кросса 30→33
-• 🎯 Confluence и Pullback: фильтр «нижние 30% 24ч-диапазона»
-• ⚡ WS dip-пул расширен: RSI 25–45
-• 📦 Breakout / Retest — не тронуты
+НОВОЕ В v21.0.0 (относительно v20.3.1):
+• 🌊 WaveTrend (LazyBear) — встроен в dip-buy (+2 к score), Confluence/Pullback
+  (обход BTC при WT-кросс внизу), отдельная стратегия WT-DIP.
+• 💥 Squeeze Momentum (LazyBear) — детект «сжатия → выпуск» в боковиках,
+  отдельная стратегия SQZ-BREAKOUT с пониженным требованием к объёму (1.4×).
+• 🌊+💥 SQZ-release даёт +1 к score в dip-buy.
+• 5 стратегий: Confluence, Pullback, RSI-DIPBUY, WT-DIP, SQZ-BREAKOUT
+  + Breakout, Retest.
 ==============================================================================
 """
 import json
@@ -70,11 +68,11 @@ RETEST_TOUCH_TOLERANCE_PCT = 0.8
 RETEST_SL_ATR = 1.5
 RETEST_TP_ATR = 4.0
 
-# --- BTC-ФИЛЬТР (v20.3.1: ослабленные пороги) ---
+# --- BTC-ФИЛЬТР ---
 BTC_CONTEXT_ENABLED = True
 BTC_CONTEXT_TTL = 300
-BTC_DROP_6H_PCT = -10.0           # 🔧 было -7.0
-BTC_ADX_BLOCK_THRESHOLD = 55      # 🔧 было 45
+BTC_DROP_6H_PCT = -10.0
+BTC_ADX_BLOCK_THRESHOLD = 55
 BTC_ALLOW_STRONG_WHEN_BLOCKED = True
 BTC_STRONG_MIN_TREND_SCORE = 3
 BTC_STRONG_MIN_SCORE = 8
@@ -145,7 +143,7 @@ DAILY_REGIME_FILTER_ENABLED = True
 DAILY_REGIME_BLOCK_BELOW_SCORE = 7
 DAILY_REGIME_FETCH_BARS = 260
 
-# --- RSI DIP-BUY (v20.3.0 «DIP-FIRST») ---
+# --- RSI DIP-BUY ---
 DIPBUY_ENABLED = True
 DIPBUY_RSI_ZONE = 35
 DIPBUY_RSI_MIN_BARS = 3
@@ -163,6 +161,35 @@ BOTTOM_FILTER_ENABLED = True
 BOTTOM_FILTER_PCT = 0.30
 BOTTOM_FILTER_LOOKBACK_BARS = 96
 
+# --- WAVETREND (LazyBear) v21.0.0 ---
+WT_ENABLED = True
+WT_N1 = 10
+WT_N2 = 21
+WT_SMA_LEN = 4
+WT_OS1 = -60
+WT_OS2 = -53
+WT_OB1 = 60
+WT_OB2 = 53
+WT_DIP_STRATEGY_ENABLED = True
+WT_CONFIRM_BYPASS_BTC = True
+WT_DIP_SL_ATR = 2.5
+WT_DIP_TP_ATR = 5.0
+WT_HOT_RSI_MIN = 25
+WT_HOT_RSI_MAX = 55
+
+# --- SQUEEZE MOMENTUM (LazyBear) v21.0.0 ---
+SQZ_ENABLED = True
+SQZ_BB_LEN = 20
+SQZ_BB_MULT = 2.0
+SQZ_KC_LEN = 20
+SQZ_KC_MULT = 1.5
+SQZ_BREAKOUT_VOL_MULT = 1.4
+SQZ_RELEASE_MAX_BARS = 3
+SQZ_BREAKOUT_STRATEGY_ENABLED = True
+SQZ_DIP_STRATEGY_ENABLED = True
+SQZ_DIP_SL_ATR = 2.5
+SQZ_DIP_TP_ATR = 5.0
+
 # --- ПОРОГИ «ГОРЯЧЕСТИ» БОКОВИКОВ ---
 HOT_DIST_PCT_1 = 1.0
 HOT_DIST_PCT_2 = 3.0
@@ -171,6 +198,7 @@ HOT_DIST_PCT_3 = 5.0
 MAX_SHOW_CANDIDATES = 10
 MAX_SHOW_CONSOLIDATIONS = 10
 MAX_SHOW_DIPBUY = 5
+MAX_SHOW_WTDIP = 5
 
 # --- ⚡ WS-REALTIME-HOT ---
 WS_TICKERS_ENABLED = True
@@ -218,7 +246,6 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("bybit-scanner")
-
 # ==================== ГЛОБАЛЬНОЕ СОСТОЯНИЕ ====================
 state = {}
 state_lock = threading.RLock()
@@ -249,9 +276,11 @@ HOT_PAIRS_CACHE = {
     "candidates_pool": [],
     "consolidations_pool": [],
     "dipbuy_pool": [],
+    "wtdip_pool": [],
     "candidates": [],
     "consolidations": [],
     "dipbuy": [],
+    "wtdip": [],
     "ts": 0.0,
 }
 HOT_PAIRS_LOCK = threading.RLock()
@@ -366,11 +395,13 @@ def is_strong_signal_for_blocked_market(signal):
             and score >= BTC_STRONG_MIN_SCORE)
 
 def _signal_bypasses_btc(signal):
-    """v20.3.1: dip-buy и BOTTOM-сигналы (Confluence/Pullback в нижних 30% дня)
+    """dip-buy / WT-dip / SQZ-dip / BOTTOM / WT-confirm / SQZ-release
     обходят BTC-фильтр — покупаем слабость, а не пик."""
     if not signal:
         return False
-    if signal.get("strategy") == "rsi_dipbuy":
+    if signal.get("strategy") in ("rsi_dipbuy", "wt_dip", "sqz_dip"):
+        return True
+    if signal.get("wt_confirm") or signal.get("sqz_release"):
         return True
     return bool(signal.get("bottom_ok"))
 
@@ -598,14 +629,15 @@ def tv_link(symbol: str) -> str:
     return f'<a href="{url}">📈 {symbol}</a>'
 
 HELP_TEXT = (
-    "📡 <b>Bybit Scanner v20.3.1 «DIP-FIRST + BTC-BYPASS» — справка</b>\n"
+    "📡 <b>Bybit Scanner v21.0.0 «WT + SQUEEZE + DIP-FIRST» — справка</b>\n"
     "Бот шлёт: входы/выходы, частичные TP и ОДИН статус каждые 2 часа.\n"
     "⚡ WS-REALTIME-HOT: 15 cand + 15 cons + 10 dip в реальном времени.\n"
     "🐂 Дневной режим (EMA50/200 на 1D): в bear пускаем только сильные.\n"
     "💎 RSI-DIPBUY: RSI(15m) в зоне ≤35 × 3 свечи → отскок + BB + объём + 1D bull.\n"
+    "🌊 WT-DIP: WaveTrend кросс внизу + BOTTOM + 1D bull.\n"
+    "💥 SQZ-BREAKOUT: Squeeze Momentum release + пробой уровня (объём 1.4×).\n"
     "🎯 DIP-FIRST: Confluence/Pullback входят в нижних 30% дня.\n"
-    "🔧 BTC-фильтр: -10%/6ч или ADX>55. dip-buy и 🎯BOTTOM обходят.\n"
-    "📦 Breakout / Retest — под BTC-фильтром (без обхода).\n"
+    "🔧 BTC-фильтр: -10%/6ч или ADX>55. dip-buy / WT-dip / SQZ-dip и 🎯BOTTOM обходят.\n"
     "🛡 PEAK-GUARD: не входим на пике (RSI≤70, дрейф≤1%).\n"
     "Команды: /stop — отписаться, /help — справка."
 )
@@ -716,7 +748,6 @@ def log_trade(symbol, entry, exit_price, reason, strategy,
         if traded_fraction >= 1.0:
             cb_register(net_pnl)
         return round(net_pnl, 2)
-
 # ==================== ИНДИКАТОРЫ ====================
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
@@ -748,6 +779,167 @@ def adx(df, period=14):
     dx = 100 * np.abs((plus_di - minus_di) / di_sum)
     return dx.ewm(alpha=1 / period, adjust=False).mean()
 
+# ==================== 🌊 WAVETREND (LazyBear) v21.0.0 ====================
+def wavetrend(df, n1=10, n2=21, sma_len=4):
+    """LazyBear WaveTrend Oscillator.
+    Возвращает (wt1, wt2) как pd.Series.
+    Формулы (Pine):
+      ap = hlc3
+      esa = EMA(ap, n1)
+      d = EMA(|ap - esa|, n1)
+      ci = (ap - esa) / (0.015 * d)
+      tci = EMA(ci, n2)
+      wt1 = tci
+      wt2 = SMA(wt1, 4)
+    """
+    ap = (df["high"] + df["low"] + df["close"]) / 3.0
+    esa = ap.ewm(span=n1, adjust=False).mean()
+    d = (ap - esa).abs().ewm(span=n1, adjust=False).mean()
+    ci = (ap - esa) / (0.015 * d.replace(0, np.nan))
+    tci = ci.ewm(span=n2, adjust=False).mean()
+    wt1 = tci
+    wt2 = wt1.rolling(sma_len).mean()
+    return wt1, wt2
+
+
+def detect_wt_buy_cross(df, os_level=None):
+    """True, если wt1 пересёк wt2 снизу вверх при wt1 < os_level (по умолчанию WT_OS2)."""
+    if not WT_ENABLED:
+        return False
+    if os_level is None:
+        os_level = WT_OS2
+    if len(df) < 25:
+        return False
+    try:
+        wt1, wt2 = wavetrend(df, WT_N1, WT_N2, WT_SMA_LEN)
+    except Exception:
+        return False
+    if len(wt1) < 3:
+        return False
+    prev1, prev2 = wt1.iloc[-3], wt2.iloc[-3]
+    last1, last2 = wt1.iloc[-2], wt2.iloc[-2]
+    if pd.isna(prev1) or pd.isna(prev2) or pd.isna(last1) or pd.isna(last2):
+        return False
+    cross_up = prev1 <= prev2 and last1 > last2
+    return bool(cross_up and last1 < os_level)
+
+
+def detect_wt_sell_cross(df, ob_level=None):
+    """True, если wt1 пересёк wt2 сверху вниз при wt1 > ob_level."""
+    if not WT_ENABLED:
+        return False
+    if ob_level is None:
+        ob_level = WT_OB2
+    if len(df) < 25:
+        return False
+    try:
+        wt1, wt2 = wavetrend(df, WT_N1, WT_N2, WT_SMA_LEN)
+    except Exception:
+        return False
+    if len(wt1) < 3:
+        return False
+    prev1, prev2 = wt1.iloc[-3], wt2.iloc[-3]
+    last1, last2 = wt1.iloc[-2], wt2.iloc[-2]
+    if pd.isna(prev1) or pd.isna(prev2) or pd.isna(last1) or pd.isna(last2):
+        return False
+    cross_down = prev1 >= prev2 and last1 < last2
+    return bool(cross_down and last1 > ob_level)
+
+
+# ==================== 💥 SQUEEZE MOMENTUM (LazyBear) v21.0.0 ====================
+def squeeze_momentum(df, bb_len=20, bb_mult=2.0, kc_len=20, kc_mult=1.5):
+    """LazyBear Squeeze Momentum Indicator.
+    Возвращает (val, sqz_on, sqz_off) как pd.Series.
+    BB — Bollinger Bands (bb_len, bb_mult).
+    KC — Keltner Channels (kc_len, kc_mult) с TrueRange.
+    val — момент (linreg residual) на базе 20-периодной линейной регрессии.
+    """
+    src = df["close"]
+    basis = src.rolling(bb_len).mean()
+    dev = bb_mult * src.rolling(bb_len).std(ddof=0)
+    upper_bb = basis + dev
+    lower_bb = basis - dev
+
+    ma = src.rolling(kc_len).mean()
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift()).abs(),
+        (df["low"] - df["close"].shift()).abs(),
+    ], axis=1).max(axis=1)
+    rangema = tr.rolling(kc_len).mean()
+    upper_kc = ma + rangema * kc_mult
+    lower_kc = ma - rangema * kc_mult
+
+    sqz_on = (lower_bb > lower_kc) & (upper_bb < upper_kc)
+    sqz_off = (lower_bb < lower_kc) & (upper_bb > upper_kc)
+
+    hh = df["high"].rolling(kc_len).max()
+    ll = df["low"].rolling(kc_len).min()
+    mid = (hh + ll) / 2.0
+    sma_close = src.rolling(kc_len).mean()
+    delta = src - (mid + sma_close) / 2.0
+    try:
+        val = delta.rolling(kc_len).apply(
+            lambda y: np.polyval(np.polyfit(np.arange(len(y)), y, 1), len(y) - 1)
+            if not np.any(np.isnan(y)) else np.nan,
+            raw=True)
+    except Exception:
+        val = pd.Series(np.nan, index=df.index)
+    return val, sqz_on, sqz_off
+
+
+def detect_sqz_release_bull(df, max_bars=None):
+    """True, если sqz был ON и только что OFF, val растёт.
+    max_bars — сколько свечей назад искать ON→OFF (по умолчанию SQZ_RELEASE_MAX_BARS).
+    """
+    if not SQZ_ENABLED:
+        return False
+    if max_bars is None:
+        max_bars = SQZ_RELEASE_MAX_BARS
+    if len(df) < SQZ_KC_LEN + 5:
+        return False
+    try:
+        val, sqz_on, sqz_off = squeeze_momentum(
+            df, SQZ_BB_LEN, SQZ_BB_MULT, SQZ_KC_LEN, SQZ_KC_MULT)
+    except Exception:
+        return False
+    n = len(sqz_on)
+    for i in range(1, max_bars + 1):
+        idx = n - 2 - i
+        if idx < 1:
+            return False
+        if bool(sqz_on.iloc[idx - 1]) and bool(sqz_off.iloc[idx]):
+            v_now = val.iloc[idx]
+            v_prev = val.iloc[idx - 1]
+            if pd.isna(v_now) or pd.isna(v_prev):
+                return False
+            return bool(v_now > v_prev)
+    return False
+
+
+def sqz_state(df):
+    """Возвращает состояние последней свечи:
+    (val_now, is_on, is_off, color) — цвет как в Pine:
+    'lime'/'green'/'red'/'maroon'/'grey'."""
+    if not SQZ_ENABLED or len(df) < SQZ_KC_LEN + 5:
+        return 0.0, False, False, "grey"
+    try:
+        val, sqz_on, sqz_off = squeeze_momentum(
+            df, SQZ_BB_LEN, SQZ_BB_MULT, SQZ_KC_LEN, SQZ_KC_MULT)
+    except Exception:
+        return 0.0, False, False, "grey"
+    v_now = float(val.iloc[-2]) if not pd.isna(val.iloc[-2]) else 0.0
+    v_prev = float(val.iloc[-3]) if len(val) > 3 and not pd.isna(val.iloc[-3]) else v_now
+    is_on = bool(sqz_on.iloc[-2]) if not pd.isna(sqz_on.iloc[-2]) else False
+    is_off = bool(sqz_off.iloc[-2]) if not pd.isna(sqz_off.iloc[-2]) else False
+    if v_now > 0:
+        color = "lime" if v_now > v_prev else "green"
+    else:
+        color = "maroon" if v_now > v_prev else "red"
+    return v_now, is_on, is_off, color
+
+
+# ==================== ANALYZE TIMEFRAME ====================
 def analyze_timeframe(df, params):
     if df.empty or len(df) < params["min_bars"]:
         return None
@@ -793,8 +985,6 @@ def analyze_timeframe(df, params):
         "ema_fast": float(last["ema_fast"]),
         "ema_slow": float(last["ema_slow"]),
     }
-
-# <<< КОНЕЦ ЧАСТИ 1 — дальше идёт ЧАСТЬ 2 >>>
 # ==================== БОКОВИКИ ====================
 def _find_cons_window(closed):
     for days in CONSOLIDATION_WINDOWS:
@@ -897,7 +1087,7 @@ def can_enter(pair, signal=None, signal_risk_pct=None):
     if not cb_can_trade():
         return False
 
-    # 🔧 v20.3.1: BTC-фильтр — dip-buy и BOTTOM-сигналы обходят блок
+    # 🔧 BTC-фильтр: dip-buy / WT-dip / SQZ-dip / BOTTOM / WT-confirm обходят
     if not market_allows_longs():
         if not _signal_bypasses_btc(signal):
             if signal is None or not is_strong_signal_for_blocked_market(signal):
@@ -1025,7 +1215,6 @@ def daily_regime_str(symbol):
     if r is False:
         return "bear"
     return "unknown"
-
 # ==================== ВСЕЛЕННАЯ ПАР ====================
 FIAT_BASES = {"AUD", "GBP", "EUR", "CAD", "CHF", "JPY", "USD",
               "BRL", "MXN", "TRY", "ZAR", "INR", "SGD", "HKD"}
@@ -1241,13 +1430,17 @@ def evaluate_ws_entry(df, symbol):
         return None
     if not _rr_ok(entry, stop, target):
         return None
-    # 🎯 v20.3.0 DIP-FIRST: Confluence только в нижних 30% дня
+    # 🎯 DIP-FIRST: Confluence только в нижних 30% дня
     if not _bottom_filter_ok(symbol, entry):
         return None
+    wt_confirm = detect_wt_buy_cross(df)
+    if wt_confirm:
+        score += 1
+        parts.append("🌊 WT-кросс +1")
     return {"entry": entry, "stop": stop, "target": target, "atr": atr_value,
             "score": score, "parts": parts, "strategy": "ws_15m",
-            "trend_score": ti["score"], "bottom_ok": True}
-
+            "trend_score": ti["score"], "bottom_ok": True,
+            "wt_confirm": wt_confirm}
 def evaluate_ws_pullback(df, symbol):
     if not PULLBACK_ENABLED or len(df) < MIN_BARS + 1:
         return None
@@ -1292,16 +1485,23 @@ def evaluate_ws_pullback(df, symbol):
         return None
     if not _rr_ok(entry, stop, target):
         return None
-    # 🎯 v20.3.0 DIP-FIRST: Pullback только в нижних 30% дня
+    # 🎯 DIP-FIRST: Pullback только в нижних 30% дня
     if not _bottom_filter_ok(symbol, entry):
         return None
+    wt_confirm = detect_wt_buy_cross(df)
+    parts = [f"Откат к EMA21 · тренд 3/3 · объём {vol_ratio:.1f}×"]
+    if wt_confirm:
+        parts.append("🌊 WT-кросс")
     return {"entry": entry, "stop": stop, "target": target, "atr": atr_value,
             "score": "PB", "trend_score": ti["score"],
-            "parts": [f"Откат к EMA21 · тренд 3/3 · объём {vol_ratio:.1f}×"],
-            "strategy": "ws_pullback", "bottom_ok": True}
+            "parts": parts,
+            "strategy": "ws_pullback", "bottom_ok": True,
+            "wt_confirm": wt_confirm}
 
-# ==================== RSI DIP-BUY v20.3.0 «DIP-FIRST» ====================
+# ==================== 💎 RSI DIP-BUY v21.0.0 ====================
 def evaluate_ws_dipbuy(df, symbol):
+    """RSI зона + отскок + BB + объём + 1D bull.
+    v21.0.0: WT-кросс даёт +2, SQZ-release даёт +1."""
     if not DIPBUY_ENABLED or len(df) < MIN_BARS + 1:
         return None
 
@@ -1371,16 +1571,113 @@ def evaluate_ws_dipbuy(df, symbol):
     ti = get_trend(symbol)
     trend_score = ti["score"] if ti else 0
 
+    wt_confirm = detect_wt_buy_cross(df)
+    sqz_release = detect_sqz_release_bull(df)
+    score = 6
+    parts = [
+        f"RSI зона≤{DIPBUY_RSI_ZONE} ×{DIPBUY_RSI_MIN_BARS}св → отскок {rsi_prev:.0f}→{rsi_now:.0f}",
+        f"Нижняя BB · Объём {vol_ratio:.1f}×",
+        "1D аптренд ✓",
+    ]
+    if wt_confirm:
+        score += 2
+        parts.append("🌊 WT-кросс +2")
+    if sqz_release:
+        score += 1
+        parts.append("💥 SQZ-release +1")
     return {
         "entry": entry, "stop": stop, "target": target, "atr": atr_value,
-        "score": 6,
+        "score": score,
         "trend_score": trend_score,
-        "parts": [
-            f"RSI зона≤{DIPBUY_RSI_ZONE} ×{DIPBUY_RSI_MIN_BARS}св → отскок {rsi_prev:.0f}→{rsi_now:.0f}",
-            f"Нижняя BB · Объём {vol_ratio:.1f}×",
-            "1D аптренд ✓",
-        ],
+        "parts": parts,
         "strategy": "rsi_dipbuy",
+        "wt_confirm": wt_confirm,
+        "sqz_release": sqz_release,
+    }
+
+# ==================== 🌊 WT-DIP (v21.0.0) ====================
+def evaluate_ws_wt_dip(df, symbol):
+    """WaveTrend кросс внизу + BOTTOM-фильтр + 1D-bull + EMA9>21."""
+    if not WT_ENABLED or not WT_DIP_STRATEGY_ENABLED:
+        return None
+    if len(df) < MIN_BARS + 1:
+        return None
+    if DIPBUY_REQUIRE_DAILY_BULL:
+        regime = daily_regime_bull(symbol)
+        if regime is not True:
+            return None
+    if not detect_wt_buy_cross(df):
+        return None
+    sig = df.iloc[-2]
+    if pd.isna(sig["atr"]) or sig["atr"] <= 0:
+        return None
+    if DIPBUY_REQUIRE_EMA_UP and not (sig["ema_fast"] > sig["ema_slow"]):
+        return None
+    if not (sig["close"] > sig["open"]):
+        return None
+    entry = float(df.iloc[-1]["close"])
+    if not _bottom_filter_ok(symbol, entry):
+        return None
+    atr_value = float(sig["atr"])
+    stop = entry - atr_value * WT_DIP_SL_ATR
+    target = entry + atr_value * WT_DIP_TP_ATR
+    if stop >= entry or target <= entry:
+        return None
+    if (entry - stop) / entry * 100 < MIN_STOP_DISTANCE_PCT:
+        return None
+    if not _rr_ok(entry, stop, target):
+        return None
+    ti = get_trend(symbol)
+    trend_score = ti["score"] if ti else 0
+    wt1, _ = wavetrend(df, WT_N1, WT_N2, WT_SMA_LEN)
+    wt_now = float(wt1.iloc[-2]) if not pd.isna(wt1.iloc[-2]) else 0.0
+    return {
+        "entry": entry, "stop": stop, "target": target, "atr": atr_value,
+        "score": 7, "trend_score": trend_score,
+        "parts": [f"🌊 WT-кросс внизу (wt1={wt_now:.0f})", "BOTTOM ✓", "1D аптренд ✓"],
+        "strategy": "wt_dip",
+        "wt_confirm": True,
+        "bottom_ok": True,
+    }
+
+# ==================== 💥 SQZ-BREAKOUT (v21.0.0) ====================
+def evaluate_ws_sqz_breakout(df, symbol, level):
+    """Squeeze Momentum release + пробой уровня (объём 1.4× вместо 1.8×)."""
+    if not SQZ_ENABLED or not SQZ_BREAKOUT_STRATEGY_ENABLED:
+        return None
+    if not level or level <= 0 or len(df) < MIN_BARS + 1:
+        return None
+    if not detect_sqz_release_bull(df):
+        return None
+    sig = df.iloc[-2]
+    if pd.isna(sig["atr"]) or sig["atr"] <= 0:
+        return None
+    last_close = float(sig["close"])
+    if last_close < level * (1 + BREAKOUT_MIN_TRIGGER_PCT / 100):
+        return None
+    if last_close > level * (1 + MAX_BREAKOUT_DISTANCE_PCT / 100):
+        return None
+    vol_ratio = float(sig["vol_ratio"]) if not pd.isna(sig["vol_ratio"]) else 0.0
+    if vol_ratio < SQZ_BREAKOUT_VOL_MULT:
+        return None
+    entry = float(df.iloc[-1]["close"])
+    atr_value = float(sig["atr"])
+    stop = entry - atr_value * ATR_MULT_SL
+    target = entry + atr_value * ATR_MULT_TP
+    if stop >= entry or target <= entry:
+        return None
+    if (entry - stop) / entry * 100 < MIN_STOP_DISTANCE_PCT:
+        return None
+    if not _rr_ok(entry, stop, target):
+        return None
+    ti = get_trend(symbol)
+    trend_score = ti["score"] if ti else 0
+    return {
+        "entry": entry, "stop": stop, "target": target, "atr": atr_value,
+        "score": 7, "trend_score": trend_score,
+        "parts": [f"💥 SQZ-release у уровня {level:.6g}", f"Объём {vol_ratio:.1f}×"],
+        "strategy": "sqz_breakout",
+        "sqz_release": True,
     }
 
 # ==================== BREAKOUT RETEST ====================
@@ -1532,7 +1829,7 @@ def try_ws_breakout(symbol, new_candle, df):
     return {"entry": entry, "stop": stop, "target": target,
             "vol_ratio": vol_ratio, "level": level}
 
-# ==================== ⚡ WS-REALTIME-HOT-X + DIP ====================
+# ==================== ⚡ WS-REALTIME-HOT-X + WT-DIP ====================
 def _cand_hotness(s):
     return abs(s.get("macd_gap_pct", 999))
 
@@ -1546,12 +1843,14 @@ def _cons_hotness(item):
 def _dip_hotness(s):
     return s.get("rsi_now", 999)
 
+def _wtdip_hotness(s):
+    return s.get("wt_now", 999)
+
 def _rebuild_hot_pools_from_buffers():
     cand_pool = []
     cons_pool = []
     dip_pool = []
-    with state_lock:
-        open_pairs = set(p for p, v in state.items() if v.get("position") == "open")
+    wtdip_pool = []
 
     for sym, buf in list(ohlc_buffers.items()):
         if not buf or len(buf) < MIN_BARS:
@@ -1571,6 +1870,7 @@ def _rebuild_hot_pools_from_buffers():
             ti = get_trend(sym)
             trend_score = ti["score"] if ti else 0
 
+            # --- cand pool ---
             if (trend_score >= 2
                     and abs(macd_gap_pct) <= WS_HOT_NEAR_CROSS_PCT):
                 cand_pool.append({
@@ -1582,6 +1882,7 @@ def _rebuild_hot_pools_from_buffers():
                     "source": "buffers",
                 })
 
+            # --- cons pool ---
             with breakout_cache_lock:
                 lvl = breakout_cache.get(sym)
             if lvl and lvl > 0:
@@ -1598,10 +1899,10 @@ def _rebuild_hot_pools_from_buffers():
                         "source": "buffers",
                     })
 
+            # --- dip pool (RSI 25–45) ---
             if DIPBUY_ENABLED and not pd.isna(last["rsi"]):
                 rsi_now = float(last["rsi"])
                 regime = daily_regime_bull(sym)
-                # v20.3.0: пул dip расширен до 25–45
                 if (regime is True
                         and WS_HOT_DIP_RSI_MIN <= rsi_now <= WS_HOT_DIP_RSI_MAX
                         and last["ema_fast"] > last["ema_slow"]):
@@ -1612,12 +1913,37 @@ def _rebuild_hot_pools_from_buffers():
                         "close_price": float(last["close"]),
                         "source": "buffers",
                     })
+
+            # --- wtdip pool (RSI 25–55, WT около зоны) ---
+            if WT_ENABLED and WT_DIP_STRATEGY_ENABLED and not pd.isna(last["rsi"]):
+                rsi_now = float(last["rsi"])
+                regime = daily_regime_bull(sym)
+                if (regime is True
+                        and WT_HOT_RSI_MIN <= rsi_now <= WT_HOT_RSI_MAX
+                        and last["ema_fast"] > last["ema_slow"]):
+                    try:
+                        wt1, wt2 = wavetrend(df, WT_N1, WT_N2, WT_SMA_LEN)
+                        wt_now = float(wt1.iloc[-2]) if not pd.isna(wt1.iloc[-2]) else 999
+                        wt_prev = float(wt1.iloc[-3]) if len(wt1) > 3 and not pd.isna(wt1.iloc[-3]) else wt_now
+                        # берём пары где WT недалеко от зоны перепроданности
+                        if wt_now <= 0 or (wt_now < 0 and wt_now > wt_prev):
+                            wtdip_pool.append({
+                                "pair": sym,
+                                "wt_now": wt_now,
+                                "rsi_now": rsi_now,
+                                "current_price": float(last["close"]),
+                                "close_price": float(last["close"]),
+                                "source": "buffers",
+                            })
+                    except Exception:
+                        pass
         except Exception as e:
             logger.debug("_rebuild_hot_pools_from_buffers %s: %s", sym, e)
 
     cand_pool.sort(key=_cand_hotness)
     cons_pool.sort(key=_cons_hotness)
     dip_pool.sort(key=_dip_hotness)
+    wtdip_pool.sort(key=_wtdip_hotness)
 
     with HOT_PAIRS_LOCK:
         if cand_pool:
@@ -1626,9 +1952,11 @@ def _rebuild_hot_pools_from_buffers():
             HOT_PAIRS_CACHE["consolidations_pool"] = cons_pool
         if dip_pool:
             HOT_PAIRS_CACHE["dipbuy_pool"] = dip_pool
+        if wtdip_pool:
+            HOT_PAIRS_CACHE["wtdip_pool"] = wtdip_pool
         HOT_PAIRS_CACHE["ts"] = time.time()
-    logger.debug("Мягкая пересборка: cand=%d cons=%d dip=%d",
-                 len(cand_pool), len(cons_pool), len(dip_pool))
+    logger.debug("Мягкая пересборка: cand=%d cons=%d dip=%d wtdip=%d",
+                 len(cand_pool), len(cons_pool), len(dip_pool), len(wtdip_pool))
 
 def update_ticker_subscription():
     if not WS_TICKERS_ENABLED:
@@ -1637,10 +1965,12 @@ def update_ticker_subscription():
         cand_pool = list(HOT_PAIRS_CACHE.get("candidates_pool") or [])
         cons_pool = list(HOT_PAIRS_CACHE.get("consolidations_pool") or [])
         dip_pool = list(HOT_PAIRS_CACHE.get("dipbuy_pool") or [])
+        wtdip_pool = list(HOT_PAIRS_CACHE.get("wtdip_pool") or [])
 
     cand_pool = sorted(cand_pool, key=_cand_hotness)
     cons_pool = sorted(cons_pool, key=_cons_hotness)
     dip_pool = sorted(dip_pool, key=_dip_hotness)
+    wtdip_pool = sorted(wtdip_pool, key=_wtdip_hotness)
 
     picked = []
     picked_set = set()
@@ -1672,7 +2002,17 @@ def update_ticker_subscription():
         picked.append(p)
         picked_set.add(p)
 
-    for pool in (cand_pool, cons_pool, dip_pool):
+    # WT-dip — добирает остаток до WS_TICKERS_MAX_PAIRS
+    for s in wtdip_pool:
+        if len(picked) >= WS_TICKERS_MAX_PAIRS:
+            break
+        p = s["pair"]
+        if p in picked_set:
+            continue
+        picked.append(p)
+        picked_set.add(p)
+
+    for pool in (cand_pool, cons_pool, dip_pool, wtdip_pool):
         if len(picked) >= WS_TICKERS_MAX_PAIRS:
             break
         for item in pool:
@@ -1719,6 +2059,7 @@ def _find_hot_entry(symbol):
         cand_pool = HOT_PAIRS_CACHE.get("candidates_pool") or []
         cons_pool = HOT_PAIRS_CACHE.get("consolidations_pool") or []
         dip_pool = HOT_PAIRS_CACHE.get("dipbuy_pool") or []
+        wtdip_pool = HOT_PAIRS_CACHE.get("wtdip_pool") or []
     cand = next((s for s in cand_pool if s["pair"] == symbol), None)
     if cand:
         return "cand", cand
@@ -1728,6 +2069,9 @@ def _find_hot_entry(symbol):
     dip = next((s for s in dip_pool if s["pair"] == symbol), None)
     if dip:
         return "dip", dip
+    wt = next((s for s in wtdip_pool if s["pair"] == symbol), None)
+    if wt:
+        return "wtdip", wt
     return None, None
 
 def _build_df_with_indicators(buf):
@@ -1746,8 +2090,14 @@ def _build_df_with_indicators(buf):
     df["ema_cross_up"] = ((df["ema_fast"] > df["ema_slow"])
                           & (df["ema_fast"].shift(1) <= df["ema_slow"].shift(1)))
     df["vol_ratio"] = df["volume"] / df["vol_sma"].replace(0, np.nan)
+    try:
+        wt1, wt2 = wavetrend(df, WT_N1, WT_N2, WT_SMA_LEN)
+        df["wt1"] = wt1
+        df["wt2"] = wt2
+    except Exception:
+        df["wt1"] = np.nan
+        df["wt2"] = np.nan
     return df
-
 def _open_on_tick(symbol, cur_price, source="tick"):
     if not WS_TICKERS_ENABLED:
         return
@@ -1765,7 +2115,7 @@ def _open_on_tick(symbol, cur_price, source="tick"):
     if df is None:
         return
 
-    # --- Кандидат ---
+    # --- Кандидат (Confluence) ---
     if kind == "cand":
         entry_ref = item.get("close_price", 0)
         if entry_ref > 0:
@@ -1877,7 +2227,7 @@ def _open_on_tick(symbol, cur_price, source="tick"):
             f"Объём: ×{vol_ratio:.1f}")
         return
 
-    # --- Dip-buy ---
+    # --- Dip-buy (RSI) ---
     if kind == "dip":
         sig = evaluate_ws_dipbuy(df, symbol)
         if sig is None:
@@ -1889,6 +2239,25 @@ def _open_on_tick(symbol, cur_price, source="tick"):
             logger.info("💎 WS-DIPBUY ВХОД %s @ %.6g", symbol, sig["entry"])
             send_telegram(
                 f"💎 <b>RSI-DIPBUY ВХОД</b>\n"
+                f"Пара: {tv_link(symbol)}\n"
+                f"Цена: {sig['entry']:.8f}\n"
+                f"SL: {sig['stop']:.8f} · TP: {sig['target']:.8f}\n"
+                f"<i>{' · '.join(sig['parts'])}</i>")
+        return
+
+    # --- WT-DIP (v21.0.0) ---
+    if kind == "wtdip":
+        sig = evaluate_ws_wt_dip(df, symbol)
+        if sig is None:
+            return
+        HOT_LAST_CHECK[symbol] = now_ts
+        with state_lock:
+            opened = open_position(symbol, sig, int(df.iloc[-2]["start"]))
+        if opened:
+            logger.info("🌊 WS-WTDIP ВХОД %s @ %.6g (WT-кросс)",
+                        symbol, sig["entry"])
+            send_telegram(
+                f"🌊 <b>WT-DIP ВХОД</b>\n"
                 f"Пара: {tv_link(symbol)}\n"
                 f"Цена: {sig['entry']:.8f}\n"
                 f"SL: {sig['stop']:.8f} · TP: {sig['target']:.8f}\n"
@@ -2039,19 +2408,28 @@ def on_message(ws, message):
                     f"SL: {breakout_sig['stop']:.8f} · TP: {breakout_sig['target']:.8f}\n"
                     f"Объём: {breakout_sig['vol_ratio']:.1f}×")
                 continue
+
             with breakout_cache_lock:
                 level = breakout_cache.get(symbol)
-            sig = evaluate_ws_retest(df, symbol, level)
-            if sig is None:
-                sig = evaluate_ws_entry(df, symbol)
+
+            # v21.0.0: приоритеты — WT-dip → RSI-dip → SQZ-breakout → Retest → Confluence → Pullback
+            sig = evaluate_ws_wt_dip(df, symbol)
             if sig is None:
                 sig = evaluate_ws_dipbuy(df, symbol)
+            if sig is None:
+                sig = evaluate_ws_sqz_breakout(df, symbol, level)
+            if sig is None:
+                sig = evaluate_ws_retest(df, symbol, level)
+            if sig is None:
+                sig = evaluate_ws_entry(df, symbol)
             if sig is None:
                 sig = evaluate_ws_pullback(df, symbol)
             if sig is None:
                 continue
+
             cur_price_ws = float(new_candle["close"])
-            if sig.get("strategy") != "rsi_dipbuy":
+            # PEAK-GUARD — не для dip-стратегий (они у дна)
+            if sig.get("strategy") not in ("rsi_dipbuy", "wt_dip", "sqz_dip"):
                 peak_ok, peak_reason, _ = check_peak_guard(df, cur_price_ws)
                 if not peak_ok:
                     logger.info("⛔ PEAK-GUARD отклонил %s: %s", symbol, peak_reason)
@@ -2064,11 +2442,19 @@ def on_message(ws, message):
                 opened = open_position(symbol, sig, closed_start)
             if opened is None:
                 continue
+
             score_txt = (f" · score {sig['score']}/10"
                          if isinstance(sig["score"], int) else f" · {sig['score']}")
             extra = btc_extra_tag(sig)
-            icon = "💎" if sig.get("strategy") == "rsi_dipbuy" else "🟢"
-            title = "RSI-DIPBUY" if sig.get("strategy") == "rsi_dipbuy" else f"ВХОД (WS{score_txt})"
+            strat = sig.get("strategy", "")
+            if strat == "rsi_dipbuy":
+                icon, title = "💎", "RSI-DIPBUY"
+            elif strat == "wt_dip":
+                icon, title = "🌊", "WT-DIP"
+            elif strat == "sqz_breakout":
+                icon, title = "💥", "SQZ-BREAKOUT"
+            else:
+                icon, title = "🟢", f"ВХОД (WS{score_txt})"
             send_telegram(
                 f"{icon} <b>{title}</b>{extra}\n"
                 f"Пара: {tv_link(symbol)} · {sig['strategy']}\n"
@@ -2107,7 +2493,6 @@ def watchdog_loop():
                 WS_APP.close()
             except Exception:
                 pass
-
 # ==================== ⚡ WEBSOCKET TICKERS ====================
 def on_tickers_open(ws):
     logger.info("⚡ WS tickers подключен. Подписка на %d пар...",
@@ -2195,6 +2580,7 @@ def tickers_refresh_loop():
             update_ticker_subscription()
         except Exception as e:
             logger.error("tickers_refresh_loop: %s", e)
+
 # ==================== ФОНОВОЕ СКАНИРОВАНИЕ ====================
 TIMEFRAME_PARAMS = {
     "15m": {"bybit_interval": "15",  "min_bars": 80,  "ema_fast": 9,  "ema_slow": 21},
@@ -2267,6 +2653,7 @@ def background_scan_loop():
             scan_summary = []
             consolidation_list = []
             dipbuy_candidates = []
+            wtdip_candidates = []
             consolidation_seen = set()
             now_iso = datetime.now(timezone.utc).isoformat()
             daily_cache = {}
@@ -2306,6 +2693,7 @@ def background_scan_loop():
                         "current_price": current_price,
                     })
 
+                    # --- dip-кандидаты (RSI 25–45) ---
                     if DIPBUY_ENABLED:
                         buf = ohlc_buffers.get(pair)
                         if buf and len(buf) >= MIN_BARS + 1:
@@ -2313,7 +2701,6 @@ def background_scan_loop():
                             if df15 is not None:
                                 last15 = df15.iloc[-2]
                                 rsi_now = float(last15["rsi"]) if not pd.isna(last15["rsi"]) else None
-                                # v20.3.0: диапазон 25–45
                                 if rsi_now is not None and WS_HOT_DIP_RSI_MIN <= rsi_now <= WS_HOT_DIP_RSI_MAX:
                                     regime = daily_regime_bull(pair)
                                     if regime is True and last15["ema_fast"] > last15["ema_slow"]:
@@ -2323,6 +2710,32 @@ def background_scan_loop():
                                             "current_price": current_price,
                                             "close_price": float(last15["close"]),
                                         })
+
+                    # --- WT-dip кандидаты ---
+                    if WT_ENABLED and WT_DIP_STRATEGY_ENABLED:
+                        buf = ohlc_buffers.get(pair)
+                        if buf and len(buf) >= MIN_BARS + 1:
+                            df15 = _build_df_with_indicators(buf)
+                            if df15 is not None:
+                                last15 = df15.iloc[-2]
+                                rsi_now = float(last15["rsi"]) if not pd.isna(last15["rsi"]) else None
+                                regime = daily_regime_bull(pair)
+                                if (rsi_now is not None
+                                        and WT_HOT_RSI_MIN <= rsi_now <= WT_HOT_RSI_MAX
+                                        and regime is True
+                                        and last15["ema_fast"] > last15["ema_slow"]):
+                                    try:
+                                        wt1s, _ = wavetrend(df15, WT_N1, WT_N2, WT_SMA_LEN)
+                                        wt_now = float(wt1s.iloc[-2]) if not pd.isna(wt1s.iloc[-2]) else 999
+                                        if wt_now <= 0:
+                                            wtdip_candidates.append({
+                                                "pair": pair,
+                                                "wt_now": wt_now,
+                                                "rsi_now": rsi_now,
+                                                "current_price": current_price,
+                                            })
+                                    except Exception:
+                                        pass
 
                     cons = detect_consolidation(df_daily)
                     if cons and pair not in consolidation_seen:
@@ -2334,7 +2747,7 @@ def background_scan_loop():
                                                   now_iso, r4h=r4h)
                     if breakout:
                         found_buy += 1
-                        extra = btc_extra_tag(None)   # v20.3.1
+                        extra = btc_extra_tag(None)
                         send_telegram(
                             f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>{extra}\n"
                             f"Пара: {tv_link(pair)}\n"
@@ -2342,6 +2755,7 @@ def background_scan_loop():
                             f"SL: {breakout['stop']:.8f} · TP: {breakout['target']:.8f}\n"
                             f"Дней в боковике: {breakout['days']} · "
                             f"объём ×1.8 · ADX {breakout['adx']:.0f}")
+
                     messages = []
                     time_stopped = False
                     with state_lock:
@@ -2438,7 +2852,7 @@ def background_scan_loop():
                     breakout = try_open_breakout(pair, df_daily, current_price, now_iso)
                     if breakout:
                         found_buy += 1
-                        extra = btc_extra_tag(None)   # v20.3.1
+                        extra = btc_extra_tag(None)
                         send_telegram(
                             f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>{extra}\n"
                             f"Пара: {tv_link(pair)}\n"
@@ -2475,7 +2889,7 @@ def background_scan_loop():
                 logger.error("Ошибка очистки state: %s", e)
 
             send_status(scan_summary, consolidation_list, dipbuy_candidates,
-                        found_buy, found_sell)
+                        wtdip_candidates, found_buy, found_sell)
             try:
                 update_ticker_subscription()
             except Exception as e:
@@ -2484,10 +2898,9 @@ def background_scan_loop():
         except Exception as e:
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
-
-# ==================== СТАТУС (v20.3.1) ====================
+# ==================== СТАТУС (v21.0.0) ====================
 def send_status(scan_summary, consolidation_list, dipbuy_candidates,
-                found_buy, found_sell):
+                wtdip_candidates, found_buy, found_sell):
     with state_lock:
         open_snapshot = [(pair, dict(pos)) for pair, pos in state.items()
                          if pos.get("position") == "open"]
@@ -2503,15 +2916,15 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         tickers_count = len(WS_TICKER_PAIRS)
 
     breakout_strategies = ("breakout", "breakout_ws", "breakout_retest",
-                           "breakout_realtime")
+                           "breakout_realtime", "sqz_breakout")
     now_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M")
 
     btc_state_str = "OK" if mok else f"БЛОК: {mreason}"
     if not mok and BTC_ALLOW_STRONG_WHEN_BLOCKED:
-        btc_state_str += " · dip-buy + 🎯BOTTOM обходят"
+        btc_state_str += " · dip/WT/BOTTOM обходят"
 
     header = [
-        f"📡 <b>СТАТУС v20.3.1 «DIP-FIRST + BTC-BYPASS»</b> | <i>{now_str} UTC</i>",
+        f"📡 <b>СТАТУС v21.0.0 «WT + SQUEEZE + DIP-FIRST»</b> | <i>{now_str} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔹 Пар WS kline: <b>{len(PAIRS_WS)}</b> · Тренд 3/3: <b>{q3}</b>",
         f"🔹 1D-bull (EMA50&gt;200): <b>{bull_1d}</b> пар",
@@ -2520,12 +2933,15 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         f"dip ≤{WS_TICKERS_QUOTA_DIP})",
         f"🔹 BTC: <b>{btc_state_str}</b>",
         f"🔹 Боковиков: <b>{len(consolidation_list)}</b> · "
-        f"Dip-buy кандидатов: <b>{len(dipbuy_candidates)}</b>",
+        f"RSI-dip: <b>{len(dipbuy_candidates)}</b> · "
+        f"WT-dip: <b>{len(wtdip_candidates)}</b>",
         f"🔹 Позиций: <b>{len(open_snapshot)}/{MAX_OPEN_POSITIONS}</b> · "
         f"Входов: <b>{found_buy}</b> · Выходов: <b>{found_sell}</b> · 👥 {subs_count}",
         f"🔹 🛡 PEAK-GUARD: <b>{'ON' if PEAK_GUARD_ENABLED else 'OFF'}</b> · "
         f"1D-фильтр: <b>{'ON' if DAILY_REGIME_FILTER_ENABLED else 'OFF'}</b> · "
-        f"🎯 DIP-FIRST: <b>{'ON' if BOTTOM_FILTER_ENABLED else 'OFF'}</b>",
+        f"🎯 DIP-FIRST: <b>{'ON' if BOTTOM_FILTER_ENABLED else 'OFF'}</b> · "
+        f"🌊 WT: <b>{'ON' if WT_ENABLED else 'OFF'}</b> · "
+        f"💥 SQZ: <b>{'ON' if SQZ_ENABLED else 'OFF'}</b>",
     ]
     if not cb_can_trade():
         header.append("🔹 🛑 Circuit breaker: <b>входы на паузе</b>")
@@ -2538,6 +2954,10 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
             strat = pos.get("strategy", "")
             if strat == "rsi_dipbuy":
                 tag = "💎"
+            elif strat == "wt_dip":
+                tag = "🌊"
+            elif strat == "sqz_breakout":
+                tag = "💥"
             elif strat in breakout_strategies:
                 tag = "📦"
             else:
@@ -2576,10 +2996,12 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         return max(dist_pct, 0)
     consolidation_list = sorted(consolidation_list, key=_hot_score)
     dipbuy_candidates = sorted(dipbuy_candidates, key=lambda x: x.get("rsi_now", 999))
+    wtdip_candidates = sorted(wtdip_candidates, key=lambda x: x.get("wt_now", 999))
 
     display_calls = valid_calls[:MAX_SHOW_CANDIDATES]
     display_cons = consolidation_list[:MAX_SHOW_CONSOLIDATIONS]
     display_dip = dipbuy_candidates[:MAX_SHOW_DIPBUY]
+    display_wtdip = wtdip_candidates[:MAX_SHOW_WTDIP]
 
     cand_pool = [s for s in valid_calls
                  if abs(s.get("macd_gap_pct", 999)) <= WS_HOT_NEAR_CROSS_PCT]
@@ -2595,14 +3017,17 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
     cand_pool.sort(key=_cand_hotness)
     cons_pool.sort(key=_cons_hotness)
     dip_pool = sorted(dipbuy_candidates, key=_dip_hotness)
+    wtdip_pool = sorted(wtdip_candidates, key=_wtdip_hotness)
 
     with HOT_PAIRS_LOCK:
         HOT_PAIRS_CACHE["candidates"] = list(display_calls)
         HOT_PAIRS_CACHE["consolidations"] = list(display_cons)
         HOT_PAIRS_CACHE["dipbuy"] = list(display_dip)
+        HOT_PAIRS_CACHE["wtdip"] = list(display_wtdip)
         HOT_PAIRS_CACHE["candidates_pool"] = list(cand_pool)
         HOT_PAIRS_CACHE["consolidations_pool"] = list(cons_pool)
         HOT_PAIRS_CACHE["dipbuy_pool"] = list(dip_pool)
+        HOT_PAIRS_CACHE["wtdip_pool"] = list(wtdip_pool)
         HOT_PAIRS_CACHE["ts"] = time.time()
 
     def cand_line(i, s, with_link):
@@ -2671,29 +3096,41 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         rsi_now = s.get("rsi_now", 0)
         return f"💎{i}.{name} RSI{rsi_now:.0f} 💰{cur:.6g} (ждём отскок)"
 
+    def wtdip_line(i, s, with_link):
+        name = tv_link(s["pair"]) if with_link else s["pair"]
+        cur = s.get("current_price", 0)
+        wt_now = s.get("wt_now", 0)
+        rsi_now = s.get("rsi_now", 0)
+        return f"🌊{i}.{name} WT{wt_now:.0f} RSI{rsi_now:.0f} 💰{cur:.6g}"
+
     footer = [
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔄 Следующий статус через 2 ч · лимиты {MAX_OPEN_POSITIONS} поз / "
         f"{MAX_TRADES_PER_HOUR} в час",
-        f"ℹ️ Показаны {MAX_SHOW_CANDIDATES} кандидатов + "
-        f"{MAX_SHOW_CONSOLIDATIONS} боковиков + {MAX_SHOW_DIPBUY} dip.",
+        f"ℹ️ Показаны {MAX_SHOW_CANDIDATES} cand + {MAX_SHOW_DIPBUY} RSI-dip + "
+        f"{MAX_SHOW_WTDIP} WT-dip + {MAX_SHOW_CONSOLIDATIONS} боковиков.",
         f"⚡ WS-tickers: {WS_TICKERS_QUOTA_CAND} cand + {WS_TICKERS_QUOTA_CONS} cons + "
-        f"{WS_TICKERS_QUOTA_DIP} dip в реальном времени",
+        f"{WS_TICKERS_QUOTA_DIP} dip + WT-dip (макс {WS_TICKERS_MAX_PAIRS})",
         f"🎯 Пороги: |MACD gap|≤{WS_HOT_NEAR_CROSS_PCT}% · "
         f"до пробоя ≤{WS_HOT_NEAR_BREAKOUT_PCT}%",
         f"🐂 Дневной режим 1D: {'ON' if DAILY_REGIME_FILTER_ENABLED else 'OFF'} "
         f"(bear блокирует score&lt;{DAILY_REGIME_BLOCK_BELOW_SCORE})",
         f"💎 RSI-DIPBUY: {'ON' if DIPBUY_ENABLED else 'OFF'} · "
         f"RSI зона ≤{DIPBUY_RSI_ZONE} × {DIPBUY_RSI_MIN_BARS}св + BB + объём",
-        f"🎯 DIP-FIRST: Confluence/Pullback входят в нижних "
+        f"🌊 WT-DIP: {'ON' if WT_DIP_STRATEGY_ENABLED else 'OFF'} · "
+        f"WT({WT_N1},{WT_N2}) кросс &lt; {WT_OS2}",
+        f"💥 SQZ-BREAKOUT: {'ON' if SQZ_BREAKOUT_STRATEGY_ENABLED else 'OFF'} · "
+        f"объём ≥{SQZ_BREAKOUT_VOL_MULT}× после сжатия",
+        f"🎯 DIP-FIRST: Confluence/Pullback в нижних "
         f"{int(BOTTOM_FILTER_PCT*100)}% 24ч-диапазона",
-        f"🔧 BTC-фильтр: -{abs(BTC_DROP_6H_PCT):.0f}%/6ч или ADX&gt;{BTC_ADX_BLOCK_THRESHOLD:.0f} · dip-buy и 🎯BOTTOM обходят",
+        f"🔧 BTC-фильтр: -{abs(BTC_DROP_6H_PCT):.0f}%/6ч или ADX&gt;{BTC_ADX_BLOCK_THRESHOLD:.0f} · "
+        f"dip/WT/SQZ/BOTTOM обходят",
         "🛡 PEAK-GUARD: не входим на пике (RSI≤70, дрейф≤1%, топ-15%)",
         "🔥≤1% ⚡≤3% 🟢≤5% — % до пробоя · 🥀 объём↓ · ⛔ пик · ⚠️ дрейф",
         "👇 Тапни 📈-ссылку — TradingView",
     ]
 
-    def build(with_links, max_cand, max_cons, max_dip):
+    def build(with_links, max_cand, max_cons, max_dip, max_wtdip):
         lines = list(header)
         lines += pos_lines
         lines.append("")
@@ -2711,7 +3148,15 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
             for i, s in enumerate(display_dip[:max_dip], 1):
                 lines.append(dip_line(i, s, with_links))
         else:
-            lines.append("— dip-кандидатов нет")
+            lines.append("— RSI dip-кандидатов нет")
+        lines.append("</blockquote>")
+        lines.append("🌊🌊🌊 <b>WT-DIP (WAVETREND ВНИЗУ)</b> 🌊🌊🌊")
+        lines.append("<blockquote expandable>")
+        if display_wtdip:
+            for i, s in enumerate(display_wtdip[:max_wtdip], 1):
+                lines.append(wtdip_line(i, s, with_links))
+        else:
+            lines.append("— WT dip-кандидатов нет")
         lines.append("</blockquote>")
         lines.append("🟡🟡🟡 <b>МОНЕТЫ В БОКОВИКЕ (30–60 ДНЕЙ)</b> 🟡🟡🟡")
         lines.append("<blockquote expandable>")
@@ -2724,12 +3169,16 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         lines += footer
         return "\n".join(lines)
 
-    text = build(True, len(display_calls), len(display_cons), len(display_dip))
+    text = build(True, len(display_calls), len(display_cons),
+                 len(display_dip), len(display_wtdip))
     if len(text) > TG_SAFE_LIMIT:
         for max_cand in range(len(display_calls), 2, -1):
             for max_cons in range(len(display_cons), 2, -1):
                 for max_dip in range(len(display_dip), 0, -1):
-                    text = build(True, max_cand, max_cons, max_dip)
+                    for max_wtdip in range(len(display_wtdip), 0, -1):
+                        text = build(True, max_cand, max_cons, max_dip, max_wtdip)
+                        if len(text) <= TG_SAFE_LIMIT:
+                            break
                     if len(text) <= TG_SAFE_LIMIT:
                         break
                 if len(text) <= TG_SAFE_LIMIT:
@@ -2737,11 +3186,12 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
             if len(text) <= TG_SAFE_LIMIT:
                 break
     if len(text) > TG_SAFE_LIMIT:
-        text = build(True, 5, 5, 3)
+        text = build(True, 5, 5, 3, 3)
 
     _send_to_all_one(text)
-    logger.info("Статус v20.3.1: %d симв · cand=%d cons=%d dip=%d · tickers=%d",
-                len(text), len(cand_pool), len(cons_pool), len(dip_pool), tickers_count)
+    logger.info("Статус v21.0.0: %d симв · cand=%d dip=%d wtdip=%d cons=%d · tickers=%d",
+                len(text), len(cand_pool), len(dip_pool), len(wtdip_pool),
+                len(cons_pool), tickers_count)
 
 # ==================== MAIN ====================
 def handle_stop(signum, _frame):
@@ -2751,7 +3201,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v20.3.1 «DIP-FIRST + BTC-BYPASS» (Bybit) ...")
+    logger.info("Запуск бота v21.0.0 «WT + SQUEEZE + DIP-FIRST» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
@@ -2825,19 +3275,22 @@ if __name__ == "__main__":
     threading.Thread(target=tickers_refresh_loop, daemon=True).start()
 
     _send_to_all_one(
-        f"🟢 <b>СКАНЕР v20.3.1 «DIP-FIRST + BTC-BYPASS» ЗАПУЩЕН</b>\n"
+        f"🟢 <b>СКАНЕР v21.0.0 «WT + SQUEEZE + DIP-FIRST» ЗАПУЩЕН</b>\n"
         f"WS kline: {len(PAIRS_WS)} пар\n"
         f"⚡ WS tickers: {WS_TICKERS_QUOTA_CAND} cand + {WS_TICKERS_QUOTA_CONS} cons + "
-        f"{WS_TICKERS_QUOTA_DIP} dip (макс {WS_TICKERS_MAX_PAIRS})\n"
+        f"{WS_TICKERS_QUOTA_DIP} dip + WT-dip (макс {WS_TICKERS_MAX_PAIRS})\n"
         f"🐂 1D-режим: {'ON' if DAILY_REGIME_FILTER_ENABLED else 'OFF'} "
-        f"(EMA50&gt;200 + close&gt;200; bear блокирует score&lt;{DAILY_REGIME_BLOCK_BELOW_SCORE})\n"
-        f"💎 RSI-DIPBUY: {'ON' if DIPBUY_ENABLED else 'OFF'} "
-        f"(RSI зона ≤{DIPBUY_RSI_ZONE} × {DIPBUY_RSI_MIN_BARS}св + BB + объём ≥{DIPBUY_MIN_VOL}×)\n"
+        f"(bear блокирует score&lt;{DAILY_REGIME_BLOCK_BELOW_SCORE})\n"
+        f"💎 RSI-DIPBUY: {'ON' if DIPBUY_ENABLED else 'OFF'} · "
+        f"RSI зона ≤{DIPBUY_RSI_ZONE} × {DIPBUY_RSI_MIN_BARS}св + BB + объём\n"
+        f"🌊 WT-DIP: {'ON' if WT_DIP_STRATEGY_ENABLED else 'OFF'} · "
+        f"WT({WT_N1},{WT_N2}) кросс &lt; {WT_OS2}\n"
+        f"💥 SQZ-BREAKOUT: {'ON' if SQZ_BREAKOUT_STRATEGY_ENABLED else 'OFF'} · "
+        f"объём ≥{SQZ_BREAKOUT_VOL_MULT}× после сжатия\n"
         f"🎯 DIP-FIRST: Confluence/Pullback только в нижних "
         f"{int(BOTTOM_FILTER_PCT*100)}% 24ч-диапазона\n"
-        f"📦 Breakout / Retest — под BTC-фильтром (без обхода)\n"
         f"🔧 BTC-фильтр: -{abs(BTC_DROP_6H_PCT):.0f}%/6ч или ADX&gt;{BTC_ADX_BLOCK_THRESHOLD:.0f} · "
-        f"dip-buy и 🎯BOTTOM обходят\n"
+        f"dip/WT/SQZ/BOTTOM обходят\n"
         f"Тренд 3/3: {q3} · 1D-bull: {bull_1d} · "
         f"BTC: {'OK' if market_allows_longs() else 'БЛОК'}\n"
         f"🛡 PEAK-GUARD: RSI≤{PEAK_MAX_RSI} · дрейф≤{PEAK_MAX_DRIFT_PCT}%\n"
