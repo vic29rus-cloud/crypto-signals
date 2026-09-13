@@ -2,18 +2,20 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v21.0.0 «WT + SQUEEZE + DIP-FIRST» — ЕДИНЫЙ ФАЙЛ VPS
+BYBIT SCANNER v21.0.1 «WT + SQUEEZE + DIP-FIRST» — ЕДИНЫЙ ФАЙЛ VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
+
+НОВОЕ В v21.0.1 (относительно v21.0.0):
+• 🐛 FIX: WS tickers — Bybit v5 шлёт data как dict (snapshot) или list (delta).
+  Раньше при dict падало `'str' object has no attribute 'get'`. Теперь оба случая.
+• 🐛 FIX: WS kline — та же защита на всякий случай.
 
 НОВОЕ В v21.0.0 (относительно v20.3.1):
 • 🌊 WaveTrend (LazyBear) — встроен в dip-buy (+2 к score), Confluence/Pullback
   (обход BTC при WT-кросс внизу), отдельная стратегия WT-DIP.
 • 💥 Squeeze Momentum (LazyBear) — детект «сжатия → выпуск» в боковиках,
   отдельная стратегия SQZ-BREAKOUT с пониженным требованием к объёму (1.4×).
-• 🌊+💥 SQZ-release даёт +1 к score в dip-buy.
-• 5 стратегий: Confluence, Pullback, RSI-DIPBUY, WT-DIP, SQZ-BREAKOUT
-  + Breakout, Retest.
 ==============================================================================
 """
 import json
@@ -629,7 +631,7 @@ def tv_link(symbol: str) -> str:
     return f'<a href="{url}">📈 {symbol}</a>'
 
 HELP_TEXT = (
-    "📡 <b>Bybit Scanner v21.0.0 «WT + SQUEEZE + DIP-FIRST» — справка</b>\n"
+    "📡 <b>Bybit Scanner v21.0.1 «WT + SQUEEZE + DIP-FIRST» — справка</b>\n"
     "Бот шлёт: входы/выходы, частичные TP и ОДИН статус каждые 2 часа.\n"
     "⚡ WS-REALTIME-HOT: 15 cand + 15 cons + 10 dip в реальном времени.\n"
     "🐂 Дневной режим (EMA50/200 на 1D): в bear пускаем только сильные.\n"
@@ -779,7 +781,7 @@ def adx(df, period=14):
     dx = 100 * np.abs((plus_di - minus_di) / di_sum)
     return dx.ewm(alpha=1 / period, adjust=False).mean()
 
-# ==================== 🌊 WAVETREND (LazyBear) v21.0.0 ====================
+# ==================== 🌊 WAVETREND (LazyBear) v21.0.1 ====================
 def wavetrend(df, n1=10, n2=21, sma_len=4):
     """LazyBear WaveTrend Oscillator.
     Возвращает (wt1, wt2) как pd.Series.
@@ -803,7 +805,7 @@ def wavetrend(df, n1=10, n2=21, sma_len=4):
 
 
 def detect_wt_buy_cross(df, os_level=None):
-    """True, если wt1 пересёк wt2 снизу вверх при wt1 < os_level (по умолчанию WT_OS2)."""
+    """True, если wt1 пересёк wt2 снизу вверх при wt1 < os_level."""
     if not WT_ENABLED:
         return False
     if os_level is None:
@@ -846,7 +848,7 @@ def detect_wt_sell_cross(df, ob_level=None):
     return bool(cross_down and last1 > ob_level)
 
 
-# ==================== 💥 SQUEEZE MOMENTUM (LazyBear) v21.0.0 ====================
+# ==================== 💥 SQUEEZE MOMENTUM (LazyBear) v21.0.1 ====================
 def squeeze_momentum(df, bb_len=20, bb_mult=2.0, kc_len=20, kc_mult=1.5):
     """LazyBear Squeeze Momentum Indicator.
     Возвращает (val, sqz_on, sqz_off) как pd.Series.
@@ -889,9 +891,7 @@ def squeeze_momentum(df, bb_len=20, bb_mult=2.0, kc_len=20, kc_mult=1.5):
 
 
 def detect_sqz_release_bull(df, max_bars=None):
-    """True, если sqz был ON и только что OFF, val растёт.
-    max_bars — сколько свечей назад искать ON→OFF (по умолчанию SQZ_RELEASE_MAX_BARS).
-    """
+    """True, если sqz был ON и только что OFF, val растёт."""
     if not SQZ_ENABLED:
         return False
     if max_bars is None:
@@ -1498,7 +1498,7 @@ def evaluate_ws_pullback(df, symbol):
             "strategy": "ws_pullback", "bottom_ok": True,
             "wt_confirm": wt_confirm}
 
-# ==================== 💎 RSI DIP-BUY v21.0.0 ====================
+# ==================== 💎 RSI DIP-BUY v21.0.1 ====================
 def evaluate_ws_dipbuy(df, symbol):
     """RSI зона + отскок + BB + объём + 1D bull.
     v21.0.0: WT-кросс даёт +2, SQZ-release даёт +1."""
@@ -1595,7 +1595,7 @@ def evaluate_ws_dipbuy(df, symbol):
         "sqz_release": sqz_release,
     }
 
-# ==================== 🌊 WT-DIP (v21.0.0) ====================
+# ==================== 🌊 WT-DIP (v21.0.1) ====================
 def evaluate_ws_wt_dip(df, symbol):
     """WaveTrend кросс внизу + BOTTOM-фильтр + 1D-bull + EMA9>21."""
     if not WT_ENABLED or not WT_DIP_STRATEGY_ENABLED:
@@ -1640,7 +1640,7 @@ def evaluate_ws_wt_dip(df, symbol):
         "bottom_ok": True,
     }
 
-# ==================== 💥 SQZ-BREAKOUT (v21.0.0) ====================
+# ==================== 💥 SQZ-BREAKOUT (v21.0.1) ====================
 def evaluate_ws_sqz_breakout(df, symbol, level):
     """Squeeze Momentum release + пробой уровня (объём 1.4× вместо 1.8×)."""
     if not SQZ_ENABLED or not SQZ_BREAKOUT_STRATEGY_ENABLED:
@@ -1925,7 +1925,6 @@ def _rebuild_hot_pools_from_buffers():
                         wt1, wt2 = wavetrend(df, WT_N1, WT_N2, WT_SMA_LEN)
                         wt_now = float(wt1.iloc[-2]) if not pd.isna(wt1.iloc[-2]) else 999
                         wt_prev = float(wt1.iloc[-3]) if len(wt1) > 3 and not pd.isna(wt1.iloc[-3]) else wt_now
-                        # берём пары где WT недалеко от зоны перепроданности
                         if wt_now <= 0 or (wt_now < 0 and wt_now > wt_prev):
                             wtdip_pool.append({
                                 "pair": sym,
@@ -2002,7 +2001,6 @@ def update_ticker_subscription():
         picked.append(p)
         picked_set.add(p)
 
-    # WT-dip — добирает остаток до WS_TICKERS_MAX_PAIRS
     for s in wtdip_pool:
         if len(picked) >= WS_TICKERS_MAX_PAIRS:
             break
@@ -2245,7 +2243,7 @@ def _open_on_tick(symbol, cur_price, source="tick"):
                 f"<i>{' · '.join(sig['parts'])}</i>")
         return
 
-    # --- WT-DIP (v21.0.0) ---
+    # --- WT-DIP ---
     if kind == "wtdip":
         sig = evaluate_ws_wt_dip(df, symbol)
         if sig is None:
@@ -2310,13 +2308,22 @@ def on_message(ws, message):
     last_ws_msg_ts = time.time()
     try:
         data = json.loads(message)
+        if not isinstance(data, dict):
+            return
         topic = data.get("topic", "")
         if not topic.startswith("kline."):
             return
         symbol = topic.split(".")[-1]
         if symbol not in ohlc_buffers:
             return
-        for item in data.get("data", []):
+        raw = data.get("data")
+        if isinstance(raw, dict):
+            raw = [raw]
+        elif not isinstance(raw, list):
+            return
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
             try:
                 new_candle = {
                     "start": int(item["start"]) // 1000,
@@ -2412,7 +2419,7 @@ def on_message(ws, message):
             with breakout_cache_lock:
                 level = breakout_cache.get(symbol)
 
-            # v21.0.0: приоритеты — WT-dip → RSI-dip → SQZ-breakout → Retest → Confluence → Pullback
+            # Приоритеты: WT-dip → RSI-dip → SQZ-breakout → Retest → Confluence → Pullback
             sig = evaluate_ws_wt_dip(df, symbol)
             if sig is None:
                 sig = evaluate_ws_dipbuy(df, symbol)
@@ -2428,7 +2435,6 @@ def on_message(ws, message):
                 continue
 
             cur_price_ws = float(new_candle["close"])
-            # PEAK-GUARD — не для dip-стратегий (они у дна)
             if sig.get("strategy") not in ("rsi_dipbuy", "wt_dip", "sqz_dip"):
                 peak_ok, peak_reason, _ = check_peak_guard(df, cur_price_ws)
                 if not peak_ok:
@@ -2493,6 +2499,7 @@ def watchdog_loop():
                 WS_APP.close()
             except Exception:
                 pass
+
 # ==================== ⚡ WEBSOCKET TICKERS ====================
 def on_tickers_open(ws):
     logger.info("⚡ WS tickers подключен. Подписка на %d пар...",
@@ -2522,25 +2529,38 @@ def tickers_pinger(ws):
 def on_tickers_message(ws, message):
     try:
         data = json.loads(message)
-        if data.get("topic", "").startswith("tickers."):
-            for item in data.get("data", []):
-                symbol = item.get("symbol", "")
-                if symbol not in WS_TICKER_PAIRS:
-                    continue
-                try:
-                    cur_price = float(item.get("lastPrice", 0))
-                except (TypeError, ValueError):
-                    continue
-                if cur_price <= 0:
-                    continue
-                buf = ohlc_buffers.get(symbol)
-                if buf and len(buf) > 0:
-                    buf[-1]["close"] = cur_price
-                    if cur_price > buf[-1]["high"]:
-                        buf[-1]["high"] = cur_price
-                    if cur_price < buf[-1]["low"]:
-                        buf[-1]["low"] = cur_price
-                _open_on_tick(symbol, cur_price, source="tick")
+        if not isinstance(data, dict):
+            return
+        if not data.get("topic", "").startswith("tickers."):
+            return
+        raw = data.get("data")
+        # Bybit v5: data может быть dict (snapshot) или list (delta)
+        if isinstance(raw, dict):
+            items = [raw]
+        elif isinstance(raw, list):
+            items = raw
+        else:
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            symbol = item.get("symbol", "")
+            if not symbol or symbol not in WS_TICKER_PAIRS:
+                continue
+            try:
+                cur_price = float(item.get("lastPrice", 0))
+            except (TypeError, ValueError):
+                continue
+            if cur_price <= 0:
+                continue
+            buf = ohlc_buffers.get(symbol)
+            if buf and len(buf) > 0:
+                buf[-1]["close"] = cur_price
+                if cur_price > buf[-1]["high"]:
+                    buf[-1]["high"] = cur_price
+                if cur_price < buf[-1]["low"]:
+                    buf[-1]["low"] = cur_price
+            _open_on_tick(symbol, cur_price, source="tick")
     except Exception as e:
         logger.error("Ошибка WS tickers: %s", e)
 
@@ -2580,7 +2600,6 @@ def tickers_refresh_loop():
             update_ticker_subscription()
         except Exception as e:
             logger.error("tickers_refresh_loop: %s", e)
-
 # ==================== ФОНОВОЕ СКАНИРОВАНИЕ ====================
 TIMEFRAME_PARAMS = {
     "15m": {"bybit_interval": "15",  "min_bars": 80,  "ema_fast": 9,  "ema_slow": 21},
@@ -2898,7 +2917,7 @@ def background_scan_loop():
         except Exception as e:
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
-# ==================== СТАТУС (v21.0.0) ====================
+# ==================== СТАТУС (v21.0.1) ====================
 def send_status(scan_summary, consolidation_list, dipbuy_candidates,
                 wtdip_candidates, found_buy, found_sell):
     with state_lock:
@@ -2924,7 +2943,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         btc_state_str += " · dip/WT/BOTTOM обходят"
 
     header = [
-        f"📡 <b>СТАТУС v21.0.0 «WT + SQUEEZE + DIP-FIRST»</b> | <i>{now_str} UTC</i>",
+        f"📡 <b>СТАТУС v21.0.1 «WT + SQUEEZE + DIP-FIRST»</b> | <i>{now_str} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔹 Пар WS kline: <b>{len(PAIRS_WS)}</b> · Тренд 3/3: <b>{q3}</b>",
         f"🔹 1D-bull (EMA50&gt;200): <b>{bull_1d}</b> пар",
@@ -3189,7 +3208,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         text = build(True, 5, 5, 3, 3)
 
     _send_to_all_one(text)
-    logger.info("Статус v21.0.0: %d симв · cand=%d dip=%d wtdip=%d cons=%d · tickers=%d",
+    logger.info("Статус v21.0.1: %d симв · cand=%d dip=%d wtdip=%d cons=%d · tickers=%d",
                 len(text), len(cand_pool), len(dip_pool), len(wtdip_pool),
                 len(cons_pool), tickers_count)
 
@@ -3201,7 +3220,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v21.0.0 «WT + SQUEEZE + DIP-FIRST» (Bybit) ...")
+    logger.info("Запуск бота v21.0.1 «WT + SQUEEZE + DIP-FIRST» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
@@ -3275,7 +3294,7 @@ if __name__ == "__main__":
     threading.Thread(target=tickers_refresh_loop, daemon=True).start()
 
     _send_to_all_one(
-        f"🟢 <b>СКАНЕР v21.0.0 «WT + SQUEEZE + DIP-FIRST» ЗАПУЩЕН</b>\n"
+        f"🟢 <b>СКАНЕР v21.0.1 «WT + SQUEEZE + DIP-FIRST» ЗАПУЩЕН</b>\n"
         f"WS kline: {len(PAIRS_WS)} пар\n"
         f"⚡ WS tickers: {WS_TICKERS_QUOTA_CAND} cand + {WS_TICKERS_QUOTA_CONS} cons + "
         f"{WS_TICKERS_QUOTA_DIP} dip + WT-dip (макс {WS_TICKERS_MAX_PAIRS})\n"
