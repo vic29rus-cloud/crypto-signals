@@ -2,23 +2,20 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v20.3.0 «DIP-FIRST» — ЕДИНЫЙ ФАЙЛ VPS
+BYBIT SCANNER v20.3.1 «DIP-FIRST + BTC-BYPASS» — ЕДИНЫЙ ФАЙЛ VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
+НОВОЕ В v20.3.1 (относительно v20.3.0):
+• 🔧 BTC-фильтр: dip-buy и BOTTOM-сигналы (Confluence/Pullback в нижних 30% дня)
+  обходят блок. Пороги ослаблены: -10%/6ч и ADX>55.
+  Теперь обычный нисходящий тренд BTC не блокирует входы.
+
 НОВОЕ В v20.3.0 (относительно v20.2.1):
 • 💎 RSI-DIPBUY переписан: «зона + отскок» вместо жёсткого кросса 30→33
-  – RSI(14) 15m ≤ 35 минимум 3 свечи подряд
-  – RSI растёт (rsi[-2] > rsi[-3])
-  – зелёная свеча (close > open)
-  – касание нижней полосы Боллинджера (20, 2σ)
-  – объём ≥ 1.3×
-  – 1D-bull + EMA9 > EMA21
-  → в разы больше сигналов «со дна»
 • 🎯 Confluence и Pullback: фильтр «нижние 30% 24ч-диапазона»
-  → больше не входим в верхней части дня
-• ⚡ WS dip-пул расширен: RSI 25–45 (было 25–40)
-• 📦 Breakout / Retest — не тронуты (своя логика)
+• ⚡ WS dip-пул расширен: RSI 25–45
+• 📦 Breakout / Retest — не тронуты
 ==============================================================================
 """
 import json
@@ -73,11 +70,11 @@ RETEST_TOUCH_TOLERANCE_PCT = 0.8
 RETEST_SL_ATR = 1.5
 RETEST_TP_ATR = 4.0
 
-# --- BTC-ФИЛЬТР (v20.2.1: ослабленные пороги) ---
+# --- BTC-ФИЛЬТР (v20.3.1: ослабленные пороги) ---
 BTC_CONTEXT_ENABLED = True
 BTC_CONTEXT_TTL = 300
-BTC_DROP_6H_PCT = -7.0
-BTC_ADX_BLOCK_THRESHOLD = 45
+BTC_DROP_6H_PCT = -10.0           # 🔧 было -7.0
+BTC_ADX_BLOCK_THRESHOLD = 55      # 🔧 было 45
 BTC_ALLOW_STRONG_WHEN_BLOCKED = True
 BTC_STRONG_MIN_TREND_SCORE = 3
 BTC_STRONG_MIN_SCORE = 8
@@ -143,16 +140,16 @@ PEAK_MIN_DIST_TO_MAX_PCT = 1.5
 PEAK_MAX_RSI = 70
 PEAK_MAX_DRIFT_PCT = 1.0
 
-# --- ДНЕВНОЙ РЕЖИМ (EMA50 vs EMA200 + close vs EMA200 на 1D) ---
+# --- ДНЕВНОЙ РЕЖИМ ---
 DAILY_REGIME_FILTER_ENABLED = True
 DAILY_REGIME_BLOCK_BELOW_SCORE = 7
 DAILY_REGIME_FETCH_BARS = 260
 
 # --- RSI DIP-BUY (v20.3.0 «DIP-FIRST») ---
 DIPBUY_ENABLED = True
-DIPBUY_RSI_ZONE = 35              # RSI(14) 15m должен быть ≤ этого N свечей
-DIPBUY_RSI_MIN_BARS = 3           # сколько свечей подряд в зоне
-DIPBUY_MIN_VOL = 1.3              # было 1.2
+DIPBUY_RSI_ZONE = 35
+DIPBUY_RSI_MIN_BARS = 3
+DIPBUY_MIN_VOL = 1.3
 DIPBUY_SL_ATR = 2.5
 DIPBUY_TP_ATR = 5.0
 DIPBUY_REQUIRE_DAILY_BULL = True
@@ -161,10 +158,10 @@ DIPBUY_BB_PERIOD = 20
 DIPBUY_BB_STD = 2.0
 DIPBUY_LOG_REJECTS = True
 
-# --- DIP-FIRST: фильтр «нижние 30% 24ч-диапазона» для Confluence/Pullback ---
+# --- DIP-FIRST: фильтр «нижние 30% 24ч-диапазона» ---
 BOTTOM_FILTER_ENABLED = True
 BOTTOM_FILTER_PCT = 0.30
-BOTTOM_FILTER_LOOKBACK_BARS = 96  # 96 × 15m = 24ч
+BOTTOM_FILTER_LOOKBACK_BARS = 96
 
 # --- ПОРОГИ «ГОРЯЧЕСТИ» БОКОВИКОВ ---
 HOT_DIST_PCT_1 = 1.0
@@ -175,7 +172,7 @@ MAX_SHOW_CANDIDATES = 10
 MAX_SHOW_CONSOLIDATIONS = 10
 MAX_SHOW_DIPBUY = 5
 
-# --- ⚡ WS-REALTIME-HOT (X-режим) ---
+# --- ⚡ WS-REALTIME-HOT ---
 WS_TICKERS_ENABLED = True
 WS_TICKERS_MAX_PAIRS = 40
 WS_TICKERS_QUOTA_CAND = 15
@@ -368,6 +365,23 @@ def is_strong_signal_for_blocked_market(signal):
     return (trend_score >= BTC_STRONG_MIN_TREND_SCORE
             and score >= BTC_STRONG_MIN_SCORE)
 
+def _signal_bypasses_btc(signal):
+    """v20.3.1: dip-buy и BOTTOM-сигналы (Confluence/Pullback в нижних 30% дня)
+    обходят BTC-фильтр — покупаем слабость, а не пик."""
+    if not signal:
+        return False
+    if signal.get("strategy") == "rsi_dipbuy":
+        return True
+    return bool(signal.get("bottom_ok"))
+
+def btc_extra_tag(signal):
+    """Метка для Telegram-алертов."""
+    if market_allows_longs():
+        return ""
+    if _signal_bypasses_btc(signal):
+        return " 🎯BOTTOM (BTC-блок обойдён)"
+    return " ⚠️BTC-БЛОК ×0.5"
+
 # ==================== 🛡 PEAK-GUARD ====================
 def check_peak_guard(df, entry_price):
     if not PEAK_GUARD_ENABLED:
@@ -415,9 +429,6 @@ def check_peak_guard_drift(current_price, entry_price):
 
 # ==================== DIP-FIRST: ФИЛЬТР «ДНО ДНЯ» ====================
 def _bottom_filter_ok(symbol, cur_price):
-    """v20.3.0 DIP-FIRST: применяется к Confluence и Pullback.
-    Разрешает вход только если цена в нижних BOTTOM_FILTER_PCT
-    от 24ч-диапазона (по 15m буферу). Breakout/Retest/Dip-buy — не трогаем."""
     if not BOTTOM_FILTER_ENABLED:
         return True
     if cur_price is None or cur_price <= 0:
@@ -587,15 +598,15 @@ def tv_link(symbol: str) -> str:
     return f'<a href="{url}">📈 {symbol}</a>'
 
 HELP_TEXT = (
-    "📡 <b>Bybit Scanner v20.3.0 «DIP-FIRST» — справка</b>\n"
+    "📡 <b>Bybit Scanner v20.3.1 «DIP-FIRST + BTC-BYPASS» — справка</b>\n"
     "Бот шлёт: входы/выходы, частичные TP и ОДИН статус каждые 2 часа.\n"
     "⚡ WS-REALTIME-HOT: 15 cand + 15 cons + 10 dip в реальном времени.\n"
     "🐂 Дневной режим (EMA50/200 на 1D): в bear пускаем только сильные.\n"
     "💎 RSI-DIPBUY: RSI(15m) в зоне ≤35 × 3 свечи → отскок + BB + объём + 1D bull.\n"
-    "🎯 DIP-FIRST фильтр: Confluence/Pullback входят только в нижних 30% дня.\n"
-    "📦 Breakout / Retest — без изменений.\n"
+    "🎯 DIP-FIRST: Confluence/Pullback входят в нижних 30% дня.\n"
+    "🔧 BTC-фильтр: -10%/6ч или ADX>55. dip-buy и 🎯BOTTOM обходят.\n"
+    "📦 Breakout / Retest — под BTC-фильтром (без обхода).\n"
     "🛡 PEAK-GUARD: не входим на пике (RSI≤70, дрейф≤1%).\n"
-    "🔧 BTC-фильтр: -7%/6ч или ADX>45. Dip-buy — обходит.\n"
     "Команды: /stop — отписаться, /help — справка."
 )
 
@@ -783,6 +794,7 @@ def analyze_timeframe(df, params):
         "ema_slow": float(last["ema_slow"]),
     }
 
+# <<< КОНЕЦ ЧАСТИ 1 — дальше идёт ЧАСТЬ 2 >>>
 # ==================== БОКОВИКИ ====================
 def _find_cons_window(closed):
     for days in CONSOLIDATION_WINDOWS:
@@ -885,9 +897,9 @@ def can_enter(pair, signal=None, signal_risk_pct=None):
     if not cb_can_trade():
         return False
 
+    # 🔧 v20.3.1: BTC-фильтр — dip-buy и BOTTOM-сигналы обходят блок
     if not market_allows_longs():
-        sig_strategy = signal.get("strategy") if signal else None
-        if sig_strategy != "rsi_dipbuy":
+        if not _signal_bypasses_btc(signal):
             if signal is None or not is_strong_signal_for_blocked_market(signal):
                 return False
 
@@ -1229,12 +1241,12 @@ def evaluate_ws_entry(df, symbol):
         return None
     if not _rr_ok(entry, stop, target):
         return None
-    # 🎯 v20.3.0 DIP-FIRST: Confluence входит только в нижних 30% дня
+    # 🎯 v20.3.0 DIP-FIRST: Confluence только в нижних 30% дня
     if not _bottom_filter_ok(symbol, entry):
         return None
     return {"entry": entry, "stop": stop, "target": target, "atr": atr_value,
             "score": score, "parts": parts, "strategy": "ws_15m",
-            "trend_score": ti["score"]}
+            "trend_score": ti["score"], "bottom_ok": True}
 
 def evaluate_ws_pullback(df, symbol):
     if not PULLBACK_ENABLED or len(df) < MIN_BARS + 1:
@@ -1280,26 +1292,16 @@ def evaluate_ws_pullback(df, symbol):
         return None
     if not _rr_ok(entry, stop, target):
         return None
-    # 🎯 v20.3.0 DIP-FIRST: Pullback входит только в нижних 30% дня
+    # 🎯 v20.3.0 DIP-FIRST: Pullback только в нижних 30% дня
     if not _bottom_filter_ok(symbol, entry):
         return None
     return {"entry": entry, "stop": stop, "target": target, "atr": atr_value,
             "score": "PB", "trend_score": ti["score"],
             "parts": [f"Откат к EMA21 · тренд 3/3 · объём {vol_ratio:.1f}×"],
-            "strategy": "ws_pullback"}
+            "strategy": "ws_pullback", "bottom_ok": True}
 
 # ==================== RSI DIP-BUY v20.3.0 «DIP-FIRST» ====================
 def evaluate_ws_dipbuy(df, symbol):
-    """v20.3.0: «зона + отскок» вместо жёсткого кросса 30→33.
-    Условия:
-      – RSI(14) 15m ≤ DIPBUY_RSI_ZONE последние DIPBUY_RSI_MIN_BARS свечей
-      – RSI растёт (rsi[-2] > rsi[-3])
-      – зелёная свеча (close > open)
-      – касание нижней BB(DIPBUY_BB_PERIOD, DIPBUY_BB_STD)
-      – объём ≥ DIPBUY_MIN_VOL
-      – 1D-bull (если требуется)
-      – EMA9 > EMA21 (если требуется)
-    """
     if not DIPBUY_ENABLED or len(df) < MIN_BARS + 1:
         return None
 
@@ -1422,8 +1424,10 @@ def evaluate_ws_retest(df, symbol, level):
 
 # ==================== ОТКРЫТИЕ ПОЗИЦИИ ====================
 def open_position(symbol, sig, closed_start):
-    btc_blocked = not market_allows_longs()
-    if btc_blocked and sig.get("strategy") != "rsi_dipbuy":
+    btc_blocked_raw = not market_allows_longs()
+    bypassed = _signal_bypasses_btc(sig)
+    btc_blocked = btc_blocked_raw and not bypassed
+    if btc_blocked:
         if not is_strong_signal_for_blocked_market(sig):
             return None
     risk_pct = (sig["entry"] - sig["stop"]) / sig["entry"] * 100
@@ -1459,7 +1463,6 @@ def open_position(symbol, sig, closed_start):
     trade_times.append(time.time())
     save_state(state)
     return new_state
-
 # ==================== БЫСТРЫЙ BREAKOUT ЧЕРЕЗ WS (kline) ====================
 def try_ws_breakout(symbol, new_candle, df):
     with breakout_cache_lock:
@@ -1789,8 +1792,7 @@ def _open_on_tick(symbol, cur_price, source="tick"):
             opened = open_position(symbol, sig, int(df.iloc[-2]["start"]))
         if opened:
             logger.info("⚡ WS-REALTIME ВХОД (cand) %s @ %.6g", symbol, sig["entry"])
-            btc_blocked = not market_allows_longs()
-            extra = " ⚠️BTC-БЛОК ×0.5" if btc_blocked else ""
+            extra = btc_extra_tag(sig)
             regime = opened.get("daily_regime_at_entry", "unknown")
             send_telegram(
                 f"⚡ <b>WS-REALTIME ВХОД</b>{extra}\n"
@@ -1866,7 +1868,7 @@ def _open_on_tick(symbol, cur_price, source="tick"):
             save_state(state)
         logger.info("⚡ WS-REALTIME ПРОБОЙ %s @ %.6g (уровень %.6g, vol ×%.1f)",
                     symbol, entry, lvl, vol_ratio)
-        extra = " ⚠️BTC-БЛОК ×0.5" if btc_blocked else ""
+        extra = btc_extra_tag(None)
         send_telegram(
             f"⚡ <b>WS-REALTIME ПРОБОЙ</b>{extra}\n"
             f"Пара: {tv_link(symbol)}\n"
@@ -2029,8 +2031,7 @@ def on_message(ws, message):
 
             breakout_sig = try_ws_breakout(symbol, new_candle, df)
             if breakout_sig:
-                btc_blocked = not market_allows_longs()
-                extra = " ⚠️BTC-БЛОК ×0.5" if btc_blocked else ""
+                extra = btc_extra_tag(None)
                 send_telegram(
                     f"📦 <b>ПРОБОЙ БОКОВИКА (WS)</b>{extra}\n"
                     f"Пара: {tv_link(symbol)}\n"
@@ -2065,8 +2066,7 @@ def on_message(ws, message):
                 continue
             score_txt = (f" · score {sig['score']}/10"
                          if isinstance(sig["score"], int) else f" · {sig['score']}")
-            btc_blocked = not market_allows_longs()
-            extra = " ⚠️BTC-БЛОК ×0.5" if btc_blocked else ""
+            extra = btc_extra_tag(sig)
             icon = "💎" if sig.get("strategy") == "rsi_dipbuy" else "🟢"
             title = "RSI-DIPBUY" if sig.get("strategy") == "rsi_dipbuy" else f"ВХОД (WS{score_txt})"
             send_telegram(
@@ -2195,7 +2195,6 @@ def tickers_refresh_loop():
             update_ticker_subscription()
         except Exception as e:
             logger.error("tickers_refresh_loop: %s", e)
-
 # ==================== ФОНОВОЕ СКАНИРОВАНИЕ ====================
 TIMEFRAME_PARAMS = {
     "15m": {"bybit_interval": "15",  "min_bars": 80,  "ema_fast": 9,  "ema_slow": 21},
@@ -2314,7 +2313,7 @@ def background_scan_loop():
                             if df15 is not None:
                                 last15 = df15.iloc[-2]
                                 rsi_now = float(last15["rsi"]) if not pd.isna(last15["rsi"]) else None
-                                # v20.3.0: расширили диапазон 25–45
+                                # v20.3.0: диапазон 25–45
                                 if rsi_now is not None and WS_HOT_DIP_RSI_MIN <= rsi_now <= WS_HOT_DIP_RSI_MAX:
                                     regime = daily_regime_bull(pair)
                                     if regime is True and last15["ema_fast"] > last15["ema_slow"]:
@@ -2335,8 +2334,7 @@ def background_scan_loop():
                                                   now_iso, r4h=r4h)
                     if breakout:
                         found_buy += 1
-                        btc_blocked = not market_allows_longs()
-                        extra = " ⚠️BTC-БЛОК ×0.5" if btc_blocked else ""
+                        extra = btc_extra_tag(None)   # v20.3.1
                         send_telegram(
                             f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>{extra}\n"
                             f"Пара: {tv_link(pair)}\n"
@@ -2440,8 +2438,7 @@ def background_scan_loop():
                     breakout = try_open_breakout(pair, df_daily, current_price, now_iso)
                     if breakout:
                         found_buy += 1
-                        btc_blocked = not market_allows_longs()
-                        extra = " ⚠️BTC-БЛОК ×0.5" if btc_blocked else ""
+                        extra = btc_extra_tag(None)   # v20.3.1
                         send_telegram(
                             f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>{extra}\n"
                             f"Пара: {tv_link(pair)}\n"
@@ -2488,7 +2485,7 @@ def background_scan_loop():
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
 
-# ==================== СТАТУС (v20.3.0) ====================
+# ==================== СТАТУС (v20.3.1) ====================
 def send_status(scan_summary, consolidation_list, dipbuy_candidates,
                 found_buy, found_sell):
     with state_lock:
@@ -2511,10 +2508,10 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
 
     btc_state_str = "OK" if mok else f"БЛОК: {mreason}"
     if not mok and BTC_ALLOW_STRONG_WHEN_BLOCKED:
-        btc_state_str += " · сильные T3/3 score≥8 → ×0.5"
+        btc_state_str += " · dip-buy + 🎯BOTTOM обходят"
 
     header = [
-        f"📡 <b>СТАТУС v20.3.0 «DIP-FIRST»</b> | <i>{now_str} UTC</i>",
+        f"📡 <b>СТАТУС v20.3.1 «DIP-FIRST + BTC-BYPASS»</b> | <i>{now_str} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔹 Пар WS kline: <b>{len(PAIRS_WS)}</b> · Тренд 3/3: <b>{q3}</b>",
         f"🔹 1D-bull (EMA50&gt;200): <b>{bull_1d}</b> пар",
@@ -2690,7 +2687,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         f"RSI зона ≤{DIPBUY_RSI_ZONE} × {DIPBUY_RSI_MIN_BARS}св + BB + объём",
         f"🎯 DIP-FIRST: Confluence/Pullback входят в нижних "
         f"{int(BOTTOM_FILTER_PCT*100)}% 24ч-диапазона",
-        f"🔧 BTC-фильтр: -{abs(BTC_DROP_6H_PCT):.0f}%/6ч или ADX&gt;{BTC_ADX_BLOCK_THRESHOLD:.0f} · dip-buy обходит",
+        f"🔧 BTC-фильтр: -{abs(BTC_DROP_6H_PCT):.0f}%/6ч или ADX&gt;{BTC_ADX_BLOCK_THRESHOLD:.0f} · dip-buy и 🎯BOTTOM обходят",
         "🛡 PEAK-GUARD: не входим на пике (RSI≤70, дрейф≤1%, топ-15%)",
         "🔥≤1% ⚡≤3% 🟢≤5% — % до пробоя · 🥀 объём↓ · ⛔ пик · ⚠️ дрейф",
         "👇 Тапни 📈-ссылку — TradingView",
@@ -2743,7 +2740,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         text = build(True, 5, 5, 3)
 
     _send_to_all_one(text)
-    logger.info("Статус v20.3.0: %d симв · cand=%d cons=%d dip=%d · tickers=%d",
+    logger.info("Статус v20.3.1: %d симв · cand=%d cons=%d dip=%d · tickers=%d",
                 len(text), len(cand_pool), len(cons_pool), len(dip_pool), tickers_count)
 
 # ==================== MAIN ====================
@@ -2754,7 +2751,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v20.3.0 «DIP-FIRST» (Bybit) ...")
+    logger.info("Запуск бота v20.3.1 «DIP-FIRST + BTC-BYPASS» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
@@ -2828,7 +2825,7 @@ if __name__ == "__main__":
     threading.Thread(target=tickers_refresh_loop, daemon=True).start()
 
     _send_to_all_one(
-        f"🟢 <b>СКАНЕР v20.3.0 «DIP-FIRST» ЗАПУЩЕН</b>\n"
+        f"🟢 <b>СКАНЕР v20.3.1 «DIP-FIRST + BTC-BYPASS» ЗАПУЩЕН</b>\n"
         f"WS kline: {len(PAIRS_WS)} пар\n"
         f"⚡ WS tickers: {WS_TICKERS_QUOTA_CAND} cand + {WS_TICKERS_QUOTA_CONS} cons + "
         f"{WS_TICKERS_QUOTA_DIP} dip (макс {WS_TICKERS_MAX_PAIRS})\n"
@@ -2838,8 +2835,9 @@ if __name__ == "__main__":
         f"(RSI зона ≤{DIPBUY_RSI_ZONE} × {DIPBUY_RSI_MIN_BARS}св + BB + объём ≥{DIPBUY_MIN_VOL}×)\n"
         f"🎯 DIP-FIRST: Confluence/Pullback только в нижних "
         f"{int(BOTTOM_FILTER_PCT*100)}% 24ч-диапазона\n"
-        f"📦 Breakout / Retest — без изменений\n"
-        f"🔧 BTC-фильтр: -{abs(BTC_DROP_6H_PCT):.0f}%/6ч или ADX&gt;{BTC_ADX_BLOCK_THRESHOLD:.0f} · dip-buy обходит\n"
+        f"📦 Breakout / Retest — под BTC-фильтром (без обхода)\n"
+        f"🔧 BTC-фильтр: -{abs(BTC_DROP_6H_PCT):.0f}%/6ч или ADX&gt;{BTC_ADX_BLOCK_THRESHOLD:.0f} · "
+        f"dip-buy и 🎯BOTTOM обходят\n"
         f"Тренд 3/3: {q3} · 1D-bull: {bull_1d} · "
         f"BTC: {'OK' if market_allows_longs() else 'БЛОК'}\n"
         f"🛡 PEAK-GUARD: RSI≤{PEAK_MAX_RSI} · дрейф≤{PEAK_MAX_DRIFT_PCT}%\n"
