@@ -3122,31 +3122,13 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         rsi_now = s.get("rsi_now", 0)
         return f"🌊{i}.{name} WT{wt_now:.0f} RSI{rsi_now:.0f} 💰{cur:.6g}"
 
-    footer = [
+       footer = [
         "━━━━━━━━━━━━━━━━━━━━━",
-        f"🔄 Следующий статус через 2 ч · лимиты {MAX_OPEN_POSITIONS} поз / "
-        f"{MAX_TRADES_PER_HOUR} в час",
-        f"ℹ️ Показаны {MAX_SHOW_CANDIDATES} cand + {MAX_SHOW_DIPBUY} RSI-dip + "
-        f"{MAX_SHOW_WTDIP} WT-dip + {MAX_SHOW_CONSOLIDATIONS} боковиков.",
-        f"⚡ WS-tickers: {WS_TICKERS_QUOTA_CAND} cand + {WS_TICKERS_QUOTA_CONS} cons + "
-        f"{WS_TICKERS_QUOTA_DIP} dip + WT-dip (макс {WS_TICKERS_MAX_PAIRS})",
-        f"🎯 Пороги: |MACD gap|≤{WS_HOT_NEAR_CROSS_PCT}% · "
-        f"до пробоя ≤{WS_HOT_NEAR_BREAKOUT_PCT}%",
-        f"🐂 Дневной режим 1D: {'ON' if DAILY_REGIME_FILTER_ENABLED else 'OFF'} "
-        f"(bear блокирует score&lt;{DAILY_REGIME_BLOCK_BELOW_SCORE})",
-        f"💎 RSI-DIPBUY: {'ON' if DIPBUY_ENABLED else 'OFF'} · "
-        f"RSI зона ≤{DIPBUY_RSI_ZONE} × {DIPBUY_RSI_MIN_BARS}св + BB + объём",
-        f"🌊 WT-DIP: {'ON' if WT_DIP_STRATEGY_ENABLED else 'OFF'} · "
-        f"WT({WT_N1},{WT_N2}) кросс &lt; {WT_OS2}",
-        f"💥 SQZ-BREAKOUT: {'ON' if SQZ_BREAKOUT_STRATEGY_ENABLED else 'OFF'} · "
-        f"объём ≥{SQZ_BREAKOUT_VOL_MULT}× после сжатия",
-        f"🎯 DIP-FIRST: Confluence/Pullback в нижних "
-        f"{int(BOTTOM_FILTER_PCT*100)}% 24ч-диапазона",
-        f"🔧 BTC-фильтр: -{abs(BTC_DROP_6H_PCT):.0f}%/6ч или ADX&gt;{BTC_ADX_BLOCK_THRESHOLD:.0f} · "
-        f"dip/WT/SQZ/BOTTOM обходят",
-        "🛡 PEAK-GUARD: не входим на пике (RSI≤70, дрейф≤1%, топ-15%)",
-        "🔥≤1% ⚡≤3% 🟢≤5% — % до пробоя · 🥀 объём↓ · ⛔ пик · ⚠️ дрейф",
-        "👇 Тапни 📈-ссылку — TradingView",
+        f"🔄 Следующий статус через 2 ч · лимиты {MAX_OPEN_POSITIONS} поз / {MAX_TRADES_PER_HOUR} в час",
+        f"⚡ WS-tickers: {WS_TICKERS_QUOTA_CAND}c + {WS_TICKERS_QUOTA_CONS}cons + {WS_TICKERS_QUOTA_DIP}dip + WT",
+        f"🎯 Пороги: MACD≤{WS_HOT_NEAR_CROSS_PCT}% · пробой≤{WS_HOT_NEAR_BREAKOUT_PCT}%",
+        "🐂1D-bull · 💎RSI-dip · 🌊WT-dip · 💥SQZ · 🎯BOTTOM · 🛡PEAK · 🔧BTC-обход",
+        "🔥≤1% ⚡≤3% 🟢≤5% до пробоя · ⛔ пик · ⚠️ дрейф · 🥀 объём↓",
     ]
 
     def build(with_links, max_cand, max_cons, max_dip, max_wtdip):
