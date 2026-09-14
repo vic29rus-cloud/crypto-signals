@@ -2,19 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v21.0.2 «DEBUG-FUNNEL» — ЕДИНЫЙ ФАЙЛ VPS
+BYBIT SCANNER v21.0.3 «WS-FIX» — ЕДИНЫЙ ФАЙЛ VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
-НОВОЕ В v21.0.2 (относительно v21.0.1):
-• 🔍 DEBUG-FUNNEL: пошаговые счётчики всех фильтров (RSI/ADX/EMA/trend/MACD/
-  score/DIP-FIRST/PEAK-GUARD). Раз в 2 часа строка воронки в статусе.
-• 🐛 FIX: footer приведён к отступу 4 пробела (был IndentationError).
-• Логика входов НЕ менялась. Только диагностика.
-
-НОВОЕ В v21.0.1:
-• 🐛 FIX: WS tickers — Bybit v5 шлёт data как dict или list. Теперь оба случая.
-• 🐛 FIX: WS kline — та же защита.
+НОВОЕ В v21.0.3 (относительно v21.0.2):
+• 🐛 FIX: WS kline молчал — Bybit v5 не принимает подписку на 100 топиков
+  одним сообщением. Теперь чанки по 10 с паузой 0.15с.
+• 🐛 FIX: WS tickers — то же, чанки по 10.
+• 🐛 FIX: раздельные watchdog'и для kline и tickers. Если kline мёртв,
+  а tickers живой — перезапускается только kline.
+• Версия v21.0.2 DEBUG-FUNNEL остаётся.
 ==============================================================================
 """
 import json
@@ -63,6 +61,8 @@ CONSOLIDATION_MAX_RANGE_PCT = 24.0
 CONSOLIDATION_MAX_ADX = 25
 
 WS_EXTRA_SYMBOLS = 50
+WS_SUBSCRIBE_CHUNK = 10
+WS_SUBSCRIBE_PAUSE = 0.15
 
 RETEST_ENABLED = True
 RETEST_TOUCH_TOLERANCE_PCT = 0.8
@@ -157,12 +157,12 @@ DIPBUY_BB_PERIOD = 20
 DIPBUY_BB_STD = 2.0
 DIPBUY_LOG_REJECTS = True
 
-# --- DIP-FIRST: фильтр «нижние 30% 24ч-диапазона» ---
+# --- DIP-FIRST ---
 BOTTOM_FILTER_ENABLED = True
 BOTTOM_FILTER_PCT = 0.30
 BOTTOM_FILTER_LOOKBACK_BARS = 96
 
-# --- WAVETREND (LazyBear) ---
+# --- WAVETREND ---
 WT_ENABLED = True
 WT_N1 = 10
 WT_N2 = 21
@@ -178,7 +178,7 @@ WT_DIP_TP_ATR = 5.0
 WT_HOT_RSI_MIN = 25
 WT_HOT_RSI_MAX = 55
 
-# --- SQUEEZE MOMENTUM (LazyBear) ---
+# --- SQUEEZE MOMENTUM ---
 SQZ_ENABLED = True
 SQZ_BB_LEN = 20
 SQZ_BB_MULT = 2.0
@@ -191,7 +191,7 @@ SQZ_DIP_STRATEGY_ENABLED = True
 SQZ_DIP_SL_ATR = 2.5
 SQZ_DIP_TP_ATR = 5.0
 
-# --- ПОРОГИ «ГОРЯЧЕСТИ» БОКОВИКОВ ---
+# --- ПОРОГИ БОКОВИКОВ ---
 HOT_DIST_PCT_1 = 1.0
 HOT_DIST_PCT_2 = 3.0
 HOT_DIST_PCT_3 = 5.0
@@ -295,6 +295,7 @@ breakout_cache = {}
 breakout_cache_lock = threading.RLock()
 retest_memory = {}
 last_ws_msg_ts = time.time()
+last_tickers_msg_ts = time.time()   # v21.0.3: отдельный watchdog для tickers
 WS_APP = None
 PAIRS_WS = []
 SESSION = requests.Session()
@@ -431,8 +432,6 @@ def is_strong_signal_for_blocked_market(signal):
             and score >= BTC_STRONG_MIN_SCORE)
 
 def _signal_bypasses_btc(signal):
-    """dip-buy / WT-dip / SQZ-dip / BOTTOM / WT-confirm / SQZ-release
-    обходят BTC-фильтр — покупаем слабость, а не пик."""
     if not signal:
         return False
     if signal.get("strategy") in ("rsi_dipbuy", "wt_dip", "sqz_dip"):
@@ -442,7 +441,6 @@ def _signal_bypasses_btc(signal):
     return bool(signal.get("bottom_ok"))
 
 def btc_extra_tag(signal):
-    """Метка для Telegram-алертов."""
     if market_allows_longs():
         return ""
     if _signal_bypasses_btc(signal):
@@ -494,7 +492,7 @@ def check_peak_guard_drift(current_price, entry_price):
         return False, f"цена ушла на {drift_pct:.1f}%"
     return True, ""
 
-# ==================== DIP-FIRST: ФИЛЬТР «ДНО ДНЯ» ====================
+# ==================== DIP-FIRST ====================
 def _bottom_filter_ok(symbol, cur_price):
     if not BOTTOM_FILTER_ENABLED:
         return True
@@ -553,7 +551,7 @@ def portfolio_risk_used():
             total += dist * v.get("size_fraction", 1.0)
     return total
 
-# ==================== TELEGRAM: ПОДПИСЧИКИ ====================
+# ==================== TELEGRAM ====================
 def _load_subscribers():
     global SUBSCRIBERS, MAIN_CHAT_ID
     ids = set()
@@ -665,7 +663,7 @@ def tv_link(symbol: str) -> str:
     return f'<a href="{url}">📈 {symbol}</a>'
 
 HELP_TEXT = (
-    "📡 <b>Bybit Scanner v21.0.2 «DEBUG-FUNNEL» — справка</b>\n"
+    "📡 <b>Bybit Scanner v21.0.3 «WS-FIX» — справка</b>\n"
     "Бот шлёт: входы/выходы, частичные TP и ОДИН статус каждые 2 часа.\n"
     "⚡ WS-REALTIME-HOT: 15 cand + 15 cons + 10 dip в реальном времени.\n"
     "🐂 Дневной режим (EMA50/200 на 1D): в bear пускаем только сильные.\n"
@@ -676,7 +674,7 @@ HELP_TEXT = (
     "🔧 BTC-фильтр: -10%/6ч или ADX>55. dip-buy / WT-dip / SQZ-dip и 🎯BOTTOM обходят.\n"
     "🛡 PEAK-GUARD: не входим на пике (RSI≤70, дрейф≤1%).\n"
     "🔍 DEBUG-FUNNEL: счётчики фильтров в шапке статуса.\n"
-    "Команды: /stop — отписаться, /help — справка."
+    "Команды: /stop — отписаться, /help — справка, /funnel — счётчики."
 )
 
 def polling_loop():
@@ -1386,7 +1384,7 @@ def _rr_ok(entry, stop, target, min_rr=1.5):
     return (target - entry) / risk >= min_rr
 
 def evaluate_ws_entry(df, symbol):
-    """Confluence с пошаговой воронкой (v21.0.2)."""
+    """Confluence с пошаговой воронкой."""
     funnel_inc("conf_total")
     if len(df) < MIN_BARS + 1:
         return None
@@ -1521,7 +1519,6 @@ def evaluate_ws_pullback(df, symbol):
         return None
     if not _rr_ok(entry, stop, target):
         return None
-    # 🎯 DIP-FIRST: Pullback только в нижних 30% дня
     if not _bottom_filter_ok(symbol, entry):
         return None
     wt_confirm = detect_wt_buy_cross(df)
@@ -1534,10 +1531,9 @@ def evaluate_ws_pullback(df, symbol):
             "strategy": "ws_pullback", "bottom_ok": True,
             "wt_confirm": wt_confirm}
 
-# ==================== 💎 RSI DIP-BUY v21.0.2 ====================
+# ==================== 💎 RSI DIP-BUY v21.0.3 ====================
 def evaluate_ws_dipbuy(df, symbol):
-    """RSI зона + отскок + BB + объём + 1D bull.
-    v21.0.2: пошаговые счётчики воронки."""
+    """RSI зона + отскок + BB + объём + 1D bull. Пошаговые счётчики."""
     funnel_inc("dip_total")
     if not DIPBUY_ENABLED or len(df) < MIN_BARS + 1:
         return None
@@ -1558,7 +1554,6 @@ def evaluate_ws_dipbuy(df, symbol):
     if pd.isna(last["rsi"]) or pd.isna(last["atr"]) or last["atr"] <= 0:
         return None
 
-    # 1) Зона RSI N свечей подряд
     zone_slice = df["rsi"].iloc[-DIPBUY_RSI_MIN_BARS-1:-1]
     if zone_slice.isna().any():
         return None
@@ -1567,7 +1562,6 @@ def evaluate_ws_dipbuy(df, symbol):
         return None
     funnel_inc("dip_zone")
 
-    # 2) RSI растёт
     rsi_now = float(df["rsi"].iloc[-2])
     rsi_prev = float(df["rsi"].iloc[-3])
     rsi_rising = rsi_now > rsi_prev
@@ -1575,13 +1569,11 @@ def evaluate_ws_dipbuy(df, symbol):
         return None
     funnel_inc("dip_rising")
 
-    # 3) Зелёная свеча
     green = bool(last["close"] > last["open"])
     if not green:
         return None
     funnel_inc("dip_green")
 
-    # 4) Касание нижней BB
     bb_ma = df["close"].rolling(DIPBUY_BB_PERIOD).mean().iloc[-2]
     bb_sd = df["close"].rolling(DIPBUY_BB_PERIOD).std().iloc[-2]
     touched_bb = False
@@ -1592,7 +1584,6 @@ def evaluate_ws_dipbuy(df, symbol):
         return None
     funnel_inc("dip_bb")
 
-    # 5) Объём
     vol_ratio = float(last["vol_ratio"]) if not pd.isna(last["vol_ratio"]) else 0.0
     vol_ok = vol_ratio >= DIPBUY_MIN_VOL
     if not vol_ok:
@@ -1643,7 +1634,7 @@ def evaluate_ws_dipbuy(df, symbol):
         "sqz_release": sqz_release,
     }
 
-# ==================== 🌊 WT-DIP (v21.0.2) ====================
+# ==================== 🌊 WT-DIP (v21.0.3) ====================
 def evaluate_ws_wt_dip(df, symbol):
     """WaveTrend кросс внизу + BOTTOM-фильтр + 1D-bull + EMA9>21."""
     funnel_inc("wt_total")
@@ -1698,7 +1689,7 @@ def evaluate_ws_wt_dip(df, symbol):
         "bottom_ok": True,
     }
 
-# ==================== 💥 SQZ-BREAKOUT (v21.0.2) ====================
+# ==================== 💥 SQZ-BREAKOUT (v21.0.3) ====================
 def evaluate_ws_sqz_breakout(df, symbol, level):
     """Squeeze Momentum release + пробой уровня (объём 1.4×)."""
     funnel_inc("sqz_total")
@@ -2097,16 +2088,19 @@ def update_ticker_subscription():
     app = WS_TICKERS_APP
     if app is not None and WS_TICKERS_CONNECTED.is_set():
         try:
+            # v21.0.3: чанки по 10, пауза 0.1с
             if to_add:
                 args = [f"tickers.{s}" for s in to_add]
-                for i in range(0, len(args), 100):
+                for i in range(0, len(args), WS_SUBSCRIBE_CHUNK):
                     app.send(json.dumps({"op": "subscribe",
-                                         "args": args[i:i + 100]}))
+                                         "args": args[i:i + WS_SUBSCRIBE_CHUNK]}))
+                    time.sleep(0.1)
             if to_remove:
                 args = [f"tickers.{s}" for s in to_remove]
-                for i in range(0, len(args), 100):
+                for i in range(0, len(args), WS_SUBSCRIBE_CHUNK):
                     app.send(json.dumps({"op": "unsubscribe",
-                                         "args": args[i:i + 100]}))
+                                         "args": args[i:i + WS_SUBSCRIBE_CHUNK]}))
+                    time.sleep(0.1)
             logger.info("⚡ WS-tickers: +%d -%d (всего %d)",
                         len(to_add), len(to_remove), len(new_subset))
         except Exception as e:
@@ -2330,11 +2324,23 @@ def _open_on_tick(symbol, cur_price, source="tick"):
         return
 # ==================== WEBSOCKET: KLINE ====================
 def on_open(ws):
-    logger.info("WS kline подключен. Подписка на %d пар...", len(PAIRS_WS))
+    """v21.0.3: Bybit v5 не принимает подписку на 100 топиков одним сообщением.
+    Шлём чанками по 10 с паузой 0.15с."""
+    logger.info("WS kline подключен. Подписка на %d пар (по %d)...",
+                len(PAIRS_WS), WS_SUBSCRIBE_CHUNK)
     args = [f"kline.{TIMEFRAME}.{p}" for p in PAIRS_WS]
-    for i in range(0, len(args), 100):
-        ws.send(json.dumps({"op": "subscribe", "args": args[i:i + 100]}))
-        time.sleep(0.2)
+    sent = 0
+    for i in range(0, len(args), WS_SUBSCRIBE_CHUNK):
+        chunk = args[i:i + WS_SUBSCRIBE_CHUNK]
+        try:
+            ws.send(json.dumps({"op": "subscribe", "args": chunk}))
+            sent += len(chunk)
+        except Exception as e:
+            logger.warning("WS kline subscribe error: %s", e)
+            return
+        time.sleep(WS_SUBSCRIBE_PAUSE)
+    logger.info("WS kline: отправлено %d подписок чанками по %d",
+                sent, WS_SUBSCRIBE_CHUNK)
     threading.Thread(target=pinger, args=(ws,), daemon=True).start()
 
 def pinger(ws):
@@ -2352,13 +2358,16 @@ def extend_ws_subscription(extra_pairs):
     new = [p for p in extra_pairs if p not in ohlc_buffers][:WS_EXTRA_SYMBOLS]
     if not new:
         return
-    for i in range(0, len(new), 100):
+    # v21.0.3: чанки по 10
+    for i in range(0, len(new), WS_SUBSCRIBE_CHUNK):
+        chunk = new[i:i + WS_SUBSCRIBE_CHUNK]
+        args = [f"kline.{TIMEFRAME}.{p}" for p in chunk]
         try:
-            WS_APP.send(json.dumps({"op": "subscribe",
-                                    "args": [f"kline.{TIMEFRAME}.{p}" for p in new[i:i + 100]]}))
+            WS_APP.send(json.dumps({"op": "subscribe", "args": args}))
         except Exception as e:
             logger.warning("WS subscribe error: %s", e)
             return
+        time.sleep(0.1)
     for p in new:
         ohlc_buffers[p] = deque(maxlen=200)
         history = fetch_klines(p, TIMEFRAME, 80)
@@ -2559,31 +2568,37 @@ def run_websocket():
         time.sleep(5)
 
 def watchdog_loop():
+    """v21.0.3: следит ТОЛЬКО за kline. Тишина >90с → перезапуск."""
+    global last_ws_msg_ts
     while True:
         time.sleep(30)
         silence = time.time() - last_ws_msg_ts
         if silence > WS_SILENCE_TIMEOUT and WS_APP is not None:
-            logger.warning("Watchdog: тишина WS %.0f c — перезапуск", silence)
+            logger.warning("Watchdog kline: тишина %.0f c — перезапуск", silence)
             try:
                 WS_APP.close()
             except Exception:
                 pass
+            # сбросим маркер, чтобы не дёргать повторно
+            last_ws_msg_ts = time.time()
 
 # ==================== ⚡ WEBSOCKET TICKERS ====================
 def on_tickers_open(ws):
-    logger.info("⚡ WS tickers подключен. Подписка на %d пар...",
-                len(WS_TICKER_PAIRS))
+    logger.info("⚡ WS tickers подключен. Подписка на %d пар (по %d)...",
+                len(WS_TICKER_PAIRS), WS_SUBSCRIBE_CHUNK)
     WS_TICKERS_CONNECTED.set()
     with WS_TICKER_PAIRS_LOCK:
         pairs = list(WS_TICKER_PAIRS)
     if pairs:
         args = [f"tickers.{s}" for s in pairs]
-        for i in range(0, len(args), 100):
+        # v21.0.3: чанки по 10
+        for i in range(0, len(args), WS_SUBSCRIBE_CHUNK):
+            chunk = args[i:i + WS_SUBSCRIBE_CHUNK]
             try:
-                ws.send(json.dumps({"op": "subscribe",
-                                    "args": args[i:i + 100]}))
+                ws.send(json.dumps({"op": "subscribe", "args": chunk}))
             except Exception as e:
                 logger.warning("WS tickers subscribe error: %s", e)
+                break
             time.sleep(0.1)
     threading.Thread(target=tickers_pinger, args=(ws,), daemon=True).start()
 
@@ -2596,6 +2611,8 @@ def tickers_pinger(ws):
             return
 
 def on_tickers_message(ws, message):
+    global last_tickers_msg_ts
+    last_tickers_msg_ts = time.time()
     try:
         data = json.loads(message)
         if not isinstance(data, dict):
@@ -2603,7 +2620,6 @@ def on_tickers_message(ws, message):
         if not data.get("topic", "").startswith("tickers."):
             return
         raw = data.get("data")
-        # Bybit v5: data может быть dict (snapshot) или list (delta)
         if isinstance(raw, dict):
             items = [raw]
         elif isinstance(raw, list):
@@ -2990,46 +3006,36 @@ def background_scan_loop():
 # ==================== 🔍 ВОРОНКА (строка для статуса) ====================
 def _format_funnel(fs):
     """Форматирует счётчики воронки в читаемую строку для Telegram."""
-    def pct(a, b):
-        if b == 0:
-            return "—"
-        return f"{a*100//b}%"
     lines = []
     lines.append(f"🔍 <b>ВОРОНКА</b> (баров: {fs.get('bars_processed', 0)})")
-    # Confluence
     lines.append(
         f"🔵 Confluence: {fs['conf_total']}→RSI {fs['conf_rsi']}"
         f"→ADX {fs['conf_adx']}→EMA {fs['conf_ema']}"
         f"→trend {fs['conf_trend']}→MACD {fs['conf_macd']}"
         f"→score {fs['conf_score']}→BOTTOM {fs['conf_bottom']}")
-    # RSI dip
     lines.append(
         f"💎 RSI-dip: {fs['dip_total']}→bull {fs['dip_bull']}"
         f"→зона {fs['dip_zone']}→растёт {fs['dip_rising']}"
         f"→зел {fs['dip_green']}→BB {fs['dip_bb']}"
         f"→объём {fs['dip_vol']}→EMA {fs['dip_ema']}")
-    # WT-dip
     lines.append(
         f"🌊 WT-dip: {fs['wt_total']}→bull {fs['wt_bull']}"
         f"→RSI {fs['wt_rsi']}→кросс {fs['wt_cross']}"
         f"→EMA {fs['wt_ema']}→зел {fs['wt_green']}"
         f"→BOTTOM {fs['wt_bottom']}")
-    # SQZ
     lines.append(
         f"💥 SQZ: {fs['sqz_total']}→release {fs['sqz_release']}"
         f"→пробой {fs['sqz_breakout']}")
-    # Pullback
     lines.append(
         f"🎣 Pullback: {fs['pb_total']}→тренд {fs['pb_trend']}"
         f"→касание {fs['pb_touch']}→объём {fs['pb_vol']}")
-    # Сводка
     lines.append(
         f"⛔ PEAK-GUARD: {fs['peak_block']} · "
         f"🔧 BTC-блок: {fs['btc_block']} · "
         f"✅ Открыто: {fs['opened']}")
     return "\n".join(lines)
 
-# ==================== СТАТУС (v21.0.2) ====================
+# ==================== СТАТУС (v21.0.3) ====================
 def send_status(scan_summary, consolidation_list, dipbuy_candidates,
                 wtdip_candidates, found_buy, found_sell):
     with state_lock:
@@ -3057,7 +3063,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         btc_state_str += " · dip/WT/BOTTOM обходят"
 
     header = [
-        f"📡 <b>СТАТУС v21.0.2 «DEBUG-FUNNEL»</b> | <i>{now_str} UTC</i>",
+        f"📡 <b>СТАТУС v21.0.3 «WS-FIX + FUNNEL»</b> | <i>{now_str} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔹 Пар WS kline: <b>{len(PAIRS_WS)}</b> · Тренд 3/3: <b>{q3}</b>",
         f"🔹 1D-bull (EMA50&gt;200): <b>{bull_1d}</b> пар",
@@ -3232,7 +3238,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         rsi_now = s.get("rsi_now", 0)
         return f"🌊{i}.{name} WT{wt_now:.0f} RSI{rsi_now:.0f} 💰{cur:.6g}"
 
-    # ⚠️ ВАЖНО: отступ 4 пробела, не 7. Именно из-за этого была IndentationError.
+    # ⚠️ Отступ ровно 4 пробела перед footer = [
     footer = [
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔄 Следующий статус через 2 ч · лимиты {MAX_OPEN_POSITIONS} поз / {MAX_TRADES_PER_HOUR} в час",
@@ -3301,7 +3307,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         text = build(True, 5, 5, 3, 3)
 
     _send_to_all_one(text)
-    logger.info("Статус v21.0.2: %d симв · cand=%d dip=%d wtdip=%d cons=%d · tickers=%d",
+    logger.info("Статус v21.0.3: %d симв · cand=%d dip=%d wtdip=%d cons=%d · tickers=%d",
                 len(text), len(cand_pool), len(dip_pool), len(wtdip_pool),
                 len(cons_pool), tickers_count)
 
@@ -3316,7 +3322,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v21.0.2 «DEBUG-FUNNEL» (Bybit) ...")
+    logger.info("Запуск бота v21.0.3 «WS-FIX + FUNNEL» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
@@ -3390,8 +3396,8 @@ if __name__ == "__main__":
     threading.Thread(target=tickers_refresh_loop, daemon=True).start()
 
     _send_to_all_one(
-        f"🟢 <b>СКАНЕР v21.0.2 «DEBUG-FUNNEL» ЗАПУЩЕН</b>\n"
-        f"WS kline: {len(PAIRS_WS)} пар\n"
+        f"🟢 <b>СКАНЕР v21.0.3 «WS-FIX + FUNNEL» ЗАПУЩЕН</b>\n"
+        f"WS kline: {len(PAIRS_WS)} пар (подписка чанками по {WS_SUBSCRIBE_CHUNK})\n"
         f"⚡ WS tickers: {WS_TICKERS_QUOTA_CAND} cand + {WS_TICKERS_QUOTA_CONS} cons + "
         f"{WS_TICKERS_QUOTA_DIP} dip + WT-dip\n"
         f"🔍 DEBUG-FUNNEL: счётчики фильтров в каждом статусе + /funnel\n"
