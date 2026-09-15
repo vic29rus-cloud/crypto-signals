@@ -2751,7 +2751,7 @@ def tickers_refresh_loop():
             update_ticker_subscription()
         except Exception as e:
             logger.error("tickers_refresh_loop: %s", e)
-          # ==================== ФОНОВОЕ СКАНИРОВАНИЕ ====================
+# ==================== ФОНОВОЕ СКАНИРОВАНИЕ ====================
 TIMEFRAME_PARAMS = {
     "15m": {"bybit_interval": "15",  "min_bars": 80,  "ema_fast": 9,  "ema_slow": 21},
     "1h":  {"bybit_interval": "60",  "min_bars": 80,  "ema_fast": 9,  "ema_slow": 21},
@@ -3077,7 +3077,7 @@ def background_scan_loop():
         except Exception as e:
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
-          # ==================== ВОРОНКА (строка для статуса) ====================
+# ==================== ВОРОНКА (строка для статуса) ====================
 def _format_funnel(fs):
     """Форматирует счётчики воронки в читаемую строку для Telegram."""
     lines = []
