@@ -2,17 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v21.0.3 «WS-FIX» — ЕДИНЫЙ ФАЙЛ VPS
+BYBIT SCANNER v21.0.4 «SQZ-DIP + CONF-SOFT» — ЕДИНЫЙ ФАЙЛ VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
-НОВОЕ В v21.0.3 (относительно v21.0.2):
-• 🐛 FIX: WS kline молчал — Bybit v5 не принимает подписку на 100 топиков
-  одним сообщением. Теперь чанки по 10 с паузой 0.15с.
-• 🐛 FIX: WS tickers — то же, чанки по 10.
-• 🐛 FIX: раздельные watchdog'и для kline и tickers. Если kline мёртв,
-  а tickers живой — перезапускается только kline.
-• Версия v21.0.2 DEBUG-FUNNEL остаётся.
+НОВОЕ В v21.0.4 (относительно v21.0.3):
+• 🔥 SQZ-DIP: новая стратегия — Squeeze Momentum release в нижней половине
+  дня + 1D-bull + зелёная свеча. Ловит отскок после сжатия внизу.
+• 🎯 CONF-SOFT: BOTTOM_FILTER_PCT ослаблен 0.30 → 0.50. Confluence и Pullback
+  теперь входят в нижней половине дня, а не только у дна.
+• 🔍 Воронка дополнена строкой SQZ-dip.
 ==============================================================================
 """
 import json
@@ -157,9 +156,9 @@ DIPBUY_BB_PERIOD = 20
 DIPBUY_BB_STD = 2.0
 DIPBUY_LOG_REJECTS = True
 
-# --- DIP-FIRST ---
+# --- DIP-FIRST (v21.0.4: ослаблен до 0.50) ---
 BOTTOM_FILTER_ENABLED = True
-BOTTOM_FILTER_PCT = 0.30
+BOTTOM_FILTER_PCT = 0.50
 BOTTOM_FILTER_LOOKBACK_BARS = 96
 
 # --- WAVETREND ---
@@ -247,7 +246,7 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("bybit-scanner")
-# ==================== 🔍 DEBUG-FUNNEL (v21.0.2) ====================
+# ==================== 🔍 DEBUG-FUNNEL (v21.0.4) ====================
 FUNNEL = {
     # Confluence
     "conf_total": 0, "conf_rsi": 0, "conf_adx": 0, "conf_ema": 0,
@@ -260,6 +259,9 @@ FUNNEL = {
     "wt_bottom": 0, "wt_ema": 0, "wt_green": 0,
     # SQZ
     "sqz_total": 0, "sqz_release": 0, "sqz_breakout": 0,
+    # SQZ-dip (v21.0.4)
+    "sqzdip_total": 0, "sqzdip_bull": 0, "sqzdip_release": 0,
+    "sqzdip_green": 0, "sqzdip_bottom": 0,
     # Pullback
     "pb_total": 0, "pb_trend": 0, "pb_touch": 0, "pb_vol": 0,
     # Общие
@@ -295,7 +297,7 @@ breakout_cache = {}
 breakout_cache_lock = threading.RLock()
 retest_memory = {}
 last_ws_msg_ts = time.time()
-last_tickers_msg_ts = time.time()   # v21.0.3: отдельный watchdog для tickers
+last_tickers_msg_ts = time.time()
 WS_APP = None
 PAIRS_WS = []
 SESSION = requests.Session()
@@ -492,7 +494,7 @@ def check_peak_guard_drift(current_price, entry_price):
         return False, f"цена ушла на {drift_pct:.1f}%"
     return True, ""
 
-# ==================== DIP-FIRST ====================
+# ==================== DIP-FIRST (v21.0.4: 0.50) ====================
 def _bottom_filter_ok(symbol, cur_price):
     if not BOTTOM_FILTER_ENABLED:
         return True
@@ -663,15 +665,16 @@ def tv_link(symbol: str) -> str:
     return f'<a href="{url}">📈 {symbol}</a>'
 
 HELP_TEXT = (
-    "📡 <b>Bybit Scanner v21.0.3 «WS-FIX» — справка</b>\n"
+    "📡 <b>Bybit Scanner v21.0.4 «SQZ-DIP + CONF-SOFT» — справка</b>\n"
     "Бот шлёт: входы/выходы, частичные TP и ОДИН статус каждые 2 часа.\n"
     "⚡ WS-REALTIME-HOT: 15 cand + 15 cons + 10 dip в реальном времени.\n"
     "🐂 Дневной режим (EMA50/200 на 1D): в bear пускаем только сильные.\n"
     "💎 RSI-DIPBUY: RSI(15m) в зоне ≤35 × 3 свечи → отскок + BB + объём + 1D bull.\n"
     "🌊 WT-DIP: WaveTrend кросс внизу + BOTTOM + 1D bull.\n"
-    "💥 SQZ-BREAKOUT: Squeeze Momentum release + пробой уровня (объём 1.4×).\n"
-    "🎯 DIP-FIRST: Confluence/Pullback входят в нижних 30% дня.\n"
-    "🔧 BTC-фильтр: -10%/6ч или ADX>55. dip-buy / WT-dip / SQZ-dip и 🎯BOTTOM обходят.\n"
+    "🔥 SQZ-DIP: Squeeze release внизу + 1D bull + зелёная свеча.\n"
+    "💥 SQZ-BREAKOUT: Squeeze release + пробой уровня (объём 1.4×).\n"
+    "🎯 DIP-FIRST: Confluence/Pullback входят в нижней половине дня (≤50%).\n"
+    "🔧 BTC-фильтр: -10%/6ч или ADX>55. dip/WT/SQZ/BOTTOM обходят.\n"
     "🛡 PEAK-GUARD: не входим на пике (RSI≤70, дрейф≤1%).\n"
     "🔍 DEBUG-FUNNEL: счётчики фильтров в шапке статуса.\n"
     "Команды: /stop — отписаться, /help — справка, /funnel — счётчики."
@@ -786,7 +789,7 @@ def log_trade(symbol, entry, exit_price, reason, strategy,
         if traded_fraction >= 1.0:
             cb_register(net_pnl)
         return round(net_pnl, 2)
-# ==================== ИНДИКАТОРЫ ====================
+      # ==================== ИНДИКАТОРЫ ====================
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
@@ -1004,7 +1007,7 @@ def analyze_timeframe(df, params):
         "ema_fast": float(last["ema_fast"]),
         "ema_slow": float(last["ema_slow"]),
     }
-# ==================== БОКОВИКИ ====================
+  # ==================== БОКОВИКИ ====================
 def _find_cons_window(closed):
     for days in CONSOLIDATION_WINDOWS:
         if len(closed) < days:
@@ -1106,7 +1109,6 @@ def can_enter(pair, signal=None, signal_risk_pct=None):
     if not cb_can_trade():
         return False
 
-    # 🔧 BTC-фильтр: dip-buy / WT-dip / SQZ-dip / BOTTOM / WT-confirm обходят
     if not market_allows_longs():
         if not _signal_bypasses_btc(signal):
             if signal is None or not is_strong_signal_for_blocked_market(signal):
@@ -1235,7 +1237,7 @@ def daily_regime_str(symbol):
     if r is False:
         return "bear"
     return "unknown"
-# ==================== ВСЕЛЕННАЯ ПАР ====================
+  # ==================== ВСЕЛЕННАЯ ПАР ====================
 FIAT_BASES = {"AUD", "GBP", "EUR", "CAD", "CHF", "JPY", "USD",
               "BRL", "MXN", "TRY", "ZAR", "INR", "SGD", "HKD"}
 STABLECOINS = {"USDC", "USDT", "DAI", "PYUSD", "TUSD", "FDUSD", "AUSD", "EURR",
@@ -1384,7 +1386,7 @@ def _rr_ok(entry, stop, target, min_rr=1.5):
     return (target - entry) / risk >= min_rr
 
 def evaluate_ws_entry(df, symbol):
-    """Confluence с пошаговой воронкой."""
+    """Confluence со счётчиками воронки. v21.0.4: BOTTOM ослаблен до 0.50."""
     funnel_inc("conf_total")
     if len(df) < MIN_BARS + 1:
         return None
@@ -1458,7 +1460,7 @@ def evaluate_ws_entry(df, symbol):
         return None
     if not _rr_ok(entry, stop, target):
         return None
-    # 🎯 DIP-FIRST: Confluence только в нижних 30% дня
+    # 🎯 DIP-FIRST v21.0.4: нижняя половина дня (≤50%)
     if not _bottom_filter_ok(symbol, entry):
         return None
     funnel_inc("conf_bottom")
@@ -1470,8 +1472,8 @@ def evaluate_ws_entry(df, symbol):
             "score": score, "parts": parts, "strategy": "ws_15m",
             "trend_score": ti["score"], "bottom_ok": True,
             "wt_confirm": wt_confirm}
-def evaluate_ws_pullback(df, symbol):
-    """Pullback со счётчиками воронки."""
+  def evaluate_ws_pullback(df, symbol):
+    """Pullback со счётчиками воронки. v21.0.4: BOTTOM 0.50."""
     funnel_inc("pb_total")
     if not PULLBACK_ENABLED or len(df) < MIN_BARS + 1:
         return None
@@ -1531,9 +1533,9 @@ def evaluate_ws_pullback(df, symbol):
             "strategy": "ws_pullback", "bottom_ok": True,
             "wt_confirm": wt_confirm}
 
-# ==================== 💎 RSI DIP-BUY v21.0.3 ====================
+# ==================== 💎 RSI DIP-BUY (v21.0.4) ====================
 def evaluate_ws_dipbuy(df, symbol):
-    """RSI зона + отскок + BB + объём + 1D bull. Пошаговые счётчики."""
+    """RSI зона + отскок + BB + объём + 1D bull."""
     funnel_inc("dip_total")
     if not DIPBUY_ENABLED or len(df) < MIN_BARS + 1:
         return None
@@ -1634,7 +1636,7 @@ def evaluate_ws_dipbuy(df, symbol):
         "sqz_release": sqz_release,
     }
 
-# ==================== 🌊 WT-DIP (v21.0.3) ====================
+# ==================== 🌊 WT-DIP (v21.0.4) ====================
 def evaluate_ws_wt_dip(df, symbol):
     """WaveTrend кросс внизу + BOTTOM-фильтр + 1D-bull + EMA9>21."""
     funnel_inc("wt_total")
@@ -1689,7 +1691,58 @@ def evaluate_ws_wt_dip(df, symbol):
         "bottom_ok": True,
     }
 
-# ==================== 💥 SQZ-BREAKOUT (v21.0.3) ====================
+# ==================== 🔥 SQZ-DIP (v21.0.4 NEW) ====================
+def evaluate_ws_sqz_dip(df, symbol):
+    """SQZ release в нижней половине дня + 1D-bull + зелёная свеча.
+    Логика: сжатие лопнуло внизу → отскок. Только со дна."""
+    funnel_inc("sqzdip_total")
+    if not SQZ_ENABLED or not SQZ_DIP_STRATEGY_ENABLED:
+        return None
+    if len(df) < MIN_BARS + 1:
+        return None
+    if DIPBUY_REQUIRE_DAILY_BULL:
+        if daily_regime_bull(symbol) is not True:
+            return None
+    funnel_inc("sqzdip_bull")
+    if not detect_sqz_release_bull(df):
+        return None
+    funnel_inc("sqzdip_release")
+    sig = df.iloc[-2]
+    if pd.isna(sig["atr"]) or sig["atr"] <= 0:
+        return None
+    if not (sig["close"] > sig["open"]):
+        return None
+    funnel_inc("sqzdip_green")
+    entry = float(df.iloc[-1]["close"])
+    if not _bottom_filter_ok(symbol, entry):
+        return None
+    funnel_inc("sqzdip_bottom")
+    atr_value = float(sig["atr"])
+    stop = entry - atr_value * SQZ_DIP_SL_ATR
+    target = entry + atr_value * SQZ_DIP_TP_ATR
+    if stop >= entry or target <= entry:
+        return None
+    if (entry - stop) / entry * 100 < MIN_STOP_DISTANCE_PCT:
+        return None
+    if not _rr_ok(entry, stop, target):
+        return None
+    ti = get_trend(symbol)
+    trend_score = ti["score"] if ti else 0
+    try:
+        val_now, is_on, is_off, color = sqz_state(df)
+    except Exception:
+        val_now, color = 0.0, "grey"
+    return {
+        "entry": entry, "stop": stop, "target": target, "atr": atr_value,
+        "score": 7, "trend_score": trend_score,
+        "parts": [f"🔥 SQZ-release внизу (val={val_now:.4g}, {color})",
+                  "BOTTOM ✓", "1D аптренд ✓"],
+        "strategy": "sqz_dip",
+        "sqz_release": True,
+        "bottom_ok": True,
+    }
+
+# ==================== 💥 SQZ-BREAKOUT (v21.0.4) ====================
 def evaluate_ws_sqz_breakout(df, symbol, level):
     """Squeeze Momentum release + пробой уровня (объём 1.4×)."""
     funnel_inc("sqz_total")
@@ -1813,7 +1866,7 @@ def open_position(symbol, sig, closed_start):
     save_state(state)
     funnel_inc("opened")
     return new_state
-# ==================== БЫСТРЫЙ BREAKOUT ЧЕРЕЗ WS (kline) ====================
+  # ==================== БЫСТРЫЙ BREAKOUT ЧЕРЕЗ WS (kline) ====================
 def try_ws_breakout(symbol, new_candle, df):
     with breakout_cache_lock:
         level = breakout_cache.get(symbol)
@@ -2322,7 +2375,7 @@ def _open_on_tick(symbol, cur_price, source="tick"):
                 f"SL: {sig['stop']:.8f} · TP: {sig['target']:.8f}\n"
                 f"<i>{' · '.join(sig['parts'])}</i>")
         return
-# ==================== WEBSOCKET: KLINE ====================
+      # ==================== WEBSOCKET: KLINE ====================
 def on_open(ws):
     """v21.0.3: Bybit v5 не принимает подписку на 100 топиков одним сообщением.
     Шлём чанками по 10 с паузой 0.15с."""
@@ -2358,7 +2411,6 @@ def extend_ws_subscription(extra_pairs):
     new = [p for p in extra_pairs if p not in ohlc_buffers][:WS_EXTRA_SYMBOLS]
     if not new:
         return
-    # v21.0.3: чанки по 10
     for i in range(0, len(new), WS_SUBSCRIBE_CHUNK):
         chunk = new[i:i + WS_SUBSCRIBE_CHUNK]
         args = [f"kline.{TIMEFRAME}.{p}" for p in chunk]
@@ -2495,10 +2547,12 @@ def on_message(ws, message):
             with breakout_cache_lock:
                 level = breakout_cache.get(symbol)
 
-            # Приоритеты: WT-dip → RSI-dip → SQZ-breakout → Retest → Confluence → Pullback
+            # Приоритеты v21.0.4: WT-dip → RSI-dip → SQZ-dip → SQZ-breakout → Retest → Confluence → Pullback
             sig = evaluate_ws_wt_dip(df, symbol)
             if sig is None:
                 sig = evaluate_ws_dipbuy(df, symbol)
+            if sig is None:
+                sig = evaluate_ws_sqz_dip(df, symbol)
             if sig is None:
                 sig = evaluate_ws_sqz_breakout(df, symbol, level)
             if sig is None:
@@ -2535,6 +2589,8 @@ def on_message(ws, message):
                 icon, title = "💎", "RSI-DIPBUY"
             elif strat == "wt_dip":
                 icon, title = "🌊", "WT-DIP"
+            elif strat == "sqz_dip":
+                icon, title = "🔥", "SQZ-DIP"
             elif strat == "sqz_breakout":
                 icon, title = "💥", "SQZ-BREAKOUT"
             else:
@@ -2579,7 +2635,6 @@ def watchdog_loop():
                 WS_APP.close()
             except Exception:
                 pass
-            # сбросим маркер, чтобы не дёргать повторно
             last_ws_msg_ts = time.time()
 
 # ==================== ⚡ WEBSOCKET TICKERS ====================
@@ -2591,7 +2646,6 @@ def on_tickers_open(ws):
         pairs = list(WS_TICKER_PAIRS)
     if pairs:
         args = [f"tickers.{s}" for s in pairs]
-        # v21.0.3: чанки по 10
         for i in range(0, len(args), WS_SUBSCRIBE_CHUNK):
             chunk = args[i:i + WS_SUBSCRIBE_CHUNK]
             try:
@@ -3003,7 +3057,7 @@ def background_scan_loop():
         except Exception as e:
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
-# ==================== 🔍 ВОРОНКА (строка для статуса) ====================
+          # ==================== 🔍 ВОРОНКА (строка для статуса) ====================
 def _format_funnel(fs):
     """Форматирует счётчики воронки в читаемую строку для Telegram."""
     lines = []
@@ -3024,7 +3078,11 @@ def _format_funnel(fs):
         f"→EMA {fs['wt_ema']}→зел {fs['wt_green']}"
         f"→BOTTOM {fs['wt_bottom']}")
     lines.append(
-        f"💥 SQZ: {fs['sqz_total']}→release {fs['sqz_release']}"
+        f"🔥 SQZ-dip: {fs['sqzdip_total']}→bull {fs['sqzdip_bull']}"
+        f"→release {fs['sqzdip_release']}→зел {fs['sqzdip_green']}"
+        f"→BOTTOM {fs['sqzdip_bottom']}")
+    lines.append(
+        f"💥 SQZ-breakout: {fs['sqz_total']}→release {fs['sqz_release']}"
         f"→пробой {fs['sqz_breakout']}")
     lines.append(
         f"🎣 Pullback: {fs['pb_total']}→тренд {fs['pb_trend']}"
@@ -3035,7 +3093,7 @@ def _format_funnel(fs):
         f"✅ Открыто: {fs['opened']}")
     return "\n".join(lines)
 
-# ==================== СТАТУС (v21.0.3) ====================
+# ==================== СТАТУС (v21.0.4) ====================
 def send_status(scan_summary, consolidation_list, dipbuy_candidates,
                 wtdip_candidates, found_buy, found_sell):
     with state_lock:
@@ -3060,10 +3118,10 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
 
     btc_state_str = "OK" if mok else f"БЛОК: {mreason}"
     if not mok and BTC_ALLOW_STRONG_WHEN_BLOCKED:
-        btc_state_str += " · dip/WT/BOTTOM обходят"
+        btc_state_str += " · dip/WT/SQZ/BOTTOM обходят"
 
     header = [
-        f"📡 <b>СТАТУС v21.0.3 «WS-FIX + FUNNEL»</b> | <i>{now_str} UTC</i>",
+        f"📡 <b>СТАТУС v21.0.4 «SQZ-DIP + CONF-SOFT»</b> | <i>{now_str} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔹 Пар WS kline: <b>{len(PAIRS_WS)}</b> · Тренд 3/3: <b>{q3}</b>",
         f"🔹 1D-bull (EMA50&gt;200): <b>{bull_1d}</b> пар",
@@ -3077,7 +3135,6 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         "━━━━━━━━━━━━━━━━━━━━━",
     ]
 
-    # Воронка отдельным блоком
     funnel_lines = _format_funnel(funnel_snap).split("\n")
     header += funnel_lines
     header.append("━━━━━━━━━━━━━━━━━━━━━")
@@ -3091,6 +3148,8 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
                 tag = "💎"
             elif strat == "wt_dip":
                 tag = "🌊"
+            elif strat == "sqz_dip":
+                tag = "🔥"
             elif strat == "sqz_breakout":
                 tag = "💥"
             elif strat in breakout_strategies:
@@ -3244,7 +3303,8 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         f"🔄 Следующий статус через 2 ч · лимиты {MAX_OPEN_POSITIONS} поз / {MAX_TRADES_PER_HOUR} в час",
         f"⚡ WS-tickers: {WS_TICKERS_QUOTA_CAND}c + {WS_TICKERS_QUOTA_CONS}cons + {WS_TICKERS_QUOTA_DIP}dip + WT",
         f"🎯 Пороги: MACD≤{WS_HOT_NEAR_CROSS_PCT}% · пробой≤{WS_HOT_NEAR_BREAKOUT_PCT}%",
-        "🐂1D-bull · 💎RSI-dip · 🌊WT-dip · 💥SQZ · 🎯BOTTOM · 🛡PEAK · 🔧BTC-обход",
+        "🐂1D-bull · 💎RSI-dip · 🌊WT-dip · 🔥SQZ-dip · 💥SQZ · 🎯BOTTOM · 🛡PEAK · 🔧BTC-обход",
+        f"🎯 DIP-FIRST: Confluence/Pullback в нижней половине дня (≤{int(BOTTOM_FILTER_PCT*100)}%)",
         "🔥≤1% ⚡≤3% 🟢≤5% до пробоя · ⛔ пик · ⚠️ дрейф · 🥀 объём↓ · /funnel — счётчики",
     ]
 
@@ -3307,11 +3367,10 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         text = build(True, 5, 5, 3, 3)
 
     _send_to_all_one(text)
-    logger.info("Статус v21.0.3: %d симв · cand=%d dip=%d wtdip=%d cons=%d · tickers=%d",
+    logger.info("Статус v21.0.4: %d симв · cand=%d dip=%d wtdip=%d cons=%d · tickers=%d",
                 len(text), len(cand_pool), len(dip_pool), len(wtdip_pool),
                 len(cons_pool), tickers_count)
 
-    # Сброс счётчиков после отправки
     funnel_reset()
 
 # ==================== MAIN ====================
@@ -3322,7 +3381,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v21.0.3 «WS-FIX + FUNNEL» (Bybit) ...")
+    logger.info("Запуск бота v21.0.4 «SQZ-DIP + CONF-SOFT» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
@@ -3396,12 +3455,13 @@ if __name__ == "__main__":
     threading.Thread(target=tickers_refresh_loop, daemon=True).start()
 
     _send_to_all_one(
-        f"🟢 <b>СКАНЕР v21.0.3 «WS-FIX + FUNNEL» ЗАПУЩЕН</b>\n"
+        f"🟢 <b>СКАНЕР v21.0.4 «SQZ-DIP + CONF-SOFT» ЗАПУЩЕН</b>\n"
         f"WS kline: {len(PAIRS_WS)} пар (подписка чанками по {WS_SUBSCRIBE_CHUNK})\n"
         f"⚡ WS tickers: {WS_TICKERS_QUOTA_CAND} cand + {WS_TICKERS_QUOTA_CONS} cons + "
         f"{WS_TICKERS_QUOTA_DIP} dip + WT-dip\n"
         f"🔍 DEBUG-FUNNEL: счётчики фильтров в каждом статусе + /funnel\n"
-        f"🎯 DIP-FIRST: Confluence/Pullback в нижних {int(BOTTOM_FILTER_PCT*100)}%\n"
+        f"🔥 SQZ-DIP: release + BOTTOM + 1D-bull (новая стратегия)\n"
+        f"🎯 DIP-FIRST: Confluence/Pullback в нижних {int(BOTTOM_FILTER_PCT*100)}% дня\n"
         f"🔧 BTC-фильтр: -{abs(BTC_DROP_6H_PCT):.0f}%/6ч или ADX&gt;{BTC_ADX_BLOCK_THRESHOLD:.0f}\n"
         f"Тренд 3/3: {q3} · 1D-bull: {bull_1d} · "
         f"BTC: {'OK' if market_allows_longs() else 'БЛОК'}\n"
