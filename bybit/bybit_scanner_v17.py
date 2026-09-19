@@ -2,17 +2,22 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v21.0.3 «WS-FIX» — ЕДИНЫЙ ФАЙЛ VPS
+BYBIT SCANNER v21.2.0 «ALL-DIP» — ЕДИНЫЙ ФАЙЛ VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
-НОВОЕ В v21.0.3 (относительно v21.0.2):
-• 🐛 FIX: WS kline молчал — Bybit v5 не принимает подписку на 100 топиков
-  одним сообщением. Теперь чанки по 10 с паузой 0.15с.
-• 🐛 FIX: WS tickers — то же, чанки по 10.
-• 🐛 FIX: раздельные watchdog'и для kline и tickers. Если kline мёртв,
-  а tickers живой — перезапускается только kline.
-• Версия v21.0.2 DEBUG-FUNNEL остаётся.
+НОВОЕ В v21.2.0:
+• ВСЕ стратегии ищут дно. 4 активных:
+  - range_bounce: отскок от дна боковика
+  - rsi_dipbuy: RSI-отскок снизу
+  - wt_dip: WaveTrend кросс внизу
+  - sqz_dip: Squeeze release внизу
+• HOLD-TO-REVERSAL: БУ +0.5×ATR, без partial TP, без fixed TP.
+  Основной выход — EMA-кросс вниз на 4h.
+• HOT-REALTIME: 50 горячих пар, cooldown 5 сек, обновление пулов 5 мин.
+• Bounce-pool — 5-й пул.
+• ОТКЛЮЧЕНЫ: breakout (ws/open), retest, sqz-breakout, confluence, pullback.
+  Код сохранён для отката.
 ==============================================================================
 """
 import json
@@ -64,7 +69,7 @@ WS_EXTRA_SYMBOLS = 50
 WS_SUBSCRIBE_CHUNK = 10
 WS_SUBSCRIBE_PAUSE = 0.15
 
-RETEST_ENABLED = True
+RETEST_ENABLED = False
 RETEST_TOUCH_TOLERANCE_PCT = 0.8
 RETEST_SL_ATR = 1.5
 RETEST_TP_ATR = 4.0
@@ -118,7 +123,7 @@ FRESH_CROSS_WINDOW = 3
 RSI_MIN, RSI_MAX = 35, 80
 ADX_MIN, ADX_MAX = 15, 60
 MIN_VOL_MULT = 1.2
-PULLBACK_ENABLED = True
+PULLBACK_ENABLED = False
 PULLBACK_VOL_MULT = 1.1
 PULLBACK_RSI_MAX = 68
 PULLBACK_SL_ATR = 2.5
@@ -131,7 +136,7 @@ STATUS_ADX_MIN, STATUS_ADX_MAX = 18, 55
 STATUS_MIN_PRICE = 0.0001
 STATUS_READY_SCORE = 3
 
-# --- 🛡 PEAK-GUARD ---
+# --- PEAK-GUARD ---
 PEAK_GUARD_ENABLED = True
 PEAK_LOOKBACK_CANDLES = 20
 PEAK_MAX_POSITION_PCT = 85
@@ -157,9 +162,9 @@ DIPBUY_BB_PERIOD = 20
 DIPBUY_BB_STD = 2.0
 DIPBUY_LOG_REJECTS = True
 
-# --- DIP-FIRST ---
+# --- DIP-FIRST (для dip-стратегий не применяется) ---
 BOTTOM_FILTER_ENABLED = True
-BOTTOM_FILTER_PCT = 0.30
+BOTTOM_FILTER_PCT = 0.50
 BOTTOM_FILTER_LOOKBACK_BARS = 96
 
 # --- WAVETREND ---
@@ -186,10 +191,25 @@ SQZ_KC_LEN = 20
 SQZ_KC_MULT = 1.5
 SQZ_BREAKOUT_VOL_MULT = 1.4
 SQZ_RELEASE_MAX_BARS = 3
-SQZ_BREAKOUT_STRATEGY_ENABLED = True
+SQZ_BREAKOUT_STRATEGY_ENABLED = False
 SQZ_DIP_STRATEGY_ENABLED = True
 SQZ_DIP_SL_ATR = 2.5
 SQZ_DIP_TP_ATR = 5.0
+
+# --- RANGE-BOUNCE (v21.2.0) ---
+RANGE_BOUNCE_ENABLED = True
+RANGE_BOUNCE_ZONE_PCT = 0.5
+RANGE_BOUNCE_VOL_MULT = 1.2
+RANGE_BOUNCE_RSI_MAX = 50
+RANGE_BOUNCE_SL_PCT = 0.5
+RANGE_BOUNCE_MIN_RR = 2.0
+RANGE_BOUNCE_HOT_ZONE_PCT = 1.0
+
+# --- HOLD-TO-REVERSAL (v21.2.0) ---
+HOLD_MODE_ENABLED = True
+BREAKEVEN_TRIGGER_ATR_FAST = 0.5
+NO_PARTIAL_TP = True
+NO_FIXED_TP = True
 
 # --- ПОРОГИ БОКОВИКОВ ---
 HOT_DIST_PCT_1 = 1.0
@@ -200,15 +220,18 @@ MAX_SHOW_CANDIDATES = 10
 MAX_SHOW_CONSOLIDATIONS = 10
 MAX_SHOW_DIPBUY = 5
 MAX_SHOW_WTDIP = 5
+MAX_SHOW_BOUNCE = 10
 
-# --- ⚡ WS-REALTIME-HOT ---
+# --- WS-REALTIME-HOT ---
 WS_TICKERS_ENABLED = True
-WS_TICKERS_MAX_PAIRS = 40
+WS_TICKERS_MAX_PAIRS = 50
 WS_TICKERS_QUOTA_CAND = 15
 WS_TICKERS_QUOTA_CONS = 15
-WS_TICKERS_QUOTA_DIP = 10
-WS_TICKERS_REFRESH_SEC = 900
-WS_HOT_COOLDOWN_SEC = 60
+WS_TICKERS_QUOTA_DIP = 8
+WS_TICKERS_QUOTA_WT = 4
+WS_TICKERS_QUOTA_BOUNCE = 8
+WS_TICKERS_REFRESH_SEC = 300
+WS_HOT_COOLDOWN_SEC = 5
 WS_HOT_MIN_RR = 1.5
 WS_HOT_MIN_VOL = 1.2
 WS_HOT_BREAKOUT_VOL = 1.8
@@ -247,21 +270,20 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("bybit-scanner")
-# ==================== 🔍 DEBUG-FUNNEL (v21.0.2) ====================
+# ==================== DEBUG-FUNNEL (v21.2.0) ====================
 FUNNEL = {
-    # Confluence
-    "conf_total": 0, "conf_rsi": 0, "conf_adx": 0, "conf_ema": 0,
-    "conf_trend": 0, "conf_macd": 0, "conf_score": 0, "conf_bottom": 0,
+    # Range-Bounce
+    "bounce_total": 0, "bounce_zone": 0, "bounce_rsi": 0,
+    "bounce_green": 0, "bounce_vol": 0, "bounce_rr": 0,
     # RSI dip
     "dip_total": 0, "dip_bull": 0, "dip_zone": 0, "dip_rising": 0,
     "dip_green": 0, "dip_bb": 0, "dip_vol": 0, "dip_ema": 0,
     # WT-dip
     "wt_total": 0, "wt_bull": 0, "wt_rsi": 0, "wt_cross": 0,
     "wt_bottom": 0, "wt_ema": 0, "wt_green": 0,
-    # SQZ
-    "sqz_total": 0, "sqz_release": 0, "sqz_breakout": 0,
-    # Pullback
-    "pb_total": 0, "pb_trend": 0, "pb_touch": 0, "pb_vol": 0,
+    # SQZ-dip
+    "sqzdip_total": 0, "sqzdip_bull": 0, "sqzdip_release": 0,
+    "sqzdip_green": 0, "sqzdip_bottom": 0,
     # Общие
     "peak_block": 0, "btc_block": 0, "opened": 0,
     "bars_processed": 0,
@@ -295,7 +317,7 @@ breakout_cache = {}
 breakout_cache_lock = threading.RLock()
 retest_memory = {}
 last_ws_msg_ts = time.time()
-last_tickers_msg_ts = time.time()   # v21.0.3: отдельный watchdog для tickers
+last_tickers_msg_ts = time.time()
 WS_APP = None
 PAIRS_WS = []
 SESSION = requests.Session()
@@ -314,10 +336,12 @@ HOT_PAIRS_CACHE = {
     "consolidations_pool": [],
     "dipbuy_pool": [],
     "wtdip_pool": [],
+    "bounce_pool": [],
     "candidates": [],
     "consolidations": [],
     "dipbuy": [],
     "wtdip": [],
+    "bounce": [],
     "ts": 0.0,
 }
 HOT_PAIRS_LOCK = threading.RLock()
@@ -372,7 +396,7 @@ def cb_register(net_pnl):
             cb_state["consec"] += 1
             if cb_state["consec"] >= CB_MAX_CONSEC_LOSSES:
                 cb_state["paused_until"] = time.time() + CB_PAUSE_SECONDS
-                logger.warning("Circuit Breaker: %d убытков подряд — пауза %d ч",
+                logger.warning("Circuit Breaker: %d убытков подряд - пауза %d ч",
                                cb_state["consec"], CB_PAUSE_SECONDS // 3600)
         else:
             cb_state["consec"] = 0
@@ -400,9 +424,9 @@ def refresh_market_context():
                 es = ema(df["close"], 21).iloc[-2]
                 adx_val = adx(df).iloc[-2]
                 if chg_6h <= BTC_DROP_6H_PCT:
-                    ok, reason = False, f"BTC {chg_6h:.1f}% за 6ч"
+                    ok, reason = False, "BTC %.1f%% за 6ч" % chg_6h
                 elif ef < es and not pd.isna(adx_val) and adx_val > BTC_ADX_BLOCK_THRESHOLD:
-                    ok, reason = False, f"BTC нисходящий тренд (ADX>{BTC_ADX_BLOCK_THRESHOLD:.0f})"
+                    ok, reason = False, "BTC нисходящий тренд (ADX>%.0f)" % BTC_ADX_BLOCK_THRESHOLD
         except Exception as e:
             logger.debug("market context: %s", e)
     with market_context_lock:
@@ -434,7 +458,7 @@ def is_strong_signal_for_blocked_market(signal):
 def _signal_bypasses_btc(signal):
     if not signal:
         return False
-    if signal.get("strategy") in ("rsi_dipbuy", "wt_dip", "sqz_dip"):
+    if signal.get("strategy") in ("rsi_dipbuy", "wt_dip", "sqz_dip", "range_bounce"):
         return True
     if signal.get("wt_confirm") or signal.get("sqz_release"):
         return True
@@ -444,10 +468,10 @@ def btc_extra_tag(signal):
     if market_allows_longs():
         return ""
     if _signal_bypasses_btc(signal):
-        return " 🎯BOTTOM (BTC-блок обойдён)"
-    return " ⚠️BTC-БЛОК ×0.5"
+        return " [BOTTOM] BTC-блок обойдён"
+    return " [BTC-БЛОК x0.5]"
 
-# ==================== 🛡 PEAK-GUARD ====================
+# ==================== PEAK-GUARD ====================
 def check_peak_guard(df, entry_price):
     if not PEAK_GUARD_ENABLED:
         return True, "", {}
@@ -465,9 +489,9 @@ def check_peak_guard(df, entry_price):
                    "dist_to_max_pct": round(dist_to_max_pct, 2),
                    "local_high": local_high, "local_low": local_low}
         if position_pct > PEAK_MAX_POSITION_PCT:
-            return False, f"цена в верхних {100 - PEAK_MAX_POSITION_PCT:.0f}% ({position_pct:.0f}%)", metrics
+            return False, "цена в верхних %.0f%% (%.0f%%)" % (100 - PEAK_MAX_POSITION_PCT, position_pct), metrics
         if dist_to_max_pct < PEAK_MIN_DIST_TO_MAX_PCT:
-            return False, f"слишком близко к максимуму ({dist_to_max_pct:.2f}%)", metrics
+            return False, "слишком близко к максимуму (%.2f%%)" % dist_to_max_pct, metrics
         return True, "", metrics
     except Exception as e:
         logger.debug("peak_guard error: %s", e)
@@ -479,7 +503,7 @@ def check_peak_guard_rsi(rsi_val):
     if rsi_val is None or pd.isna(rsi_val):
         return True, ""
     if rsi_val > PEAK_MAX_RSI:
-        return False, f"RSI {rsi_val:.0f} > {PEAK_MAX_RSI}"
+        return False, "RSI %.0f > %d" % (rsi_val, PEAK_MAX_RSI)
     return True, ""
 
 def check_peak_guard_drift(current_price, entry_price):
@@ -489,7 +513,7 @@ def check_peak_guard_drift(current_price, entry_price):
         return True, ""
     drift_pct = abs(current_price - entry_price) / entry_price * 100
     if drift_pct > PEAK_MAX_DRIFT_PCT:
-        return False, f"цена ушла на {drift_pct:.1f}%"
+        return False, "цена ушла на %.1f%%" % drift_pct
     return True, ""
 
 # ==================== DIP-FIRST ====================
@@ -512,7 +536,7 @@ def _bottom_filter_ok(symbol, cur_price):
     pos = (cur_price - day_low) / (day_high - day_low)
     ok = pos <= BOTTOM_FILTER_PCT
     if not ok:
-        logger.debug("🎯 DIP-FIRST: %s в верхних %.0f%% (pos=%.2f)",
+        logger.debug("DIP-FIRST: %s в верхних %.0f%% (pos=%.2f)",
                      symbol, (1 - BOTTOM_FILTER_PCT) * 100, pos)
     return ok
 
@@ -588,7 +612,7 @@ def add_subscriber(cid):
             return False
         SUBSCRIBERS.add(cid)
     _save_subscribers()
-    logger.info("➕ Новый подписчик: %s (всего %d)", cid, len(SUBSCRIBERS))
+    logger.info("Новый подписчик: %s (всего %d)", cid, len(SUBSCRIBERS))
     return True
 
 def remove_subscriber(cid):
@@ -597,13 +621,13 @@ def remove_subscriber(cid):
             return False
         SUBSCRIBERS.discard(cid)
     _save_subscribers()
-    logger.info("➖ Отписка: %s (осталось %d)", cid, len(SUBSCRIBERS))
+    logger.info("Отписка: %s (осталось %d)", cid, len(SUBSCRIBERS))
     return True
 
 def _post_telegram(chat_id, text):
     if not TELEGRAM_BOT_TOKEN:
         return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = "https://api.telegram.org/bot%s/sendMessage" % TELEGRAM_BOT_TOKEN
     for parse_mode in ("HTML", None):
         payload = {"chat_id": chat_id, "text": text,
                    "disable_web_page_preview": True}
@@ -643,7 +667,7 @@ def _send_to_all_one(text):
         text = text[:cut].rstrip()
         if "<blockquote" in text and "</blockquote>" not in text.rsplit("<blockquote", 1)[1]:
             text += "\n</blockquote>"
-        text += " …"
+        text += " ..."
     with subscribers_lock:
         targets = list(SUBSCRIBERS)
     for cid in targets:
@@ -658,30 +682,28 @@ def send_telegram(text):
         for cid in targets:
             _post_telegram(cid, chunk)
 
-def tv_link(symbol: str) -> str:
-    url = f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol}"
-    return f'<a href="{url}">📈 {symbol}</a>'
+def tv_link(symbol):
+    url = "https://www.tradingview.com/chart/?symbol=BYBIT:%s" % symbol
+    return '<a href="%s">%s</a>' % (url, symbol)
 
 HELP_TEXT = (
-    "📡 <b>Bybit Scanner v21.0.3 «WS-FIX» — справка</b>\n"
-    "Бот шлёт: входы/выходы, частичные TP и ОДИН статус каждые 2 часа.\n"
-    "⚡ WS-REALTIME-HOT: 15 cand + 15 cons + 10 dip в реальном времени.\n"
-    "🐂 Дневной режим (EMA50/200 на 1D): в bear пускаем только сильные.\n"
-    "💎 RSI-DIPBUY: RSI(15m) в зоне ≤35 × 3 свечи → отскок + BB + объём + 1D bull.\n"
-    "🌊 WT-DIP: WaveTrend кросс внизу + BOTTOM + 1D bull.\n"
-    "💥 SQZ-BREAKOUT: Squeeze Momentum release + пробой уровня (объём 1.4×).\n"
-    "🎯 DIP-FIRST: Confluence/Pullback входят в нижних 30% дня.\n"
-    "🔧 BTC-фильтр: -10%/6ч или ADX>55. dip-buy / WT-dip / SQZ-dip и 🎯BOTTOM обходят.\n"
-    "🛡 PEAK-GUARD: не входим на пике (RSI≤70, дрейф≤1%).\n"
-    "🔍 DEBUG-FUNNEL: счётчики фильтров в шапке статуса.\n"
-    "Команды: /stop — отписаться, /help — справка, /funnel — счётчики."
+    "<b>Bybit Scanner v21.2.0 ALL-DIP - справка</b>\n"
+    "Все стратегии ищут ДНО. Никаких хаёв.\n"
+    "RANGE-BOUNCE: отскок от дна боковика.\n"
+    "RSI-DIPBUY: RSI <=35 x3св -> отскок + BB + объём.\n"
+    "WT-DIP: WaveTrend кросс внизу.\n"
+    "SQZ-DIP: Squeeze release внизу.\n"
+    "HOLD-TO-REVERSAL: БУ после +0.5xATR, держим до EMA-кросса 4h.\n"
+    "WS-tickers: 50 горячих пар, cooldown 5 сек.\n"
+    "BTC-фильтр: -10%/6ч или ADX>55. dip/bounce обходят.\n"
+    "Команды: /stop, /help, /funnel."
 )
 
 def polling_loop():
     if not TELEGRAM_BOT_TOKEN:
         logger.warning("Polling не запущен: нет TELEGRAM_BOT_TOKEN")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    url = "https://api.telegram.org/bot%s/getUpdates" % TELEGRAM_BOT_TOKEN
     offset = 0
     logger.info("Polling /start запущен")
     while True:
@@ -694,7 +716,7 @@ def polling_loop():
                 desc = data.get("description", "")
                 logger.error("getUpdates ошибка: %s", desc)
                 if "conflict" in desc.lower():
-                    logger.error("Конфликт с webhook — polling остановлен")
+                    logger.error("Конфликт с webhook - polling остановлен")
                     return
                 time.sleep(5)
                 continue
@@ -708,14 +730,14 @@ def polling_loop():
                 if text == "/start":
                     if add_subscriber(int(cid)):
                         _post_telegram(cid,
-                            "🟢 <b>Подписка оформлена!</b>\n"
-                            "Бот присылает входы/выходы и статус каждые 2 часа.\n"
-                            "/stop — отписаться, /help — справка.")
+                            "<b>Подписка оформлена!</b>\n"
+                            "Бот ищет ТОЛЬКО дно. Входы у нижней зоны.\n"
+                            "/stop - отписаться, /help - справка.")
                     else:
-                        _post_telegram(cid, "✅ Вы уже подписаны.")
+                        _post_telegram(cid, "Вы уже подписаны.")
                 elif text == "/stop":
                     if remove_subscriber(int(cid)):
-                        _post_telegram(cid, "🔴 Вы отписаны.\n/start — подписаться снова.")
+                        _post_telegram(cid, "Вы отписаны.\n/start - подписаться снова.")
                     else:
                         _post_telegram(cid, "Вы и так не подписаны.")
                 elif text == "/help":
@@ -786,7 +808,7 @@ def log_trade(symbol, entry, exit_price, reason, strategy,
         if traded_fraction >= 1.0:
             cb_register(net_pnl)
         return round(net_pnl, 2)
-# ==================== ИНДИКАТОРЫ ====================
+      # ==================== ИНДИКАТОРЫ ====================
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
@@ -817,9 +839,8 @@ def adx(df, period=14):
     dx = 100 * np.abs((plus_di - minus_di) / di_sum)
     return dx.ewm(alpha=1 / period, adjust=False).mean()
 
-# ==================== 🌊 WAVETREND (LazyBear) ====================
+# ==================== WAVETREND (LazyBear) ====================
 def wavetrend(df, n1=10, n2=21, sma_len=4):
-    """LazyBear WaveTrend Oscillator. Возвращает (wt1, wt2) как pd.Series."""
     ap = (df["high"] + df["low"] + df["close"]) / 3.0
     esa = ap.ewm(span=n1, adjust=False).mean()
     d = (ap - esa).abs().ewm(span=n1, adjust=False).mean()
@@ -831,7 +852,6 @@ def wavetrend(df, n1=10, n2=21, sma_len=4):
 
 
 def detect_wt_buy_cross(df, os_level=None):
-    """True, если wt1 пересёк wt2 снизу вверх при wt1 < os_level."""
     if not WT_ENABLED:
         return False
     if os_level is None:
@@ -852,31 +872,8 @@ def detect_wt_buy_cross(df, os_level=None):
     return bool(cross_up and last1 < os_level)
 
 
-def detect_wt_sell_cross(df, ob_level=None):
-    """True, если wt1 пересёк wt2 сверху вниз при wt1 > ob_level."""
-    if not WT_ENABLED:
-        return False
-    if ob_level is None:
-        ob_level = WT_OB2
-    if len(df) < 25:
-        return False
-    try:
-        wt1, wt2 = wavetrend(df, WT_N1, WT_N2, WT_SMA_LEN)
-    except Exception:
-        return False
-    if len(wt1) < 3:
-        return False
-    prev1, prev2 = wt1.iloc[-3], wt2.iloc[-3]
-    last1, last2 = wt1.iloc[-2], wt2.iloc[-2]
-    if pd.isna(prev1) or pd.isna(prev2) or pd.isna(last1) or pd.isna(last2):
-        return False
-    cross_down = prev1 >= prev2 and last1 < last2
-    return bool(cross_down and last1 > ob_level)
-
-
-# ==================== 💥 SQUEEZE MOMENTUM (LazyBear) ====================
+# ==================== SQUEEZE MOMENTUM (LazyBear) ====================
 def squeeze_momentum(df, bb_len=20, bb_mult=2.0, kc_len=20, kc_mult=1.5):
-    """LazyBear Squeeze Momentum. Возвращает (val, sqz_on, sqz_off)."""
     src = df["close"]
     basis = src.rolling(bb_len).mean()
     dev = bb_mult * src.rolling(bb_len).std(ddof=0)
@@ -912,7 +909,6 @@ def squeeze_momentum(df, bb_len=20, bb_mult=2.0, kc_len=20, kc_mult=1.5):
 
 
 def detect_sqz_release_bull(df, max_bars=None):
-    """True, если sqz был ON и только что OFF, val растёт."""
     if not SQZ_ENABLED:
         return False
     if max_bars is None:
@@ -939,7 +935,6 @@ def detect_sqz_release_bull(df, max_bars=None):
 
 
 def sqz_state(df):
-    """Возвращает состояние: (val, is_on, is_off, color)."""
     if not SQZ_ENABLED or len(df) < SQZ_KC_LEN + 5:
         return 0.0, False, False, "grey"
     try:
@@ -1004,7 +999,7 @@ def analyze_timeframe(df, params):
         "ema_fast": float(last["ema_fast"]),
         "ema_slow": float(last["ema_slow"]),
     }
-# ==================== БОКОВИКИ ====================
+  # ==================== БОКОВИКИ ====================
 def _find_cons_window(closed):
     for days in CONSOLIDATION_WINDOWS:
         if len(closed) < days:
@@ -1036,38 +1031,7 @@ def detect_consolidation(df_daily):
             "lower_level": float(window["low"].min()),
             "vol_trend": round(vol_trend, 2)}
 
-def check_breakout(df_daily, current_price):
-    closed = df_daily.iloc[:-1]
-    if len(closed) < 60:
-        return None
-    adx_val = adx(closed).iloc[-1]
-    if pd.isna(adx_val) or adx_val >= BREAKOUT_MAX_ADX:
-        return None
-    window, range_pct = _find_cons_window(closed)
-    if window is None:
-        return None
-    high = window["high"].max()
-    if current_price < high * (1 + BREAKOUT_MIN_TRIGGER_PCT / 100):
-        return None
-    if current_price > high * (1 + MAX_BREAKOUT_DISTANCE_PCT / 100):
-        return None
-    vol_base = closed["volume"].rolling(20).mean()
-    vol_avg = vol_base.iloc[-2]
-    last_vol = closed["volume"].iloc[-1]
-    if not (vol_avg > 0 and last_vol > vol_avg * 1.8):
-        return None
-    accum = closed["volume"].tail(3).mean()
-    base_old = vol_base.iloc[-4] if not pd.isna(vol_base.iloc[-4]) else vol_avg
-    if not (base_old > 0 and accum > base_old * BREAKOUT_VOL_ACCUM_MULT):
-        return None
-    atr_val = atr(closed).iloc[-1]
-    if pd.isna(atr_val) or atr_val <= 0:
-        return None
-    return {"days": len(window), "range_pct": range_pct, "adx": float(adx_val),
-            "stop": current_price - atr_val * ATR_MULT_SL,
-            "target": current_price + atr_val * ATR_MULT_TP}
-
-# ==================== УПРАВЛЕНИЕ ПОЗИЦИЕЙ ====================
+# ==================== ВЫХОДЫ (HOLD-TO-REVERSAL v21.2.0) ====================
 def check_exit(results, pos):
     if not results.get(TRIGGER_TF) or not results.get("1d"):
         return False, "", 0.0
@@ -1077,17 +1041,28 @@ def check_exit(results, pos):
     entry = pos.get("entry_price") or 0.0
     if r4h["low"] <= pos["stop"]:
         return True, "Stop-Loss", min(r4h["open"], pos["stop"])
-    if r4h["high"] >= pos["target"]:
-        return True, "Take-Profit", pos["target"]
+
+    # v21.2.0: fixed TP отключён
+    if not NO_FIXED_TP:
+        if r4h["high"] >= pos["target"]:
+            return True, "Take-Profit", pos["target"]
+
     if entry > 0 and atr1d > 0:
-        if not pos.get("partial_done") and r4h["high"] >= entry + PARTIAL_TP_ATR * atr1d:
-            pos["partial_done"] = True
-            pos["stop"] = max(pos["stop"], entry * 1.001)
-            return False, "partial", entry + PARTIAL_TP_ATR * atr1d
+        # v21.2.0: partial TP отключён
+        if not NO_PARTIAL_TP:
+            if not pos.get("partial_done") and r4h["high"] >= entry + PARTIAL_TP_ATR * atr1d:
+                pos["partial_done"] = True
+                pos["stop"] = max(pos["stop"], entry * 1.001)
+                return False, "partial", entry + PARTIAL_TP_ATR * atr1d
+
+        # БУ быстрее +0.5×ATR
+        be_trig = BREAKEVEN_TRIGGER_ATR_FAST if HOLD_MODE_ENABLED else BREAKEVEN_TRIGGER_ATR
         if (not pos.get("breakeven_moved")
-                and r4h["close"] >= entry + BREAKEVEN_TRIGGER_ATR * atr1d):
+                and r4h["close"] >= entry + be_trig * atr1d):
             pos["breakeven_moved"] = True
             pos["stop"] = max(pos["stop"], entry * 1.001)
+
+        # Трейлинг
         if r4h["close"] >= entry + TRAILING_TRIGGER_ATR * atr1d:
             pos["highest_close"] = max(pos.get("highest_close", r4h["close"]),
                                        r4h["close"])
@@ -1096,17 +1071,19 @@ def check_exit(results, pos):
                                       or pos.get("breakeven_moved")) else pos["stop"]
             if new_stop > pos["stop"]:
                 pos["stop"] = max(new_stop, floor)
+
+    # EMA-кросс вниз на 4h — основной выход
     if r4h.get("ema_cross_down"):
         return True, "Разворот", r4h["close"]
     return False, "", 0.0
 
+# ==================== ВХОД / ФИЛЬТРЫ ====================
 def can_enter(pair, signal=None, signal_risk_pct=None):
     now = time.time()
     trade_times[:] = [t for t in trade_times if now - t < 3600]
     if not cb_can_trade():
         return False
 
-    # 🔧 BTC-фильтр: dip-buy / WT-dip / SQZ-dip / BOTTOM / WT-confirm обходят
     if not market_allows_longs():
         if not _signal_bypasses_btc(signal):
             if signal is None or not is_strong_signal_for_blocked_market(signal):
@@ -1122,8 +1099,6 @@ def can_enter(pair, signal=None, signal_risk_pct=None):
             else:
                 sc_num = int(sc) if sc is not None else 0
             if sc_num < DAILY_REGIME_BLOCK_BELOW_SCORE:
-                logger.info("🚫 Bear-режим 1D заблокировал вход %s (score=%s)",
-                            pair, sc)
                 return False
 
     old_state = state.get(pair, {})
@@ -1164,7 +1139,6 @@ def refresh_trend_for(pair):
         df = pd.DataFrame(fetch_klines(pair, p["bybit_interval"], p["min_bars"]))
         res[tf] = compute_tf_trend(df, p)
         time.sleep(0.15)
-
     d_ema50_gt_200 = None
     d_close_above_200 = None
     try:
@@ -1178,7 +1152,6 @@ def refresh_trend_for(pair):
                 d_close_above_200 = bool(close_prev > ef200)
     except Exception as e:
         logger.debug("daily regime %s: %s", pair, e)
-
     score = sum(1 for v in res.values() if v)
     with trend_cache_lock:
         trend_cache[pair] = {
@@ -1204,7 +1177,7 @@ def refresh_all_trends():
                 bull_count += 1
         except Exception as e:
             logger.debug("trend %s: %s", pair, e)
-    logger.info("Тренд-кэш: %d пар · 3/3=%d · 1D-bull=%d",
+    logger.info("Тренд-кэш: %d пар, 3/3=%d, 1D-bull=%d",
                 len(watch), q3, bull_count)
 
 def trend_cache_loop():
@@ -1235,7 +1208,7 @@ def daily_regime_str(symbol):
     if r is False:
         return "bear"
     return "unknown"
-# ==================== ВСЕЛЕННАЯ ПАР ====================
+  # ==================== ВСЕЛЕННАЯ ПАР ====================
 FIAT_BASES = {"AUD", "GBP", "EUR", "CAD", "CHF", "JPY", "USD",
               "BRL", "MXN", "TRY", "ZAR", "INR", "SGD", "HKD"}
 STABLECOINS = {"USDC", "USDT", "DAI", "PYUSD", "TUSD", "FDUSD", "AUSD", "EURR",
@@ -1264,7 +1237,7 @@ def fetch_spot_instruments():
         params = {"category": "spot", "limit": 1000}
         if cursor:
             params["cursor"] = cursor
-        data = http_get(f"{BASE_URL}/instruments-info", params=params)
+        data = http_get("%s/instruments-info" % BASE_URL, params=params)
         if not api_ok(data):
             break
         result = data.get("result") or {}
@@ -1276,7 +1249,7 @@ def fetch_spot_instruments():
     return items
 
 def fetch_spot_tickers():
-    data = http_get(f"{BASE_URL}/tickers", params={"category": "spot"})
+    data = http_get("%s/tickers" % BASE_URL, params={"category": "spot"})
     if not api_ok(data):
         return {}
     out = {}
@@ -1335,7 +1308,7 @@ def get_all_available_pairs(max_pairs):
 
 # ==================== ЗАГРУЗКА ДАННЫХ ====================
 def fetch_klines(pair, interval, min_bars):
-    data = http_get(f"{BASE_URL}/kline", params={
+    data = http_get("%s/kline" % BASE_URL, params={
         "category": "spot", "symbol": pair,
         "interval": interval, "limit": min(min_bars, 1000),
     })
@@ -1383,157 +1356,80 @@ def _rr_ok(entry, stop, target, min_rr=1.5):
         return False
     return (target - entry) / risk >= min_rr
 
-def evaluate_ws_entry(df, symbol):
-    """Confluence с пошаговой воронкой."""
-    funnel_inc("conf_total")
+# ==================== RANGE-BOUNCE (v21.2.0) ====================
+def evaluate_ws_range_bounce(df, symbol, lower_level, upper_level):
+    """Отскок от дна боковика. Вход у lower_level, SL под ним.
+    Держим до EMA-кросса 4h или трейлинга. 1D-bull не обязателен."""
+    funnel_inc("bounce_total")
+    if not RANGE_BOUNCE_ENABLED:
+        return None
+    if not lower_level or not upper_level or lower_level <= 0 or upper_level <= lower_level:
+        return None
     if len(df) < MIN_BARS + 1:
         return None
+
     sig = df.iloc[-2]
-    if (pd.isna(sig["ema_fast"]) or pd.isna(sig["rsi"])
-            or pd.isna(sig["atr"]) or sig["atr"] <= 0):
+    if pd.isna(sig["atr"]) or sig["atr"] <= 0:
         return None
-    if not (RSI_MIN <= sig["rsi"] <= RSI_MAX):
+    if pd.isna(sig["rsi"]):
         return None
-    funnel_inc("conf_rsi")
-    if not (ADX_MIN <= sig["adx"] <= ADX_MAX):
+
+    # 1) Цена у дна боковика
+    zone = lower_level * (1 + RANGE_BOUNCE_ZONE_PCT / 100)
+    if sig["low"] > zone:
         return None
-    funnel_inc("conf_adx")
-    if not (sig["ema_fast"] > sig["ema_slow"]):
+    funnel_inc("bounce_zone")
+
+    # 2) RSI < 50
+    if sig["rsi"] > RANGE_BOUNCE_RSI_MAX:
         return None
-    funnel_inc("conf_ema")
-    ti = get_trend(symbol)
-    if ti is None or ti["score"] < 2:
-        return None
-    funnel_inc("conf_trend")
-    score = 0
-    parts = []
-    cross_ago = find_fresh_cross(df)
-    if cross_ago == 0:
-        score += 3
-        parts.append("MACD-кросс +3")
-    elif cross_ago in (1, 2):
-        hist_now = sig["macd_line"] - sig["macd_signal"]
-        hist_prev = df.iloc[-3]["macd_line"] - df.iloc[-3]["macd_signal"]
-        if hist_now > hist_prev:
-            score += 2
-            parts.append(f"MACD-кросс ({cross_ago + 1} св. назад) +2")
-        else:
-            return None
-    else:
-        return None
-    funnel_inc("conf_macd")
-    score += 1
-    parts.append("EMA9>21 +1")
-    if bool(sig["ema_cross_up"]):
-        score += 1
-        parts.append("EMA-кросс +1")
-    score += 1
-    parts.append("RSI в зоне +1")
-    if bool(sig["adx_slope_up"]):
-        score += 1
-        parts.append("ADX растёт +1")
-    vol_ratio = float(sig["vol_ratio"]) if not pd.isna(sig["vol_ratio"]) else 0.0
-    if vol_ratio >= MIN_VOL_MULT:
-        score += 1
-        parts.append(f"Объём {vol_ratio:.1f}× +1")
-    if ti["score"] == 3:
-        score += 2
-        parts.append("Тренд 3/3 +2")
-    else:
-        score += 1
-        parts.append("Тренд 2/3 +1")
-    min_score = MIN_SIGNAL_SCORE
-    if SESSION_FILTER_ENABLED and datetime.now(timezone.utc).hour < 7:
-        min_score += 1
-    if score < min_score:
-        return None
-    funnel_inc("conf_score")
-    entry = float(df.iloc[-1]["close"])
-    atr_value = float(sig["atr"])
-    stop = entry - atr_value * ATR_MULT_SL
-    target = entry + atr_value * ATR_MULT_TP
-    if stop >= entry or target <= entry:
-        return None
-    if (entry - stop) / entry * 100 < MIN_STOP_DISTANCE_PCT:
-        return None
-    if not _rr_ok(entry, stop, target):
-        return None
-    # 🎯 DIP-FIRST: Confluence только в нижних 30% дня
-    if not _bottom_filter_ok(symbol, entry):
-        return None
-    funnel_inc("conf_bottom")
-    wt_confirm = detect_wt_buy_cross(df)
-    if wt_confirm:
-        score += 1
-        parts.append("🌊 WT-кросс +1")
-    return {"entry": entry, "stop": stop, "target": target, "atr": atr_value,
-            "score": score, "parts": parts, "strategy": "ws_15m",
-            "trend_score": ti["score"], "bottom_ok": True,
-            "wt_confirm": wt_confirm}
-def evaluate_ws_pullback(df, symbol):
-    """Pullback со счётчиками воронки."""
-    funnel_inc("pb_total")
-    if not PULLBACK_ENABLED or len(df) < MIN_BARS + 1:
-        return None
-    ti = get_trend(symbol)
-    if ti is None or ti["score"] < 3:
-        return None
-    funnel_inc("pb_trend")
-    if find_fresh_cross(df) is not None:
-        return None
-    sig = df.iloc[-2]
-    if pd.isna(sig["ema_fast"]) or pd.isna(sig["ema_slow"]) or pd.isna(sig["atr"]):
-        return None
-    if sig["atr"] <= 0 or not (sig["ema_fast"] > sig["ema_slow"]):
-        return None
-    touched = sig["low"] <= sig["ema_slow"] * 1.002
-    recovered = sig["close"] >= sig["ema_fast"]
-    if not (touched and recovered):
-        return None
-    funnel_inc("pb_touch")
-    if sig["ema_slow"] <= df["ema_slow"].iloc[-6]:
-        return None
-    recent_high = df["high"].iloc[-11:-1].max()
-    prior_low = df["low"].iloc[-21:-6].min()
-    if sig["ema_slow"] > 0 and (recent_high - sig["low"]) / sig["ema_slow"] > PULLBACK_MAX_DEPTH_PCT:
-        return None
-    if prior_low > 0 and (recent_high - prior_low) / prior_low < PULLBACK_MIN_PRIOR_MOVE_PCT:
-        return None
+    funnel_inc("bounce_rsi")
+
+    # 3) Зелёная свеча
     if not (sig["close"] > sig["open"]):
         return None
-    if not (RSI_MIN <= sig["rsi"] <= PULLBACK_RSI_MAX):
-        return None
-    if not (ADX_MIN <= sig["adx"] <= ADX_MAX):
-        return None
+    funnel_inc("bounce_green")
+
+    # 4) Объём
     vol_ratio = float(sig["vol_ratio"]) if not pd.isna(sig["vol_ratio"]) else 0.0
-    if vol_ratio < PULLBACK_VOL_MULT:
+    if vol_ratio < RANGE_BOUNCE_VOL_MULT:
         return None
-    funnel_inc("pb_vol")
+    funnel_inc("bounce_vol")
+
     entry = float(df.iloc[-1]["close"])
     atr_value = float(sig["atr"])
-    stop = entry - atr_value * PULLBACK_SL_ATR
-    target = entry + atr_value * PULLBACK_TP_ATR
+    stop = lower_level * (1 - RANGE_BOUNCE_SL_PCT / 100)
+    target = float(upper_level)
     if stop >= entry or target <= entry:
+        return None
+    risk = entry - stop
+    if risk <= 0:
+        return None
+    rr = (target - entry) / risk
+    if rr < RANGE_BOUNCE_MIN_RR:
         return None
     if (entry - stop) / entry * 100 < MIN_STOP_DISTANCE_PCT:
         return None
-    if not _rr_ok(entry, stop, target):
-        return None
-    if not _bottom_filter_ok(symbol, entry):
-        return None
-    wt_confirm = detect_wt_buy_cross(df)
-    parts = [f"Откат к EMA21 · тренд 3/3 · объём {vol_ratio:.1f}×"]
-    if wt_confirm:
-        parts.append("🌊 WT-кросс")
-    return {"entry": entry, "stop": stop, "target": target, "atr": atr_value,
-            "score": "PB", "trend_score": ti["score"],
-            "parts": parts,
-            "strategy": "ws_pullback", "bottom_ok": True,
-            "wt_confirm": wt_confirm}
+    funnel_inc("bounce_rr")
 
-# ==================== 💎 RSI DIP-BUY v21.0.3 ====================
+    ti = get_trend(symbol)
+    trend_score = ti["score"] if ti else 0
+
+    return {
+        "entry": entry, "stop": stop, "target": target, "atr": atr_value,
+        "score": 7, "trend_score": trend_score,
+        "parts": [
+            "Bounce от дна боковика (lower=%.6g)" % lower_level,
+            "RSI %.0f, объём %.1fx" % (sig["rsi"], vol_ratio),
+            "SL под дном, держим до разворота",
+        ],
+        "strategy": "range_bounce",
+        "bottom_ok": True,
+        "hold_mode": True,
+    }
+  # ==================== RSI DIP-BUY (v21.2.0) ====================
 def evaluate_ws_dipbuy(df, symbol):
-    """RSI зона + отскок + BB + объём + 1D bull. Пошаговые счётчики."""
+    """RSI зона + отскок + BB + объём + 1D bull."""
     funnel_inc("dip_total")
     if not DIPBUY_ENABLED or len(df) < MIN_BARS + 1:
         return None
@@ -1614,16 +1510,16 @@ def evaluate_ws_dipbuy(df, symbol):
     sqz_release = detect_sqz_release_bull(df)
     score = 6
     parts = [
-        f"RSI зона≤{DIPBUY_RSI_ZONE} ×{DIPBUY_RSI_MIN_BARS}св → отскок {rsi_prev:.0f}→{rsi_now:.0f}",
-        f"Нижняя BB · Объём {vol_ratio:.1f}×",
-        "1D аптренд ✓",
+        "RSI зона<=%d x%dсв -> отскок %.0f->%.0f" % (DIPBUY_RSI_ZONE, DIPBUY_RSI_MIN_BARS, rsi_prev, rsi_now),
+        "Нижняя BB, объём %.1fx" % vol_ratio,
+        "1D аптренд OK",
     ]
     if wt_confirm:
         score += 2
-        parts.append("🌊 WT-кросс +2")
+        parts.append("WT-cross +2")
     if sqz_release:
         score += 1
-        parts.append("💥 SQZ-release +1")
+        parts.append("SQZ-release +1")
     return {
         "entry": entry, "stop": stop, "target": target, "atr": atr_value,
         "score": score,
@@ -1632,9 +1528,10 @@ def evaluate_ws_dipbuy(df, symbol):
         "strategy": "rsi_dipbuy",
         "wt_confirm": wt_confirm,
         "sqz_release": sqz_release,
+        "hold_mode": True,
     }
 
-# ==================== 🌊 WT-DIP (v21.0.3) ====================
+# ==================== WT-DIP (v21.2.0) ====================
 def evaluate_ws_wt_dip(df, symbol):
     """WaveTrend кросс внизу + BOTTOM-фильтр + 1D-bull + EMA9>21."""
     funnel_inc("wt_total")
@@ -1683,39 +1580,41 @@ def evaluate_ws_wt_dip(df, symbol):
     return {
         "entry": entry, "stop": stop, "target": target, "atr": atr_value,
         "score": 7, "trend_score": trend_score,
-        "parts": [f"🌊 WT-кросс внизу (wt1={wt_now:.0f})", "BOTTOM ✓", "1D аптренд ✓"],
+        "parts": ["WT-cross внизу (wt1=%.0f)" % wt_now, "BOTTOM OK", "1D аптренд OK"],
         "strategy": "wt_dip",
         "wt_confirm": True,
         "bottom_ok": True,
+        "hold_mode": True,
     }
 
-# ==================== 💥 SQZ-BREAKOUT (v21.0.3) ====================
-def evaluate_ws_sqz_breakout(df, symbol, level):
-    """Squeeze Momentum release + пробой уровня (объём 1.4×)."""
-    funnel_inc("sqz_total")
-    if not SQZ_ENABLED or not SQZ_BREAKOUT_STRATEGY_ENABLED:
+# ==================== SQZ-DIP (v21.2.0) ====================
+def evaluate_ws_sqz_dip(df, symbol):
+    """SQZ release в нижней половине дня + 1D-bull + зелёная свеча."""
+    funnel_inc("sqzdip_total")
+    if not SQZ_ENABLED or not SQZ_DIP_STRATEGY_ENABLED:
         return None
-    if not level or level <= 0 or len(df) < MIN_BARS + 1:
+    if len(df) < MIN_BARS + 1:
         return None
+    if DIPBUY_REQUIRE_DAILY_BULL:
+        if daily_regime_bull(symbol) is not True:
+            return None
+    funnel_inc("sqzdip_bull")
     if not detect_sqz_release_bull(df):
         return None
-    funnel_inc("sqz_release")
+    funnel_inc("sqzdip_release")
     sig = df.iloc[-2]
     if pd.isna(sig["atr"]) or sig["atr"] <= 0:
         return None
-    last_close = float(sig["close"])
-    if last_close < level * (1 + BREAKOUT_MIN_TRIGGER_PCT / 100):
+    if not (sig["close"] > sig["open"]):
         return None
-    if last_close > level * (1 + MAX_BREAKOUT_DISTANCE_PCT / 100):
-        return None
-    vol_ratio = float(sig["vol_ratio"]) if not pd.isna(sig["vol_ratio"]) else 0.0
-    if vol_ratio < SQZ_BREAKOUT_VOL_MULT:
-        return None
-    funnel_inc("sqz_breakout")
+    funnel_inc("sqzdip_green")
     entry = float(df.iloc[-1]["close"])
+    if not _bottom_filter_ok(symbol, entry):
+        return None
+    funnel_inc("sqzdip_bottom")
     atr_value = float(sig["atr"])
-    stop = entry - atr_value * ATR_MULT_SL
-    target = entry + atr_value * ATR_MULT_TP
+    stop = entry - atr_value * SQZ_DIP_SL_ATR
+    target = entry + atr_value * SQZ_DIP_TP_ATR
     if stop >= entry or target <= entry:
         return None
     if (entry - stop) / entry * 100 < MIN_STOP_DISTANCE_PCT:
@@ -1724,52 +1623,20 @@ def evaluate_ws_sqz_breakout(df, symbol, level):
         return None
     ti = get_trend(symbol)
     trend_score = ti["score"] if ti else 0
+    try:
+        val_now, is_on, is_off, color = sqz_state(df)
+    except Exception:
+        val_now, color = 0.0, "grey"
     return {
         "entry": entry, "stop": stop, "target": target, "atr": atr_value,
         "score": 7, "trend_score": trend_score,
-        "parts": [f"💥 SQZ-release у уровня {level:.6g}", f"Объём {vol_ratio:.1f}×"],
-        "strategy": "sqz_breakout",
+        "parts": ["SQZ-release внизу (val=%.4g, %s)" % (val_now, color),
+                  "BOTTOM OK", "1D аптренд OK"],
+        "strategy": "sqz_dip",
         "sqz_release": True,
+        "bottom_ok": True,
+        "hold_mode": True,
     }
-
-# ==================== BREAKOUT RETEST ====================
-def evaluate_ws_retest(df, symbol, level):
-    if not RETEST_ENABLED or not level or level <= 0 or len(df) < 25:
-        return None
-    mem = retest_memory.setdefault(symbol, {"above": False})
-    prev_close = float(df["close"].iloc[-3])
-    last = df.iloc[-2]
-    if prev_close < level * 0.97:
-        mem["above"] = False
-    if prev_close > level and not mem["above"]:
-        mem["above"] = True
-    if not mem["above"]:
-        return None
-    touched = last["low"] <= level * (1 + RETEST_TOUCH_TOLERANCE_PCT / 100)
-    crashed = last["close"] < level * 0.99
-    recovered = last["close"] > level and last["close"] > last["open"]
-    if not (touched and recovered and not crashed):
-        return None
-    atr_val = float(df["atr"].iloc[-2]) if not pd.isna(df["atr"].iloc[-2]) else 0.0
-    if atr_val <= 0:
-        return None
-    entry = float(df.iloc[-1]["close"])
-    if entry <= level:
-        return None
-    stop = level - RETEST_SL_ATR * atr_val
-    target = entry + RETEST_TP_ATR * atr_val
-    if stop >= entry or target <= entry:
-        return None
-    if (entry - stop) / entry * 100 < MIN_STOP_DISTANCE_PCT:
-        return None
-    if not _rr_ok(entry, stop, target):
-        return None
-    mem["above"] = False
-    ti = get_trend(symbol)
-    return {"entry": entry, "stop": stop, "target": target, "atr": atr_val,
-            "score": "RT", "trend_score": (ti["score"] if ti else 0),
-            "parts": [f"Retest уровня {level:.6f} · отскок"],
-            "strategy": "breakout_retest"}
 
 # ==================== ОТКРЫТИЕ ПОЗИЦИИ ====================
 def open_position(symbol, sig, closed_start):
@@ -1807,83 +1674,14 @@ def open_position(symbol, sig, closed_start):
         "size_fraction": size,
         "btc_blocked_entry": btc_blocked,
         "daily_regime_at_entry": daily_regime_str(symbol),
+        "hold_mode": sig.get("hold_mode", True),
     })
     state[symbol] = new_state
     trade_times.append(time.time())
     save_state(state)
     funnel_inc("opened")
     return new_state
-# ==================== БЫСТРЫЙ BREAKOUT ЧЕРЕЗ WS (kline) ====================
-def try_ws_breakout(symbol, new_candle, df):
-    with breakout_cache_lock:
-        level = breakout_cache.get(symbol)
-    if level is None or level <= 0:
-        return None
-    prev_close = float(df["close"].iloc[-3])
-    last_close = float(df["close"].iloc[-2])
-    vol_sma = df["volume"].rolling(20).mean()
-    vol_ratio = (float(df["volume"].iloc[-2] / vol_sma.iloc[-2])
-                 if not pd.isna(vol_sma.iloc[-2]) and vol_sma.iloc[-2] > 0 else 0.0)
-    if not (prev_close < level <= last_close):
-        return None
-    if last_close > level * (1 + MAX_BREAKOUT_DISTANCE_PCT / 100):
-        return None
-    if vol_ratio < 1.8:
-        return None
-    atr_val = float(df["atr"].iloc[-2]) if not pd.isna(df["atr"].iloc[-2]) else 0.0
-    if atr_val <= 0:
-        return None
-    entry = float(new_candle["close"])
-    stop = entry - atr_val * ATR_MULT_SL
-    target = entry + atr_val * ATR_MULT_TP
-    if stop >= entry or target <= entry:
-        return None
-    if (entry - stop) / entry * 100 < MIN_STOP_DISTANCE_PCT:
-        return None
-    if not _rr_ok(entry, stop, target):
-        return None
-    closed_start = int(df.iloc[-2]["start"])
-    risk_pct = (entry - stop) / entry * 100
-    ti = get_trend(symbol)
-    trend_score = ti["score"] if ti else 0
-    pseudo_sig = {"trend_score": trend_score, "score": 7}
-    btc_blocked = not market_allows_longs()
-    if btc_blocked and not is_strong_signal_for_blocked_market(pseudo_sig):
-        return None
-    with state_lock:
-        if not can_enter(symbol, signal=pseudo_sig, signal_risk_pct=risk_pct):
-            return None
-        old_state = state.get(symbol, {})
-        if old_state.get("last_signal_candle") == closed_start:
-            return None
-        rr = (target - entry) / (entry - stop)
-        size = position_size_fraction(7, rr, atr_val / entry * 100,
-                                      portfolio_risk_used(), risk_pct,
-                                      btc_blocked=btc_blocked)
-        new_state = old_state.copy()
-        new_state.update({
-            "position": "open",
-            "entry_price": entry,
-            "stop": stop,
-            "target": target,
-            "atr_ref": atr_val,
-            "entry_time": datetime.now(timezone.utc).isoformat(),
-            "last_signal_candle": closed_start,
-            "last_entry_ts": time.time(),
-            "strategy": "breakout_ws",
-            "score": "BWS",
-            "size_fraction": size,
-            "btc_blocked_entry": btc_blocked,
-            "daily_regime_at_entry": daily_regime_str(symbol),
-        })
-        state[symbol] = new_state
-        trade_times.append(time.time())
-        save_state(state)
-        funnel_inc("opened")
-    return {"entry": entry, "stop": stop, "target": target,
-            "vol_ratio": vol_ratio, "level": level}
-
-# ==================== ⚡ WS-REALTIME-HOT-X + WT-DIP ====================
+  # ==================== HOT-POOLS + WS-REALTIME (v21.2.0) ====================
 def _cand_hotness(s):
     return abs(s.get("macd_gap_pct", 999))
 
@@ -1900,11 +1698,17 @@ def _dip_hotness(s):
 def _wtdip_hotness(s):
     return s.get("wt_now", 999)
 
+def _bounce_hotness(s):
+    return s.get("dist_to_bottom", 999)
+
 def _rebuild_hot_pools_from_buffers():
+    """Отбор «горячих» пулов из ohlc_buffers (без REST).
+    Запускается раз в WS_TICKERS_REFRESH_SEC (5 мин)."""
     cand_pool = []
     cons_pool = []
     dip_pool = []
     wtdip_pool = []
+    bounce_pool = []
 
     for sym, buf in list(ohlc_buffers.items()):
         if not buf or len(buf) < MIN_BARS:
@@ -1938,14 +1742,22 @@ def _rebuild_hot_pools_from_buffers():
 
             # --- cons pool ---
             with breakout_cache_lock:
-                lvl = breakout_cache.get(sym)
-            if lvl and lvl > 0:
+                cache_entry = breakout_cache.get(sym)
+            upper_lvl = None
+            lower_lvl = None
+            if isinstance(cache_entry, dict):
+                upper_lvl = cache_entry.get("upper")
+                lower_lvl = cache_entry.get("lower")
+            elif isinstance(cache_entry, (int, float)):
+                upper_lvl = cache_entry
+
+            if upper_lvl and upper_lvl > 0:
                 cur = float(last["close"])
-                dist_pct = (lvl - cur) / cur * 100 if cur > 0 else 999
+                dist_pct = (upper_lvl - cur) / cur * 100 if cur > 0 else 999
                 if 0 <= dist_pct <= WS_HOT_NEAR_BREAKOUT_PCT:
                     cons_pool.append({
                         "pair": sym,
-                        "upper_level": lvl,
+                        "upper_level": upper_lvl,
                         "current_price": cur,
                         "dist_to_break_pct": dist_pct,
                         "days": 0, "range_pct": 0.0, "adx": 0.0,
@@ -1953,7 +1765,23 @@ def _rebuild_hot_pools_from_buffers():
                         "source": "buffers",
                     })
 
-            # --- dip pool (RSI 25–45) ---
+            # --- bounce pool (v21.2.0) ---
+            if (RANGE_BOUNCE_ENABLED and lower_lvl and upper_lvl
+                    and lower_lvl > 0 and upper_lvl > lower_lvl):
+                cur = float(last["close"])
+                dist_to_bottom = (cur - lower_lvl) / lower_lvl * 100
+                if 0 <= dist_to_bottom <= RANGE_BOUNCE_HOT_ZONE_PCT:
+                    bounce_pool.append({
+                        "pair": sym,
+                        "lower": lower_lvl,
+                        "upper": upper_lvl,
+                        "current_price": cur,
+                        "dist_to_bottom": dist_to_bottom,
+                        "rsi_now": float(last["rsi"]) if not pd.isna(last["rsi"]) else 50,
+                        "source": "buffers",
+                    })
+
+            # --- dip pool (RSI 25-45) ---
             if DIPBUY_ENABLED and not pd.isna(last["rsi"]):
                 rsi_now = float(last["rsi"])
                 regime = daily_regime_bull(sym)
@@ -1968,7 +1796,7 @@ def _rebuild_hot_pools_from_buffers():
                         "source": "buffers",
                     })
 
-            # --- wtdip pool (RSI 25–55, WT около зоны) ---
+            # --- wtdip pool (RSI 25-55) ---
             if WT_ENABLED and WT_DIP_STRATEGY_ENABLED and not pd.isna(last["rsi"]):
                 rsi_now = float(last["rsi"])
                 regime = daily_regime_bull(sym)
@@ -1997,6 +1825,7 @@ def _rebuild_hot_pools_from_buffers():
     cons_pool.sort(key=_cons_hotness)
     dip_pool.sort(key=_dip_hotness)
     wtdip_pool.sort(key=_wtdip_hotness)
+    bounce_pool.sort(key=_bounce_hotness)
 
     with HOT_PAIRS_LOCK:
         if cand_pool:
@@ -2007,11 +1836,15 @@ def _rebuild_hot_pools_from_buffers():
             HOT_PAIRS_CACHE["dipbuy_pool"] = dip_pool
         if wtdip_pool:
             HOT_PAIRS_CACHE["wtdip_pool"] = wtdip_pool
+        if bounce_pool:
+            HOT_PAIRS_CACHE["bounce_pool"] = bounce_pool
         HOT_PAIRS_CACHE["ts"] = time.time()
-    logger.debug("Мягкая пересборка: cand=%d cons=%d dip=%d wtdip=%d",
-                 len(cand_pool), len(cons_pool), len(dip_pool), len(wtdip_pool))
+    logger.debug("HOT-пересборка: cand=%d cons=%d dip=%d wt=%d bounce=%d",
+                 len(cand_pool), len(cons_pool), len(dip_pool),
+                 len(wtdip_pool), len(bounce_pool))
 
 def update_ticker_subscription():
+    """Диффим WS-tickers подписку: 15c + 15cons + 8dip + 4wt + 8bounce = 50."""
     if not WS_TICKERS_ENABLED:
         return
     with HOT_PAIRS_LOCK:
@@ -2019,15 +1852,18 @@ def update_ticker_subscription():
         cons_pool = list(HOT_PAIRS_CACHE.get("consolidations_pool") or [])
         dip_pool = list(HOT_PAIRS_CACHE.get("dipbuy_pool") or [])
         wtdip_pool = list(HOT_PAIRS_CACHE.get("wtdip_pool") or [])
+        bounce_pool = list(HOT_PAIRS_CACHE.get("bounce_pool") or [])
 
     cand_pool = sorted(cand_pool, key=_cand_hotness)
     cons_pool = sorted(cons_pool, key=_cons_hotness)
     dip_pool = sorted(dip_pool, key=_dip_hotness)
     wtdip_pool = sorted(wtdip_pool, key=_wtdip_hotness)
+    bounce_pool = sorted(bounce_pool, key=_bounce_hotness)
 
     picked = []
     picked_set = set()
 
+    # cand 15
     for s in cand_pool:
         if len(picked) >= WS_TICKERS_QUOTA_CAND:
             break
@@ -2037,8 +1873,10 @@ def update_ticker_subscription():
         picked.append(p)
         picked_set.add(p)
 
+    # cons 15
+    cap_cons = WS_TICKERS_QUOTA_CAND + WS_TICKERS_QUOTA_CONS
     for item in cons_pool:
-        if len(picked) >= WS_TICKERS_QUOTA_CAND + WS_TICKERS_QUOTA_CONS:
+        if len(picked) >= cap_cons:
             break
         p = item["pair"]
         if p in picked_set:
@@ -2046,8 +1884,10 @@ def update_ticker_subscription():
         picked.append(p)
         picked_set.add(p)
 
+    # dip 8
+    cap_dip = cap_cons + WS_TICKERS_QUOTA_DIP
     for s in dip_pool:
-        if len(picked) >= WS_TICKERS_QUOTA_CAND + WS_TICKERS_QUOTA_CONS + WS_TICKERS_QUOTA_DIP:
+        if len(picked) >= cap_dip:
             break
         p = s["pair"]
         if p in picked_set:
@@ -2055,8 +1895,21 @@ def update_ticker_subscription():
         picked.append(p)
         picked_set.add(p)
 
+    # bounce 8
+    cap_bounce = cap_dip + WS_TICKERS_QUOTA_BOUNCE
+    for s in bounce_pool:
+        if len(picked) >= cap_bounce:
+            break
+        p = s["pair"]
+        if p in picked_set:
+            continue
+        picked.append(p)
+        picked_set.add(p)
+
+    # wt 4
+    cap_wt = cap_bounce + WS_TICKERS_QUOTA_WT
     for s in wtdip_pool:
-        if len(picked) >= WS_TICKERS_MAX_PAIRS:
+        if len(picked) >= cap_wt:
             break
         p = s["pair"]
         if p in picked_set:
@@ -2064,7 +1917,8 @@ def update_ticker_subscription():
         picked.append(p)
         picked_set.add(p)
 
-    for pool in (cand_pool, cons_pool, dip_pool, wtdip_pool):
+    # добивка до максимума
+    for pool in (bounce_pool, dip_pool, wtdip_pool, cons_pool, cand_pool):
         if len(picked) >= WS_TICKERS_MAX_PAIRS:
             break
         for item in pool:
@@ -2088,20 +1942,19 @@ def update_ticker_subscription():
     app = WS_TICKERS_APP
     if app is not None and WS_TICKERS_CONNECTED.is_set():
         try:
-            # v21.0.3: чанки по 10, пауза 0.1с
             if to_add:
-                args = [f"tickers.{s}" for s in to_add]
+                args = ["tickers.%s" % s for s in to_add]
                 for i in range(0, len(args), WS_SUBSCRIBE_CHUNK):
                     app.send(json.dumps({"op": "subscribe",
                                          "args": args[i:i + WS_SUBSCRIBE_CHUNK]}))
                     time.sleep(0.1)
             if to_remove:
-                args = [f"tickers.{s}" for s in to_remove]
+                args = ["tickers.%s" % s for s in to_remove]
                 for i in range(0, len(args), WS_SUBSCRIBE_CHUNK):
                     app.send(json.dumps({"op": "unsubscribe",
                                          "args": args[i:i + WS_SUBSCRIBE_CHUNK]}))
                     time.sleep(0.1)
-            logger.info("⚡ WS-tickers: +%d -%d (всего %d)",
+            logger.info("WS-tickers: +%d -%d (всего %d)",
                         len(to_add), len(to_remove), len(new_subset))
         except Exception as e:
             logger.warning("WS-tickers send error: %s", e)
@@ -2115,6 +1968,10 @@ def _find_hot_entry(symbol):
         cons_pool = HOT_PAIRS_CACHE.get("consolidations_pool") or []
         dip_pool = HOT_PAIRS_CACHE.get("dipbuy_pool") or []
         wtdip_pool = HOT_PAIRS_CACHE.get("wtdip_pool") or []
+        bounce_pool = HOT_PAIRS_CACHE.get("bounce_pool") or []
+    bounce = next((s for s in bounce_pool if s["pair"] == symbol), None)
+    if bounce:
+        return "bounce", bounce
     cand = next((s for s in cand_pool if s["pair"] == symbol), None)
     if cand:
         return "cand", cand
@@ -2171,119 +2028,29 @@ def _open_on_tick(symbol, cur_price, source="tick"):
     if df is None:
         return
 
-    # --- Кандидат (Confluence) ---
-    if kind == "cand":
-        entry_ref = item.get("close_price", 0)
-        if entry_ref > 0:
-            drift_ok, _ = check_peak_guard_drift(cur_price, entry_ref)
-            if not drift_ok:
-                return
-        sig = evaluate_ws_entry(df, symbol)
+    # --- BOUNCE (v21.2.0) ---
+    if kind == "bounce":
+        lower = item.get("lower", 0)
+        upper = item.get("upper", 0)
+        if not lower or not upper:
+            return
+        sig = evaluate_ws_range_bounce(df, symbol, lower, upper)
         if sig is None:
-            return
-        peak_ok, peak_reason, _ = check_peak_guard(df, cur_price)
-        if not peak_ok:
-            funnel_inc("peak_block")
-            if now_ts - LAST_PEAK_ALERT.get(symbol, 0) > 600:
-                logger.info("⛔ HOT cand %s: %s", symbol, peak_reason)
-                LAST_PEAK_ALERT[symbol] = now_ts
-            return
-        rsi_ok, _ = check_peak_guard_rsi(float(df["rsi"].iloc[-2]))
-        if not rsi_ok:
-            funnel_inc("peak_block")
-            return
-        rr = (sig["target"] - sig["entry"]) / (sig["entry"] - sig["stop"])
-        if rr < WS_HOT_MIN_RR:
             return
         HOT_LAST_CHECK[symbol] = now_ts
         with state_lock:
             opened = open_position(symbol, sig, int(df.iloc[-2]["start"]))
         if opened:
-            logger.info("⚡ WS-REALTIME ВХОД (cand) %s @ %.6g", symbol, sig["entry"])
-            extra = btc_extra_tag(sig)
-            regime = opened.get("daily_regime_at_entry", "unknown")
+            logger.info("BOUNCE WS ВХОД %s @ %.6g (lower=%.6g)",
+                        symbol, sig["entry"], lower)
             send_telegram(
-                f"⚡ <b>WS-REALTIME ВХОД</b>{extra}\n"
-                f"Пара: {tv_link(symbol)}\n"
-                f"Цена: {sig['entry']:.8f}\n"
-                f"SL: {sig['stop']:.8f} · TP: {sig['target']:.8f}\n"
-                f"1D режим: {regime}\n"
-                f"<i>{' · '.join(sig['parts'])}</i>")
-        return
-
-    # --- Боковик ---
-    if kind == "cons":
-        lvl = item.get("upper_level", 0)
-        if lvl <= 0:
-            return
-        if cur_price < lvl * (1 + BREAKOUT_MIN_TRIGGER_PCT / 100):
-            return
-        if cur_price > lvl * (1 + MAX_BREAKOUT_DISTANCE_PCT / 100):
-            return
-        vol_ratio = (float(df["volume"].iloc[-1] / df["vol_sma"].iloc[-1])
-                     if not pd.isna(df["vol_sma"].iloc[-1]) and df["vol_sma"].iloc[-1] > 0 else 0.0)
-        if vol_ratio < WS_HOT_BREAKOUT_VOL:
-            return
-        peak_ok, _, _ = check_peak_guard(df, cur_price)
-        if not peak_ok:
-            return
-        atr_val = float(df["atr"].iloc[-2]) if not pd.isna(df["atr"].iloc[-2]) else 0.0
-        if atr_val <= 0:
-            return
-        entry = cur_price
-        stop = entry - atr_val * ATR_MULT_SL
-        target = entry + atr_val * ATR_MULT_TP
-        if stop >= entry or target <= entry:
-            return
-        if (entry - stop) / entry * 100 < MIN_STOP_DISTANCE_PCT:
-            return
-        rr = (target - entry) / (entry - stop)
-        if rr < WS_HOT_MIN_RR:
-            return
-        ti = get_trend(symbol)
-        trend_score = ti["score"] if ti else 0
-        pseudo_sig = {"trend_score": trend_score, "score": 7}
-        btc_blocked = not market_allows_longs()
-        if btc_blocked and not is_strong_signal_for_blocked_market(pseudo_sig):
-            return
-        HOT_LAST_CHECK[symbol] = now_ts
-        with state_lock:
-            if not can_enter(symbol, signal=pseudo_sig,
-                             signal_risk_pct=(entry - stop) / entry * 100):
-                return
-            old_state = state.get(symbol, {})
-            closed_start = int(df.iloc[-2]["start"]) if len(df) >= 2 else 0
-            if old_state.get("last_signal_candle") == closed_start:
-                return
-            size = position_size_fraction(7, rr, atr_val / entry * 100,
-                                          portfolio_risk_used(),
-                                          (entry - stop) / entry * 100,
-                                          btc_blocked=btc_blocked)
-            new_state = old_state.copy()
-            new_state.update({
-                "position": "open", "entry_price": entry,
-                "stop": stop, "target": target, "atr_ref": atr_val,
-                "entry_time": datetime.now(timezone.utc).isoformat(),
-                "last_signal_candle": closed_start,
-                "last_entry_ts": time.time(),
-                "strategy": "breakout_realtime", "score": "RT",
-                "size_fraction": size,
-                "btc_blocked_entry": btc_blocked,
-                "daily_regime_at_entry": daily_regime_str(symbol),
-            })
-            state[symbol] = new_state
-            trade_times.append(time.time())
-            save_state(state)
-            funnel_inc("opened")
-        logger.info("⚡ WS-REALTIME ПРОБОЙ %s @ %.6g (уровень %.6g, vol ×%.1f)",
-                    symbol, entry, lvl, vol_ratio)
-        extra = btc_extra_tag(None)
-        send_telegram(
-            f"⚡ <b>WS-REALTIME ПРОБОЙ</b>{extra}\n"
-            f"Пара: {tv_link(symbol)}\n"
-            f"Уровень: {lvl:.6g} → цена {entry:.6g}\n"
-            f"SL: {stop:.8f} · TP: {target:.8f}\n"
-            f"Объём: ×{vol_ratio:.1f}")
+                "<b>BOUNCE ВХОД (WS)</b>\n"
+                "Пара: %s\n"
+                "Цена: %.8f\n"
+                "SL: %.8f, TP: %.8f\n"
+                "<i>%s</i>" % (tv_link(symbol), sig["entry"],
+                                sig["stop"], sig["target"],
+                                " / ".join(sig["parts"])))
         return
 
     # --- Dip-buy (RSI) ---
@@ -2295,13 +2062,15 @@ def _open_on_tick(symbol, cur_price, source="tick"):
         with state_lock:
             opened = open_position(symbol, sig, int(df.iloc[-2]["start"]))
         if opened:
-            logger.info("💎 WS-DIPBUY ВХОД %s @ %.6g", symbol, sig["entry"])
+            logger.info("RSI-DIPBUY ВХОД %s @ %.6g", symbol, sig["entry"])
             send_telegram(
-                f"💎 <b>RSI-DIPBUY ВХОД</b>\n"
-                f"Пара: {tv_link(symbol)}\n"
-                f"Цена: {sig['entry']:.8f}\n"
-                f"SL: {sig['stop']:.8f} · TP: {sig['target']:.8f}\n"
-                f"<i>{' · '.join(sig['parts'])}</i>")
+                "<b>RSI-DIPBUY ВХОД</b>\n"
+                "Пара: %s\n"
+                "Цена: %.8f\n"
+                "SL: %.8f, TP: %.8f\n"
+                "<i>%s</i>" % (tv_link(symbol), sig["entry"],
+                                sig["stop"], sig["target"],
+                                " / ".join(sig["parts"])))
         return
 
     # --- WT-DIP ---
@@ -2313,22 +2082,32 @@ def _open_on_tick(symbol, cur_price, source="tick"):
         with state_lock:
             opened = open_position(symbol, sig, int(df.iloc[-2]["start"]))
         if opened:
-            logger.info("🌊 WS-WTDIP ВХОД %s @ %.6g (WT-кросс)",
+            logger.info("WT-DIP ВХОД %s @ %.6g (WT-cross)",
                         symbol, sig["entry"])
             send_telegram(
-                f"🌊 <b>WT-DIP ВХОД</b>\n"
-                f"Пара: {tv_link(symbol)}\n"
-                f"Цена: {sig['entry']:.8f}\n"
-                f"SL: {sig['stop']:.8f} · TP: {sig['target']:.8f}\n"
-                f"<i>{' · '.join(sig['parts'])}</i>")
+                "<b>WT-DIP ВХОД</b>\n"
+                "Пара: %s\n"
+                "Цена: %.8f\n"
+                "SL: %.8f, TP: %.8f\n"
+                "<i>%s</i>" % (tv_link(symbol), sig["entry"],
+                                sig["stop"], sig["target"],
+                                " / ".join(sig["parts"])))
         return
-# ==================== WEBSOCKET: KLINE ====================
+
+    # --- cand (Confluence отключён, но если попадёт — пройти мимо) ---
+    if kind == "cand":
+        # v21.2.0: Confluence отключён. Пропускаем.
+        return
+
+    # --- cons (breakout отключён, пропускаем) ---
+    if kind == "cons":
+        # v21.2.0: breakout отключён. Пропускаем.
+        return
+      # ==================== WEBSOCKET: KLINE ====================
 def on_open(ws):
-    """v21.0.3: Bybit v5 не принимает подписку на 100 топиков одним сообщением.
-    Шлём чанками по 10 с паузой 0.15с."""
     logger.info("WS kline подключен. Подписка на %d пар (по %d)...",
                 len(PAIRS_WS), WS_SUBSCRIBE_CHUNK)
-    args = [f"kline.{TIMEFRAME}.{p}" for p in PAIRS_WS]
+    args = ["kline.%s.%s" % (TIMEFRAME, p) for p in PAIRS_WS]
     sent = 0
     for i in range(0, len(args), WS_SUBSCRIBE_CHUNK):
         chunk = args[i:i + WS_SUBSCRIBE_CHUNK]
@@ -2358,10 +2137,9 @@ def extend_ws_subscription(extra_pairs):
     new = [p for p in extra_pairs if p not in ohlc_buffers][:WS_EXTRA_SYMBOLS]
     if not new:
         return
-    # v21.0.3: чанки по 10
     for i in range(0, len(new), WS_SUBSCRIBE_CHUNK):
         chunk = new[i:i + WS_SUBSCRIBE_CHUNK]
-        args = [f"kline.{TIMEFRAME}.{p}" for p in chunk]
+        args = ["kline.%s.%s" % (TIMEFRAME, p) for p in chunk]
         try:
             WS_APP.send(json.dumps({"op": "subscribe", "args": args}))
         except Exception as e:
@@ -2416,6 +2194,7 @@ def on_message(ws, message):
             else:
                 buf.append(new_candle)
 
+            # --- мгновенные выходы по SL/TP/partial ---
             exit_messages = []
             with state_lock:
                 pos = state.get(symbol, {})
@@ -2430,28 +2209,18 @@ def on_message(ws, message):
                                         "Stop-Loss", pos.get("strategy", "?"),
                                         pos.get("entry_time"), size, frac, regime)
                         exit_messages.append(
-                            f"🔴 <b>СТОП-ЛОСС (WS)</b>\nПара: {tv_link(symbol)}\n"
-                            f"Цена: {exit_price:.8f}\nРезультат: <b>{pnl:+.2f}%</b>"
-                            + ("" if frac == 1.0 else " (оставшиеся 50%)"))
+                            "<b>СТОП-ЛОСС (WS)</b>\nПара: %s\n"
+                            "Цена: %.8f\nРезультат: <b>%+.2f%%</b>%s" % (
+                                tv_link(symbol), exit_price, pnl,
+                                "" if frac == 1.0 else " (оставшиеся 50%)"))
                         pos.update({"position": "closed", "last_exit_ts": time.time(),
                                     "last_exit_price": exit_price,
                                     "last_exit_reason": "stop-loss"})
                         state[symbol] = pos
                         save_state(state)
-                    elif new_candle["high"] >= pos["target"]:
-                        pnl = log_trade(symbol, pos["entry_price"], pos["target"],
-                                        "Take-Profit", pos.get("strategy", "?"),
-                                        pos.get("entry_time"), size, frac, regime)
-                        exit_messages.append(
-                            f"🟢 <b>ТЕЙК-ПРОФИТ (WS)</b>\nПара: {tv_link(symbol)}\n"
-                            f"Цена: {pos['target']:.8f}\nРезультат: <b>{pnl:+.2f}%</b>"
-                            + ("" if frac == 1.0 else " (оставшиеся 50%)"))
-                        pos.update({"position": "closed", "last_exit_ts": time.time(),
-                                    "last_exit_price": pos["target"],
-                                    "last_exit_reason": "take-profit"})
-                        state[symbol] = pos
-                        save_state(state)
-                    elif (not pos.get("partial_done")
+                    # v21.2.0: partial TP и fixed TP отключены
+                    elif (not NO_PARTIAL_TP
+                          and not pos.get("partial_done")
                           and new_candle["high"] >= pos["entry_price"] + PARTIAL_TP_ATR * atr_ref):
                         pos["partial_done"] = True
                         pos["stop"] = max(pos["stop"], pos["entry_price"] * 1.001)
@@ -2464,9 +2233,8 @@ def on_message(ws, message):
                         state[symbol] = pos
                         save_state(state)
                         exit_messages.append(
-                            f"💰 <b>ЧАСТИЧНЫЙ TP (50%)</b>\nПара: {tv_link(symbol)}\n"
-                            f"Зафиксировано: <b>{pnl:+.2f}%</b> на половину позиции\n"
-                            f"Стоп переведён в безубыток")
+                            "<b>ЧАСТИЧНЫЙ TP (50%%)</b>\nПара: %s\n"
+                            "Зафиксировано: <b>%+.2f%%</b>" % (tv_link(symbol), pnl))
             for msg in exit_messages:
                 send_telegram(msg)
 
@@ -2481,70 +2249,52 @@ def on_message(ws, message):
             if df is None:
                 continue
 
-            breakout_sig = try_ws_breakout(symbol, new_candle, df)
-            if breakout_sig:
-                extra = btc_extra_tag(None)
-                send_telegram(
-                    f"📦 <b>ПРОБОЙ БОКОВИКА (WS)</b>{extra}\n"
-                    f"Пара: {tv_link(symbol)}\n"
-                    f"Цена: {breakout_sig['entry']:.8f}\n"
-                    f"SL: {breakout_sig['stop']:.8f} · TP: {breakout_sig['target']:.8f}\n"
-                    f"Объём: {breakout_sig['vol_ratio']:.1f}×")
-                continue
-
             with breakout_cache_lock:
-                level = breakout_cache.get(symbol)
+                cache_entry = breakout_cache.get(symbol)
+            level = None
+            lower_level = None
+            if isinstance(cache_entry, dict):
+                level = cache_entry.get("upper")
+                lower_level = cache_entry.get("lower")
+            elif isinstance(cache_entry, (int, float)):
+                level = cache_entry
 
-            # Приоритеты: WT-dip → RSI-dip → SQZ-breakout → Retest → Confluence → Pullback
-            sig = evaluate_ws_wt_dip(df, symbol)
+            # v21.2.0: только dip + bounce
+            sig = evaluate_ws_range_bounce(df, symbol, lower_level, level)
+            if sig is None:
+                sig = evaluate_ws_wt_dip(df, symbol)
             if sig is None:
                 sig = evaluate_ws_dipbuy(df, symbol)
             if sig is None:
-                sig = evaluate_ws_sqz_breakout(df, symbol, level)
-            if sig is None:
-                sig = evaluate_ws_retest(df, symbol, level)
-            if sig is None:
-                sig = evaluate_ws_entry(df, symbol)
-            if sig is None:
-                sig = evaluate_ws_pullback(df, symbol)
+                sig = evaluate_ws_sqz_dip(df, symbol)
             if sig is None:
                 continue
 
-            cur_price_ws = float(new_candle["close"])
-            if sig.get("strategy") not in ("rsi_dipbuy", "wt_dip", "sqz_dip"):
-                peak_ok, peak_reason, _ = check_peak_guard(df, cur_price_ws)
-                if not peak_ok:
-                    funnel_inc("peak_block")
-                    logger.info("⛔ PEAK-GUARD отклонил %s: %s", symbol, peak_reason)
-                    continue
-                rsi_ok, rsi_reason = check_peak_guard_rsi(float(df["rsi"].iloc[-2]))
-                if not rsi_ok:
-                    funnel_inc("peak_block")
-                    logger.info("⛔ PEAK-GUARD (RSI) отклонил %s: %s", symbol, rsi_reason)
-                    continue
             with state_lock:
                 opened = open_position(symbol, sig, closed_start)
             if opened is None:
                 continue
 
-            score_txt = (f" · score {sig['score']}/10"
-                         if isinstance(sig["score"], int) else f" · {sig['score']}")
             extra = btc_extra_tag(sig)
             strat = sig.get("strategy", "")
-            if strat == "rsi_dipbuy":
-                icon, title = "💎", "RSI-DIPBUY"
+            if strat == "range_bounce":
+                title = "RANGE-BOUNCE"
+            elif strat == "rsi_dipbuy":
+                title = "RSI-DIPBUY"
             elif strat == "wt_dip":
-                icon, title = "🌊", "WT-DIP"
-            elif strat == "sqz_breakout":
-                icon, title = "💥", "SQZ-BREAKOUT"
+                title = "WT-DIP"
+            elif strat == "sqz_dip":
+                title = "SQZ-DIP"
             else:
-                icon, title = "🟢", f"ВХОД (WS{score_txt})"
+                title = "ВХОД (%s)" % strat
             send_telegram(
-                f"{icon} <b>{title}</b>{extra}\n"
-                f"Пара: {tv_link(symbol)} · {sig['strategy']}\n"
-                f"Цена: {sig['entry']:.8f}\n"
-                f"SL: {sig['stop']:.8f} · TP: {sig['target']:.8f}\n"
-                f"<i>{' · '.join(sig['parts'])}</i>")
+                "<b>%s</b>%s\n"
+                "Пара: %s\n"
+                "Цена: %.8f\n"
+                "SL: %.8f, TP: %.8f\n"
+                "<i>%s</i>" % (title, extra, tv_link(symbol),
+                                sig['entry'], sig['stop'], sig['target'],
+                                " / ".join(sig['parts'])))
     except Exception as e:
         logger.error("Ошибка WS kline: %s", e)
 
@@ -2568,30 +2318,27 @@ def run_websocket():
         time.sleep(5)
 
 def watchdog_loop():
-    """v21.0.3: следит ТОЛЬКО за kline. Тишина >90с → перезапуск."""
     global last_ws_msg_ts
     while True:
         time.sleep(30)
         silence = time.time() - last_ws_msg_ts
         if silence > WS_SILENCE_TIMEOUT and WS_APP is not None:
-            logger.warning("Watchdog kline: тишина %.0f c — перезапуск", silence)
+            logger.warning("Watchdog kline: тишина %.0f c - перезапуск", silence)
             try:
                 WS_APP.close()
             except Exception:
                 pass
-            # сбросим маркер, чтобы не дёргать повторно
             last_ws_msg_ts = time.time()
 
-# ==================== ⚡ WEBSOCKET TICKERS ====================
+# ==================== WEBSOCKET TICKERS ====================
 def on_tickers_open(ws):
-    logger.info("⚡ WS tickers подключен. Подписка на %d пар (по %d)...",
+    logger.info("WS tickers подключен. Подписка на %d пар (по %d)...",
                 len(WS_TICKER_PAIRS), WS_SUBSCRIBE_CHUNK)
     WS_TICKERS_CONNECTED.set()
     with WS_TICKER_PAIRS_LOCK:
         pairs = list(WS_TICKER_PAIRS)
     if pairs:
-        args = [f"tickers.{s}" for s in pairs]
-        # v21.0.3: чанки по 10
+        args = ["tickers.%s" % s for s in pairs]
         for i in range(0, len(args), WS_SUBSCRIBE_CHUNK):
             chunk = args[i:i + WS_SUBSCRIBE_CHUNK]
             try:
@@ -2685,7 +2432,7 @@ def tickers_refresh_loop():
             update_ticker_subscription()
         except Exception as e:
             logger.error("tickers_refresh_loop: %s", e)
-# ==================== ФОНОВОЕ СКАНИРОВАНИЕ ====================
+          # ==================== ФОНОВОЕ СКАНИРОВАНИЕ ====================
 TIMEFRAME_PARAMS = {
     "15m": {"bybit_interval": "15",  "min_bars": 80,  "ema_fast": 9,  "ema_slow": 21},
     "1h":  {"bybit_interval": "60",  "min_bars": 80,  "ema_fast": 9,  "ema_slow": 21},
@@ -2693,51 +2440,6 @@ TIMEFRAME_PARAMS = {
     "1d":  {"bybit_interval": "D",   "min_bars": 150, "ema_fast": 20, "ema_slow": 50},
     "1w":  {"bybit_interval": "W",   "min_bars": 50,  "ema_fast": 10, "ema_slow": 30},
 }
-
-def try_open_breakout(pair, df_daily, current_price, now_iso, r4h=None):
-    breakout = check_breakout(df_daily, current_price)
-    if not breakout:
-        return None
-    daily_closed_start = int(df_daily.iloc[-2]["start"])
-    stop_distance_pct = ((current_price - breakout["stop"]) / current_price * 100
-                         if current_price > 0 else 0)
-    if stop_distance_pct < MIN_STOP_DISTANCE_PCT:
-        return None
-    risk_pct = (current_price - breakout["stop"]) / current_price * 100
-    ti = get_trend(pair)
-    trend_score = ti["score"] if ti else 0
-    pseudo_sig = {"trend_score": trend_score, "score": 7}
-    btc_blocked = not market_allows_longs()
-    if btc_blocked and not is_strong_signal_for_blocked_market(pseudo_sig):
-        return None
-    with state_lock:
-        if not can_enter(pair, signal=pseudo_sig, signal_risk_pct=risk_pct):
-            return None
-        old_state = state.get(pair, {})
-        if old_state.get("last_signal_candle") == daily_closed_start:
-            return None
-        rr = (breakout["target"] - current_price) / (current_price - breakout["stop"])
-        atr_val = (current_price - breakout["stop"]) / ATR_MULT_SL
-        size = position_size_fraction(7, rr, atr_val / current_price * 100,
-                                      portfolio_risk_used(), risk_pct,
-                                      btc_blocked=btc_blocked)
-        new_state = old_state.copy()
-        new_state.update({
-            "position": "open", "entry_price": current_price,
-            "stop": breakout["stop"], "target": breakout["target"],
-            "atr_ref": atr_val,
-            "entry_time": now_iso, "last_entry_ts": time.time(),
-            "last_signal_candle": daily_closed_start,
-            "strategy": "breakout", "score": "BO",
-            "size_fraction": size,
-            "btc_blocked_entry": btc_blocked,
-            "daily_regime_at_entry": daily_regime_str(pair),
-        })
-        state[pair] = new_state
-        trade_times.append(time.time())
-        save_state(state)
-        funnel_inc("opened")
-    return breakout
 
 def background_scan_loop():
     global state, breakout_cache
@@ -2759,10 +2461,12 @@ def background_scan_loop():
             consolidation_list = []
             dipbuy_candidates = []
             wtdip_candidates = []
+            bounce_candidates = []
             consolidation_seen = set()
             now_iso = datetime.now(timezone.utc).isoformat()
             daily_cache = {}
 
+            # ========== ПЕРВЫЙ ПРОХОД: management_pairs ==========
             for pair in management_pairs:
                 if not isinstance(pair, str):
                     continue
@@ -2798,7 +2502,7 @@ def background_scan_loop():
                         "current_price": current_price,
                     })
 
-                    # --- dip-кандидаты (RSI 25–45) ---
+                    # --- dip-кандидаты ---
                     if DIPBUY_ENABLED:
                         buf = ohlc_buffers.get(pair)
                         if buf and len(buf) >= MIN_BARS + 1:
@@ -2842,25 +2546,43 @@ def background_scan_loop():
                                     except Exception:
                                         pass
 
+                    # --- боковик ---
                     cons = detect_consolidation(df_daily)
                     if cons and pair not in consolidation_seen:
                         consolidation_seen.add(pair)
                         consolidation_list.append({"pair": pair,
                                                     "current_price": current_price,
                                                     **cons})
-                    breakout = try_open_breakout(pair, df_daily, current_price,
-                                                  now_iso, r4h=r4h)
-                    if breakout:
-                        found_buy += 1
-                        extra = btc_extra_tag(None)
-                        send_telegram(
-                            f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>{extra}\n"
-                            f"Пара: {tv_link(pair)}\n"
-                            f"Цена: {current_price:.8f}\n"
-                            f"SL: {breakout['stop']:.8f} · TP: {breakout['target']:.8f}\n"
-                            f"Дней в боковике: {breakout['days']} · "
-                            f"объём ×1.8 · ADX {breakout['adx']:.0f}")
 
+                        # --- bounce кандидат (v21.2.0) ---
+                        if (RANGE_BOUNCE_ENABLED
+                                and cons["lower_level"] > 0
+                                and cons["upper_level"] > cons["lower_level"]):
+                            dist_to_bottom = (current_price - cons["lower_level"]) / cons["lower_level"] * 100
+                            if 0 <= dist_to_bottom <= RANGE_BOUNCE_HOT_ZONE_PCT:
+                                buf = ohlc_buffers.get(pair)
+                                rsi_now = 50
+                                if buf and len(buf) >= MIN_BARS + 1:
+                                    df15b = _build_df_with_indicators(buf)
+                                    if df15b is not None:
+                                        r15 = df15b.iloc[-2]
+                                        if not pd.isna(r15["rsi"]):
+                                            rsi_now = float(r15["rsi"])
+                                bounce_candidates.append({
+                                    "pair": pair,
+                                    "lower": cons["lower_level"],
+                                    "upper": cons["upper_level"],
+                                    "current_price": current_price,
+                                    "dist_to_bottom": dist_to_bottom,
+                                    "rsi_now": rsi_now,
+                                    "days": cons["days"],
+                                })
+
+                    # v21.2.0: try_open_breakout отключён
+                    # breakout = try_open_breakout(pair, df_daily, current_price, now_iso, r4h=r4h)
+                    breakout = None
+
+                    # --- управление позицией (time-stop / partial / exit) ---
                     messages = []
                     time_stopped = False
                     with state_lock:
@@ -2883,10 +2605,11 @@ def background_scan_loop():
                                                 "Time Stop", pos.get("strategy", "?"),
                                                 pos.get("entry_time"), size, frac, regime)
                                 messages.append(
-                                    f"⏰ <b>ВЫХОД ПО ВРЕМЕНИ</b>\n"
-                                    f"Пара: {tv_link(pair)}\n"
-                                    f"Цена: {r4h['close']:.8f}\n"
-                                    f"Результат: <b>{pnl:+.2f}%</b>")
+                                    "<b>ВЫХОД ПО ВРЕМЕНИ</b>\n"
+                                    "Пара: %s\n"
+                                    "Цена: %.8f\n"
+                                    "Результат: <b>%+.2f%%</b>" % (
+                                        tv_link(pair), r4h['close'], pnl))
                                 pos.update({"position": "closed",
                                             "last_exit_ts": time.time(),
                                             "last_exit_price": r4h["close"],
@@ -2905,22 +2628,26 @@ def background_scan_loop():
                                                     size * PARTIAL_TP_FRACTION,
                                                     PARTIAL_TP_FRACTION, regime)
                                     messages.append(
-                                        f"💰 <b>ЧАСТИЧНЫЙ TP (50%)</b>\n"
-                                        f"Пара: {tv_link(pair)}\n"
-                                        f"Зафиксировано: <b>{pnl:+.2f}%</b>\n"
-                                        f"Стоп в безубытке, цель прежняя")
+                                        "<b>ЧАСТИЧНЫЙ TP (50%%)</b>\n"
+                                        "Пара: %s\n"
+                                        "Зафиксировано: <b>%+.2f%%</b>" % (
+                                            tv_link(pair), pnl))
                                 if exit_now:
                                     frac = PARTIAL_TP_FRACTION if pos.get("partial_done") else 1.0
                                     pnl = log_trade(pair, pos["entry_price"], exit_price,
                                                     reason, pos.get("strategy", "?"),
                                                     pos.get("entry_time"), size, frac, regime)
-                                    icon = "🟢" if pnl > 0 else "🔴"
+                                    if pnl > 0:
+                                        icon = "WIN"
+                                    else:
+                                        icon = "LOSS"
                                     suffix = (" (оставшиеся 50%)" if frac != 1.0 else "")
                                     messages.append(
-                                        f"{icon} <b>{reason.upper()}</b>\n"
-                                        f"Пара: {tv_link(pair)}\n"
-                                        f"Цена: {exit_price:.8f}\n"
-                                        f"Результат: <b>{pnl:+.2f}%</b>{suffix}")
+                                        "<b>%s</b>\n"
+                                        "Пара: %s\n"
+                                        "Цена: %.8f\n"
+                                        "Результат: <b>%+.2f%%</b>%s" % (
+                                            icon, tv_link(pair), exit_price, pnl, suffix))
                                     pos.update({"position": "closed",
                                                 "last_exit_ts": time.time(),
                                                 "last_exit_price": exit_price,
@@ -2936,6 +2663,7 @@ def background_scan_loop():
                     logger.error("Ошибка в %s: %s", pair, e)
                     continue
 
+            # ========== ВТОРОЙ ПРОХОД: all_pairs ==========
             for pair in all_pairs:
                 if not isinstance(pair, str):
                     continue
@@ -2954,31 +2682,44 @@ def background_scan_loop():
                         consolidation_list.append({"pair": pair,
                                                     "current_price": current_price,
                                                     **cons})
-                    breakout = try_open_breakout(pair, df_daily, current_price, now_iso)
-                    if breakout:
-                        found_buy += 1
-                        extra = btc_extra_tag(None)
-                        send_telegram(
-                            f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>{extra}\n"
-                            f"Пара: {tv_link(pair)}\n"
-                            f"Цена: {current_price:.8f}\n"
-                            f"SL: {breakout['stop']:.8f} · TP: {breakout['target']:.8f}\n"
-                            f"Дней в боковике: {breakout['days']}")
+                        # bounce кандидат
+                        if (RANGE_BOUNCE_ENABLED
+                                and cons["lower_level"] > 0
+                                and cons["upper_level"] > cons["lower_level"]):
+                            dist_to_bottom = (current_price - cons["lower_level"]) / cons["lower_level"] * 100
+                            if 0 <= dist_to_bottom <= RANGE_BOUNCE_HOT_ZONE_PCT:
+                                bounce_candidates.append({
+                                    "pair": pair,
+                                    "lower": cons["lower_level"],
+                                    "upper": cons["upper_level"],
+                                    "current_price": current_price,
+                                    "dist_to_bottom": dist_to_bottom,
+                                    "rsi_now": 50,
+                                    "days": cons["days"],
+                                })
+                    # v21.2.0: try_open_breakout отключён
+                    # breakout = try_open_breakout(pair, df_daily, current_price, now_iso)
                 except Exception as e:
                     logger.error("Ошибка во втором проходе %s: %s", pair, e)
                     continue
 
+            # ========== Обновление breakout_cache (upper+lower) ==========
             with breakout_cache_lock:
                 consolidation_list.sort(key=lambda x: (-x["days"], x.get("vol_trend", 1.0)))
                 breakout_cache = {}
                 for item in consolidation_list[:BREAKOUT_CACHE_SIZE]:
-                    breakout_cache[item["pair"]] = item["upper_level"]
-            logger.info("Breakout-кэш обновлён: %d уровней", len(breakout_cache))
+                    breakout_cache[item["pair"]] = {
+                        "upper": item["upper_level"],
+                        "lower": item["lower_level"],
+                        "days": item["days"],
+                    }
+            logger.info("Breakout-кэш: %d уровней (upper+lower)", len(breakout_cache))
 
             with breakout_cache_lock:
                 extra = [p for p in breakout_cache.keys() if p not in PAIRS_WS]
             extend_ws_subscription(extra)
 
+            # ========== Чистка state ==========
             try:
                 with state_lock:
                     if len(state) > 500:
@@ -2994,7 +2735,7 @@ def background_scan_loop():
                 logger.error("Ошибка очистки state: %s", e)
 
             send_status(scan_summary, consolidation_list, dipbuy_candidates,
-                        wtdip_candidates, found_buy, found_sell)
+                        wtdip_candidates, bounce_candidates, found_buy, found_sell)
             try:
                 update_ticker_subscription()
             except Exception as e:
@@ -3003,41 +2744,34 @@ def background_scan_loop():
         except Exception as e:
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
-# ==================== 🔍 ВОРОНКА (строка для статуса) ====================
+          # ==================== ВОРОНКА ====================
 def _format_funnel(fs):
-    """Форматирует счётчики воронки в читаемую строку для Telegram."""
     lines = []
-    lines.append(f"🔍 <b>ВОРОНКА</b> (баров: {fs.get('bars_processed', 0)})")
+    lines.append("<b>ВОРОНКА</b> (баров: %d)" % fs.get("bars_processed", 0))
     lines.append(
-        f"🔵 Confluence: {fs['conf_total']}→RSI {fs['conf_rsi']}"
-        f"→ADX {fs['conf_adx']}→EMA {fs['conf_ema']}"
-        f"→trend {fs['conf_trend']}→MACD {fs['conf_macd']}"
-        f"→score {fs['conf_score']}→BOTTOM {fs['conf_bottom']}")
+        "BOUNCE: %d->зона %d->RSI %d->зел %d->объём %d->R:R %d" % (
+            fs["bounce_total"], fs["bounce_zone"], fs["bounce_rsi"],
+            fs["bounce_green"], fs["bounce_vol"], fs["bounce_rr"]))
     lines.append(
-        f"💎 RSI-dip: {fs['dip_total']}→bull {fs['dip_bull']}"
-        f"→зона {fs['dip_zone']}→растёт {fs['dip_rising']}"
-        f"→зел {fs['dip_green']}→BB {fs['dip_bb']}"
-        f"→объём {fs['dip_vol']}→EMA {fs['dip_ema']}")
+        "RSI-dip: %d->bull %d->зона %d->растёт %d->зел %d->BB %d->объём %d->EMA %d" % (
+            fs["dip_total"], fs["dip_bull"], fs["dip_zone"], fs["dip_rising"],
+            fs["dip_green"], fs["dip_bb"], fs["dip_vol"], fs["dip_ema"]))
     lines.append(
-        f"🌊 WT-dip: {fs['wt_total']}→bull {fs['wt_bull']}"
-        f"→RSI {fs['wt_rsi']}→кросс {fs['wt_cross']}"
-        f"→EMA {fs['wt_ema']}→зел {fs['wt_green']}"
-        f"→BOTTOM {fs['wt_bottom']}")
+        "WT-dip: %d->bull %d->RSI %d->кросс %d->EMA %d->зел %d->BOTTOM %d" % (
+            fs["wt_total"], fs["wt_bull"], fs["wt_rsi"], fs["wt_cross"],
+            fs["wt_ema"], fs["wt_green"], fs["wt_bottom"]))
     lines.append(
-        f"💥 SQZ: {fs['sqz_total']}→release {fs['sqz_release']}"
-        f"→пробой {fs['sqz_breakout']}")
+        "SQZ-dip: %d->bull %d->release %d->зел %d->BOTTOM %d" % (
+            fs["sqzdip_total"], fs["sqzdip_bull"], fs["sqzdip_release"],
+            fs["sqzdip_green"], fs["sqzdip_bottom"]))
     lines.append(
-        f"🎣 Pullback: {fs['pb_total']}→тренд {fs['pb_trend']}"
-        f"→касание {fs['pb_touch']}→объём {fs['pb_vol']}")
-    lines.append(
-        f"⛔ PEAK-GUARD: {fs['peak_block']} · "
-        f"🔧 BTC-блок: {fs['btc_block']} · "
-        f"✅ Открыто: {fs['opened']}")
+        "PEAK-GUARD: %d · BTC-блок: %d · Открыто: %d" % (
+            fs["peak_block"], fs["btc_block"], fs["opened"]))
     return "\n".join(lines)
 
-# ==================== СТАТУС (v21.0.3) ====================
+# ==================== СТАТУС v21.2.0 ====================
 def send_status(scan_summary, consolidation_list, dipbuy_candidates,
-                wtdip_candidates, found_buy, found_sell):
+                wtdip_candidates, bounce_candidates, found_buy, found_sell):
     with state_lock:
         open_snapshot = [(pair, dict(pos)) for pair, pos in state.items()
                          if pos.get("position") == "open"]
@@ -3053,64 +2787,109 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         tickers_count = len(WS_TICKER_PAIRS)
 
     funnel_snap = funnel_snapshot()
-
-    breakout_strategies = ("breakout", "breakout_ws", "breakout_retest",
-                           "breakout_realtime", "sqz_breakout")
     now_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M")
 
-    btc_state_str = "OK" if mok else f"БЛОК: {mreason}"
+    btc_state_str = "OK" if mok else "БЛОК: %s" % mreason
     if not mok and BTC_ALLOW_STRONG_WHEN_BLOCKED:
-        btc_state_str += " · dip/WT/BOTTOM обходят"
+        btc_state_str += " · dip/bounce обходят"
 
     header = [
-        f"📡 <b>СТАТУС v21.0.3 «WS-FIX + FUNNEL»</b> | <i>{now_str} UTC</i>",
-        "━━━━━━━━━━━━━━━━━━━━━",
-        f"🔹 Пар WS kline: <b>{len(PAIRS_WS)}</b> · Тренд 3/3: <b>{q3}</b>",
-        f"🔹 1D-bull (EMA50&gt;200): <b>{bull_1d}</b> пар",
-        f"🔹 ⚡ WS tickers: <b>{tickers_count}</b>/{WS_TICKERS_MAX_PAIRS}",
-        f"🔹 BTC: <b>{btc_state_str}</b>",
-        f"🔹 Боковиков: <b>{len(consolidation_list)}</b> · "
-        f"RSI-dip: <b>{len(dipbuy_candidates)}</b> · "
-        f"WT-dip: <b>{len(wtdip_candidates)}</b>",
-        f"🔹 Позиций: <b>{len(open_snapshot)}/{MAX_OPEN_POSITIONS}</b> · "
-        f"Входов: <b>{found_buy}</b> · Выходов: <b>{found_sell}</b> · 👥 {subs_count}",
-        "━━━━━━━━━━━━━━━━━━━━━",
+        "<b>СТАТУС v21.2.0 ALL-DIP</b> | <i>%s UTC</i>" % now_str,
+        "----------------------",
+        "WS kline: %d пар · Тренд 3/3: %d" % (len(PAIRS_WS), q3),
+        "1D-bull: %d пар" % bull_1d,
+        "WS tickers: %d/%d (cand %d · cons %d · dip %d · wt %d · bounce %d)" % (
+            tickers_count, WS_TICKERS_MAX_PAIRS,
+            WS_TICKERS_QUOTA_CAND, WS_TICKERS_QUOTA_CONS,
+            WS_TICKERS_QUOTA_DIP, WS_TICKERS_QUOTA_WT,
+            WS_TICKERS_QUOTA_BOUNCE),
+        "BTC: <b>%s</b>" % btc_state_str,
+        "Боковиков: %d · RSI-dip: %d · WT-dip: %d · Bounce: %d" % (
+            len(consolidation_list), len(dipbuy_candidates),
+            len(wtdip_candidates), len(bounce_candidates)),
+        "Позиций: %d/%d · Входов: %d · Выходов: %d · Подписчиков: %d" % (
+            len(open_snapshot), MAX_OPEN_POSITIONS, found_buy, found_sell, subs_count),
+        "----------------------",
     ]
-
-    # Воронка отдельным блоком
-    funnel_lines = _format_funnel(funnel_snap).split("\n")
-    header += funnel_lines
-    header.append("━━━━━━━━━━━━━━━━━━━━━")
+    header += _format_funnel(funnel_snap).split("\n")
+    header.append("----------------------")
 
     pos_lines = []
     if open_snapshot:
         for pair, pos in open_snapshot:
             et = str(pos.get("entry_time", "?")).replace("T", " ")[:16]
             strat = pos.get("strategy", "")
-            if strat == "rsi_dipbuy":
-                tag = "💎"
+            if strat == "range_bounce":
+                tag = "[BOUNCE]"
+            elif strat == "rsi_dipbuy":
+                tag = "[RSI]"
             elif strat == "wt_dip":
-                tag = "🌊"
-            elif strat == "sqz_breakout":
-                tag = "💥"
-            elif strat in breakout_strategies:
-                tag = "📦"
+                tag = "[WT]"
+            elif strat == "sqz_dip":
+                tag = "[SQZ]"
             else:
-                tag = "🟢"
-            line = (f"{tag} <b>{pair}</b> {pos.get('entry_price', 0):.8f} → "
-                    f"🛑{pos.get('stop', 0):.8f} 🎯{pos.get('target', 0):.8f} · {et}")
-            if pos.get("partial_done"):
-                line += " · 💰50%"
+                tag = "[WS]"
+            line = ("%s <b>%s</b> %.8f -> stop %.8f, tp %.8f · %s" % (
+                tag, pair, pos.get('entry_price', 0),
+                pos.get('stop', 0), pos.get('target', 0), et))
+            if pos.get("breakeven_moved"):
+                line += " · BE"
             if pos.get("btc_blocked_entry"):
-                line += " · ⚠️BTC×0.5"
+                line += " · BTC x0.5"
             regime = pos.get("daily_regime_at_entry", "")
             if regime == "bull":
-                line += " · 🐂"
+                line += " · bull"
             elif regime == "bear":
-                line += " · 🐻"
+                line += " · bear"
             pos_lines.append(line)
     else:
-        pos_lines.append("💰 Позиций нет")
+        pos_lines.append("Позиций нет")
+
+    # --- BOUNCE меню ---
+    bounce_candidates = sorted(bounce_candidates, key=lambda x: x.get("dist_to_bottom", 999))
+    display_bounce = bounce_candidates[:MAX_SHOW_BOUNCE]
+
+    def bounce_line(i, s, with_link):
+        name = tv_link(s["pair"]) if with_link else s["pair"]
+        cur = s.get("current_price", 0)
+        lower = s.get("lower", 0)
+        upper = s.get("upper", 0)
+        rsi_now = s.get("rsi_now", 0)
+        dist = s.get("dist_to_bottom", 0)
+        days = s.get("days", 0)
+        return ("%d. %s %dд lower=%.6g upper=%.6g cur=%.6g (+%.2f%%) RSI%.0f" % (
+            i, name, days, lower, upper, cur, dist, rsi_now))
+
+    def dip_line(i, s, with_link):
+        name = tv_link(s["pair"]) if with_link else s["pair"]
+        cur = s.get("current_price", 0)
+        rsi_now = s.get("rsi_now", 0)
+        return "%d. %s RSI%.0f cur=%.6g" % (i, name, rsi_now, cur)
+
+    def wtdip_line(i, s, with_link):
+        name = tv_link(s["pair"]) if with_link else s["pair"]
+        cur = s.get("current_price", 0)
+        wt_now = s.get("wt_now", 0)
+        rsi_now = s.get("rsi_now", 0)
+        return "%d. %s WT%.0f RSI%.0f cur=%.6g" % (i, name, wt_now, rsi_now, cur)
+
+    def cand_line(i, s, with_link):
+        name = tv_link(s["pair"]) if with_link else s["pair"]
+        cur = s.get("current_price") or s.get("close_price", 0)
+        return ("%d. %s T%d ADX%.0f RSI%.0f cur=%.6g" % (
+            i, name, s["trend_score"], s["adx_1d"], s["rsi_4h"], cur))
+
+    def cons_line(i, item, with_link):
+        name = tv_link(item["pair"]) if with_link else item["pair"]
+        cur = item.get("current_price", 0)
+        lvl = item.get("upper_level", 0)
+        if cur > 0 and lvl > 0:
+            dist_pct = (lvl - cur) / cur * 100
+        else:
+            dist_pct = 999
+        return ("%d. %s %dд %.0f%% ADX%.0f level=%.6g cur=%.6g (%.1f%%)" % (
+            i, name, item['days'], item['range_pct'], item['adx'],
+            lvl, cur, dist_pct))
 
     valid_calls = [
         s for s in scan_summary
@@ -3119,20 +2898,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         and STATUS_ADX_MIN <= s.get("adx_1d", 0) <= STATUS_ADX_MAX
         and s.get("close_price", 0) >= STATUS_MIN_PRICE
     ]
-    valid_calls.sort(key=lambda s: (-s["trend_score"],
-                                     s.get("macd_gap_pct", 999)))
-
-    def _hot_score(item):
-        cur = item.get("current_price", 0)
-        lvl = item.get("upper_level", 0)
-        if cur <= 0 or lvl <= 0:
-            return 999
-        dist_pct = (lvl - cur) / cur * 100
-        return max(dist_pct, 0)
-    consolidation_list = sorted(consolidation_list, key=_hot_score)
-    dipbuy_candidates = sorted(dipbuy_candidates, key=lambda x: x.get("rsi_now", 999))
-    wtdip_candidates = sorted(wtdip_candidates, key=lambda x: x.get("wt_now", 999))
-
+    valid_calls.sort(key=lambda s: (-s["trend_score"], s.get("macd_gap_pct", 999)))
     display_calls = valid_calls[:MAX_SHOW_CANDIDATES]
     display_cons = consolidation_list[:MAX_SHOW_CONSOLIDATIONS]
     display_dip = dipbuy_candidates[:MAX_SHOW_DIPBUY]
@@ -3151,150 +2917,86 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
             cons_pool.append(item)
     cand_pool.sort(key=_cand_hotness)
     cons_pool.sort(key=_cons_hotness)
-    dip_pool = sorted(dipbuy_candidates, key=_dip_hotness)
-    wtdip_pool = sorted(wtdip_candidates, key=_wtdip_hotness)
 
     with HOT_PAIRS_LOCK:
         HOT_PAIRS_CACHE["candidates"] = list(display_calls)
         HOT_PAIRS_CACHE["consolidations"] = list(display_cons)
         HOT_PAIRS_CACHE["dipbuy"] = list(display_dip)
         HOT_PAIRS_CACHE["wtdip"] = list(display_wtdip)
+        HOT_PAIRS_CACHE["bounce"] = list(display_bounce)
         HOT_PAIRS_CACHE["candidates_pool"] = list(cand_pool)
         HOT_PAIRS_CACHE["consolidations_pool"] = list(cons_pool)
-        HOT_PAIRS_CACHE["dipbuy_pool"] = list(dip_pool)
-        HOT_PAIRS_CACHE["wtdip_pool"] = list(wtdip_pool)
+        # bounce_pool обновляется в _rebuild_hot_pools_from_buffers — не перетираем
         HOT_PAIRS_CACHE["ts"] = time.time()
 
-    def cand_line(i, s, with_link):
-        gap = s.get("macd_gap_pct", 0)
-        if gap < 0:
-            prox, hl = "⏳", gap > -0.25
-        elif gap < 0.5:
-            prox, hl = "🟡", True
-        else:
-            prox, hl = "⚠️", False
-        name = tv_link(s["pair"]) if with_link else s["pair"]
-        cur = s.get("current_price") or s.get("close_price", 0)
-        entry = s.get("close_price", 0)
-        buf = ohlc_buffers.get(s["pair"])
-        peak_ok, peak_reason, _ = (True, "", {})
-        if buf and len(buf) >= PEAK_LOOKBACK_CANDLES:
-            df_pk = pd.DataFrame(list(buf))
-            peak_ok, peak_reason, _ = check_peak_guard(df_pk, cur)
-        drift_pct = abs(cur - entry) / entry * 100 if entry > 0 else 0
-        drift_ok = drift_pct <= PEAK_MAX_DRIFT_PCT
-        is_ready = (s["trend_score"] == 3 and gap < 0.5
-                    and peak_ok and drift_ok)
-        if is_ready:
-            mark = "🟢"
-        elif not peak_ok:
-            mark = "⛔"
-        elif not drift_ok:
-            mark = "⚠️"
-        elif hl:
-            mark = "🟡"
-        else:
-            mark = ""
-        vol = s.get("vol_ratio", 0.0)
-        vol_txt = f" V{vol:.1f}x" if vol >= MIN_VOL_MULT else ""
-        up = "↑" if s.get("adx_slope_up") else ""
-        ready_tag = "✨" if is_ready else ""
-        drift_txt = f" ⚠️+{drift_pct:.1f}%" if not drift_ok else ""
-        return (f"{mark}{i}.{name}{ready_tag} T{s['trend_score']} "
-                f"ADX{s['adx_1d']:.0f}{up} RSI{s['rsi_4h']:.0f}{vol_txt} "
-                f"💰{cur:.6g} 🎯~{entry:.6g}{drift_txt} {prox}")
-
-    def cons_line(i, item, with_link):
-        dry = "🥀" if item.get("vol_trend", 1.0) <= 0.9 else ""
-        name = tv_link(item["pair"]) if with_link else item["pair"]
-        cur = item.get("current_price", 0)
-        lvl = item.get("upper_level", 0)
-        if cur > 0 and lvl > 0:
-            dist_pct = (lvl - cur) / cur * 100
-        else:
-            dist_pct = 999
-        if dist_pct <= HOT_DIST_PCT_1:
-            mark = "🔥"
-        elif dist_pct <= HOT_DIST_PCT_2:
-            mark = "⚡"
-        elif dist_pct <= HOT_DIST_PCT_3:
-            mark = "🟢"
-        else:
-            mark = ""
-        dist_txt = f"({dist_pct:.1f}%)" if dist_pct < 999 else ""
-        return (f"{mark}{i}.{name} {item['days']}д {item['range_pct']:.0f}% "
-                f"ADX{item['adx']:.0f}{dry} 🚀{lvl:.6g} 💰{cur:.6g}{dist_txt}")
-
-    def dip_line(i, s, with_link):
-        name = tv_link(s["pair"]) if with_link else s["pair"]
-        cur = s.get("current_price", 0)
-        rsi_now = s.get("rsi_now", 0)
-        return f"💎{i}.{name} RSI{rsi_now:.0f} 💰{cur:.6g} (ждём отскок)"
-
-    def wtdip_line(i, s, with_link):
-        name = tv_link(s["pair"]) if with_link else s["pair"]
-        cur = s.get("current_price", 0)
-        wt_now = s.get("wt_now", 0)
-        rsi_now = s.get("rsi_now", 0)
-        return f"🌊{i}.{name} WT{wt_now:.0f} RSI{rsi_now:.0f} 💰{cur:.6g}"
-
-    # ⚠️ Отступ ровно 4 пробела перед footer = [
     footer = [
-        "━━━━━━━━━━━━━━━━━━━━━",
-        f"🔄 Следующий статус через 2 ч · лимиты {MAX_OPEN_POSITIONS} поз / {MAX_TRADES_PER_HOUR} в час",
-        f"⚡ WS-tickers: {WS_TICKERS_QUOTA_CAND}c + {WS_TICKERS_QUOTA_CONS}cons + {WS_TICKERS_QUOTA_DIP}dip + WT",
-        f"🎯 Пороги: MACD≤{WS_HOT_NEAR_CROSS_PCT}% · пробой≤{WS_HOT_NEAR_BREAKOUT_PCT}%",
-        "🐂1D-bull · 💎RSI-dip · 🌊WT-dip · 💥SQZ · 🎯BOTTOM · 🛡PEAK · 🔧BTC-обход",
-        "🔥≤1% ⚡≤3% 🟢≤5% до пробоя · ⛔ пик · ⚠️ дрейф · 🥀 объём↓ · /funnel — счётчики",
+        "----------------------",
+        "Следующий статус через 2 ч · лимиты %d поз / %d в час" % (
+            MAX_OPEN_POSITIONS, MAX_TRADES_PER_HOUR),
+        "HOLD-TO-REVERSAL: BE +%.1fxATR, без partial TP, без fixed TP" % BREAKEVEN_TRIGGER_ATR_FAST,
+        "Выход: EMA-кросс 4h / трейлинг / SL / time-stop 7д",
+        "Все стратегии ищут ДНО. Никаких пробоев и momentum.",
+        "/funnel - счётчики воронки",
     ]
 
-    def build(with_links, max_cand, max_cons, max_dip, max_wtdip):
+    def build(with_links, max_cand, max_cons, max_dip, max_wtdip, max_bounce):
         lines = list(header)
         lines += pos_lines
         lines.append("")
-        lines.append("🔵🔵🔵 <b>ТОП КАНДИДАТОВ (CONFLUENCE)</b> 🔵🔵🔵")
+        lines.append("=== BOUNCE ОТ ДНА БОКОВИКА ===")
         lines.append("<blockquote expandable>")
-        if display_calls:
-            for i, s in enumerate(display_calls[:max_cand], 1):
-                lines.append(cand_line(i, s, with_links))
+        if display_bounce:
+            for i, s in enumerate(display_bounce[:max_bounce], 1):
+                lines.append(bounce_line(i, s, with_links))
         else:
-            lines.append("😴 готовых кандидатов нет")
+            lines.append("bounce-кандидатов нет")
         lines.append("</blockquote>")
-        lines.append("💎💎💎 <b>RSI-DIPBUY (ОТСКОК ОТ ДНА)</b> 💎💎💎")
+        lines.append("=== RSI-DIPBUY ===")
         lines.append("<blockquote expandable>")
         if display_dip:
             for i, s in enumerate(display_dip[:max_dip], 1):
                 lines.append(dip_line(i, s, with_links))
         else:
-            lines.append("— RSI dip-кандидатов нет")
+            lines.append("RSI dip-кандидатов нет")
         lines.append("</blockquote>")
-        lines.append("🌊🌊🌊 <b>WT-DIP (WAVETREND ВНИЗУ)</b> 🌊🌊🌊")
+        lines.append("=== WT-DIP ===")
         lines.append("<blockquote expandable>")
         if display_wtdip:
             for i, s in enumerate(display_wtdip[:max_wtdip], 1):
                 lines.append(wtdip_line(i, s, with_links))
         else:
-            lines.append("— WT dip-кандидатов нет")
+            lines.append("WT dip-кандидатов нет")
         lines.append("</blockquote>")
-        lines.append("🟡🟡🟡 <b>МОНЕТЫ В БОКОВИКЕ (30–60 ДНЕЙ)</b> 🟡🟡🟡")
+        lines.append("=== БОКОВИКИ (30-60 ДНЕЙ) ===")
         lines.append("<blockquote expandable>")
         if display_cons:
             for i, item in enumerate(display_cons[:max_cons], 1):
                 lines.append(cons_line(i, item, with_links))
         else:
-            lines.append("📦 боковиков нет")
+            lines.append("боковиков нет")
+        lines.append("</blockquote>")
+        lines.append("=== ТОП-КАНДИДАТЫ (info) ===")
+        lines.append("<blockquote expandable>")
+        if display_calls:
+            for i, s in enumerate(display_calls[:max_cand], 1):
+                lines.append(cand_line(i, s, with_links))
+        else:
+            lines.append("кандидатов нет")
         lines.append("</blockquote>")
         lines += footer
         return "\n".join(lines)
 
     text = build(True, len(display_calls), len(display_cons),
-                 len(display_dip), len(display_wtdip))
+                 len(display_dip), len(display_wtdip), len(display_bounce))
     if len(text) > TG_SAFE_LIMIT:
-        for max_cand in range(len(display_calls), 2, -1):
-            for max_cons in range(len(display_cons), 2, -1):
-                for max_dip in range(len(display_dip), 0, -1):
-                    for max_wtdip in range(len(display_wtdip), 0, -1):
-                        text = build(True, max_cand, max_cons, max_dip, max_wtdip)
+        for mc in range(len(display_calls), 2, -1):
+            for mcons in range(len(display_cons), 2, -1):
+                for md in range(len(display_dip), 0, -1):
+                    for mw in range(len(display_wtdip), 0, -1):
+                        for mb in range(len(display_bounce), 0, -1):
+                            text = build(True, mc, mcons, md, mw, mb)
+                            if len(text) <= TG_SAFE_LIMIT:
+                                break
                         if len(text) <= TG_SAFE_LIMIT:
                             break
                     if len(text) <= TG_SAFE_LIMIT:
@@ -3304,25 +3006,23 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
             if len(text) <= TG_SAFE_LIMIT:
                 break
     if len(text) > TG_SAFE_LIMIT:
-        text = build(True, 5, 5, 3, 3)
+        text = build(True, 5, 5, 3, 3, 3)
 
     _send_to_all_one(text)
-    logger.info("Статус v21.0.3: %d симв · cand=%d dip=%d wtdip=%d cons=%d · tickers=%d",
-                len(text), len(cand_pool), len(dip_pool), len(wtdip_pool),
-                len(cons_pool), tickers_count)
-
-    # Сброс счётчиков после отправки
+    logger.info("Статус v21.2.0: %d симв · bounce=%d dip=%d wt=%d cons=%d · tickers=%d",
+                len(text), len(bounce_candidates), len(dipbuy_candidates),
+                len(wtdip_candidates), len(consolidation_list), tickers_count)
     funnel_reset()
 
 # ==================== MAIN ====================
 def handle_stop(signum, _frame):
-    logger.info("Получен сигнал %s — сохраняю state и завершаюсь", signum)
+    logger.info("Получен сигнал %s - сохраняю state", signum)
     with state_lock:
         save_state(state)
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v21.0.3 «WS-FIX + FUNNEL» (Bybit) ...")
+    logger.info("Запуск бота v21.2.0 ALL-DIP (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
@@ -3344,6 +3044,7 @@ if __name__ == "__main__":
             pos.setdefault("size_fraction", 1.0)
             pos.setdefault("btc_blocked_entry", False)
             pos.setdefault("daily_regime_at_entry", "unknown")
+            pos.setdefault("hold_mode", True)
     save_state(state)
 
     refresh_market_context()
@@ -3352,14 +3053,14 @@ if __name__ == "__main__":
     while not PAIRS_WS and retry_count < 3:
         PAIRS_WS = get_filtered_pairs(TOP_N)
         if not PAIRS_WS:
-            logger.warning("Попытка %d: нет волатильных пар, повтор...", retry_count + 1)
+            logger.warning("Попытка %d: нет пар, повтор...", retry_count + 1)
             time.sleep(10)
         retry_count += 1
     if not PAIRS_WS:
-        logger.warning("Fallback: использую все доступные пары")
+        logger.warning("Fallback: все доступные пары")
         PAIRS_WS = get_all_available_pairs(TOP_N)
     if not PAIRS_WS:
-        logger.critical("Не удалось получить пары для WebSocket!")
+        logger.critical("Не удалось получить пары!")
         raise SystemExit(1)
     logger.info("Загружено %d пар для WebSocket", len(PAIRS_WS))
 
@@ -3396,14 +3097,23 @@ if __name__ == "__main__":
     threading.Thread(target=tickers_refresh_loop, daemon=True).start()
 
     _send_to_all_one(
-        f"🟢 <b>СКАНЕР v21.0.3 «WS-FIX + FUNNEL» ЗАПУЩЕН</b>\n"
-        f"WS kline: {len(PAIRS_WS)} пар (подписка чанками по {WS_SUBSCRIBE_CHUNK})\n"
-        f"⚡ WS tickers: {WS_TICKERS_QUOTA_CAND} cand + {WS_TICKERS_QUOTA_CONS} cons + "
-        f"{WS_TICKERS_QUOTA_DIP} dip + WT-dip\n"
-        f"🔍 DEBUG-FUNNEL: счётчики фильтров в каждом статусе + /funnel\n"
-        f"🎯 DIP-FIRST: Confluence/Pullback в нижних {int(BOTTOM_FILTER_PCT*100)}%\n"
-        f"🔧 BTC-фильтр: -{abs(BTC_DROP_6H_PCT):.0f}%/6ч или ADX&gt;{BTC_ADX_BLOCK_THRESHOLD:.0f}\n"
-        f"Тренд 3/3: {q3} · 1D-bull: {bull_1d} · "
-        f"BTC: {'OK' if market_allows_longs() else 'БЛОК'}\n"
-        f"👥 Подписчиков: {len(SUBSCRIBERS)} · /start · /stop · /help · /funnel")
+        "<b>СКАНЕР v21.2.0 ALL-DIP ЗАПУЩЕН</b>\n"
+        "WS kline: %d пар\n"
+        "WS tickers: %d пар (cand %d · cons %d · dip %d · wt %d · bounce %d)\n"
+        "Все стратегии ищут ДНО.\n"
+        "BOUNCE: вход у дна боковика.\n"
+        "HOLD-TO-REVERSAL: BE +%.1fxATR, без partial TP, без fixed TP.\n"
+        "Отключены: breakout, retest, confluence, pullback.\n"
+        "BTC-фильтр: -%.0f%%/6ч или ADX>%d. dip/bounce обходят.\n"
+        "Тренд 3/3: %d · 1D-bull: %d · BTC: %s\n"
+        "Подписчиков: %d · /start · /stop · /help · /funnel" % (
+            len(PAIRS_WS), WS_TICKERS_MAX_PAIRS,
+            WS_TICKERS_QUOTA_CAND, WS_TICKERS_QUOTA_CONS,
+            WS_TICKERS_QUOTA_DIP, WS_TICKERS_QUOTA_WT,
+            WS_TICKERS_QUOTA_BOUNCE,
+            BREAKEVEN_TRIGGER_ATR_FAST,
+            abs(BTC_DROP_6H_PCT), BTC_ADX_BLOCK_THRESHOLD,
+            q3, bull_1d, "OK" if market_allows_longs() else "БЛОК",
+            len(SUBSCRIBERS)))
     background_scan_loop()
+          
