@@ -2,15 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v21.3.0 «EMOJI + BOUNCE-FIX» — ЕДИНЫЙ ФАЙЛ VPS
+BYBIT SCANNER v21.4.0 «BOUNCE-WIDE + RSI-PURE» — ЕДИНЫЙ ФАЙЛ VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
-НОВОЕ В v21.3.0 (относительно v21.2.0):
-• Эмодзи возвращены во все статусы, алерты, менюшки.
-• BOUNCE: ZONE 0.5→2.0%, HOT 1.0→5.0%, VOL 1.2→1.1, RSI_MAX 50→55.
-• RSI-dip / WT-dip: EMA-фильтр мягче (×0.998).
-• SQZ-dip: жёстче — RSI растёт + close>EMA9 + объём ≥1.2×.
+НОВОЕ В v21.4.0 (относительно v21.3.0):
+• 🎯 BOUNCE-зона расширена: ZONE 2.0→4.0%, HOT 5.0→7.0%.
+  Теперь пары у дна (как XAUT в +3%) попадают в мониторинг.
+• 💎 RSI-dip: BB-требование ОТКЛЮЧЕНО (DIPBUY_REQUIRE_BB=False).
+  BB-касание убивало 7 из 9 сигналов.
+• 🌊 WT-dip: EMA-требование ОТКЛЮЧЕНО (WT_DIP_REQUIRE_EMA_UP=False).
+  EMA убивала все WT-кроссы.
+• 💥 SQZ-dip ОТКЛЮЧЁН (5 сделок = 5 убытков). Код сохранён.
+• Остаются 3 активные стратегии — все ищут дно.
 ==============================================================================
 """
 import json
@@ -152,7 +156,7 @@ DIPBUY_TP_ATR = 5.0
 DIPBUY_REQUIRE_DAILY_BULL = True
 DIPBUY_REQUIRE_EMA_UP = True
 DIPBUY_EMA_SLACK = 0.998
-DIPBUY_REQUIRE_BB = True
+DIPBUY_REQUIRE_BB = False     # v21.4.0: BB-касание отключено
 DIPBUY_BB_PERIOD = 20
 DIPBUY_BB_STD = 2.0
 DIPBUY_LOG_REJECTS = True
@@ -172,6 +176,7 @@ WT_OS2 = -53
 WT_OB1 = 60
 WT_OB2 = 53
 WT_DIP_STRATEGY_ENABLED = True
+WT_DIP_REQUIRE_EMA_UP = False   # v21.4.0: EMA-фильтр отключён
 WT_CONFIRM_BYPASS_BTC = True
 WT_DIP_SL_ATR = 2.5
 WT_DIP_TP_ATR = 5.0
@@ -187,7 +192,7 @@ SQZ_KC_MULT = 1.5
 SQZ_BREAKOUT_VOL_MULT = 1.4
 SQZ_RELEASE_MAX_BARS = 3
 SQZ_BREAKOUT_STRATEGY_ENABLED = False
-SQZ_DIP_STRATEGY_ENABLED = True
+SQZ_DIP_STRATEGY_ENABLED = False   # v21.4.0: SQZ-dip отключён (убытки)
 SQZ_DIP_SL_ATR = 2.5
 SQZ_DIP_TP_ATR = 5.0
 SQZ_DIP_VOL_MIN = 1.2
@@ -196,12 +201,12 @@ SQZ_DIP_CLOSE_ABOVE_EMA9 = True
 
 # --- 🎯 RANGE-BOUNCE ---
 RANGE_BOUNCE_ENABLED = True
-RANGE_BOUNCE_ZONE_PCT = 2.0
+RANGE_BOUNCE_ZONE_PCT = 4.0         # v21.4.0: было 2.0
 RANGE_BOUNCE_VOL_MULT = 1.1
 RANGE_BOUNCE_RSI_MAX = 55
 RANGE_BOUNCE_SL_PCT = 0.5
 RANGE_BOUNCE_MIN_RR = 1.5
-RANGE_BOUNCE_HOT_ZONE_PCT = 5.0
+RANGE_BOUNCE_HOT_ZONE_PCT = 7.0     # v21.4.0: было 5.0
 
 # --- 🔒 HOLD-TO-REVERSAL ---
 HOLD_MODE_ENABLED = True
@@ -268,7 +273,7 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("bybit-scanner")
-# ==================== 🔍 DEBUG-FUNNEL (v21.3.0) ====================
+# ==================== 🔍 DEBUG-FUNNEL (v21.4.0) ====================
 FUNNEL = {
     # 🎯 Range-Bounce
     "bounce_total": 0, "bounce_zone": 0, "bounce_rsi": 0,
@@ -279,7 +284,7 @@ FUNNEL = {
     # 🌊 WT-dip
     "wt_total": 0, "wt_bull": 0, "wt_rsi": 0, "wt_cross": 0,
     "wt_bottom": 0, "wt_ema": 0, "wt_green": 0,
-    # 💥 SQZ-dip
+    # 💥 SQZ-dip (отключен, но счётчики на месте)
     "sqzdip_total": 0, "sqzdip_bull": 0, "sqzdip_release": 0,
     "sqzdip_rsi": 0, "sqzdip_green": 0, "sqzdip_vol": 0, "sqzdip_bottom": 0,
     # Общие
@@ -572,7 +577,7 @@ def portfolio_risk_used():
             dist = (v["entry_price"] - v.get("stop", 0)) / v["entry_price"] * 100
             total += dist * v.get("size_fraction", 1.0)
     return total
-  # ==================== TELEGRAM: ПОДПИСЧИКИ ====================
+    # ==================== TELEGRAM: ПОДПИСЧИКИ ====================
 def _load_subscribers():
     global SUBSCRIBERS, MAIN_CHAT_ID
     ids = set()
@@ -684,15 +689,15 @@ def tv_link(symbol: str) -> str:
     return f'<a href="{url}">📈 {symbol}</a>'
 
 HELP_TEXT = (
-    "📡 <b>Bybit Scanner v21.3.0 «EMOJI + BOUNCE-FIX» — справка</b>\n"
+    "📡 <b>Bybit Scanner v21.4.0 «BOUNCE-WIDE + RSI-PURE» — справка</b>\n"
     "Все стратегии ищут дно.\n"
-    "🎯 RANGE-BOUNCE: отскок от дна боковика (≤2%).\n"
-    "💎 RSI-DIPBUY: RSI≤35 × 3св → отскок + BB + объём + 1D bull.\n"
-    "🌊 WT-DIP: WaveTrend кросс внизу.\n"
-    "💥 SQZ-DIP: Squeeze release внизу + RSI растёт + close>EMA9.\n"
+    "🎯 RANGE-BOUNCE: отскок от дна боковика (≤4%).\n"
+    "💎 RSI-DIPBUY: RSI≤35 × 3св → отскок + объём + 1D bull (без BB).\n"
+    "🌊 WT-DIP: WaveTrend кросс внизу (без EMA-фильтра).\n"
     "🔒 HOLD-TO-REVERSAL: BE +0.5×ATR, без partial TP, без fixed TP.\n"
     "Выход: EMA-кросс 4h / трейлинг / SL / time-stop 7д.\n"
     "🔧 BTC-фильтр: -10%/6ч или ADX>55. dip/bounce обходят.\n"
+    "💥 SQZ-dip отключён (убытки).\n"
     "Команды: /stop, /help, /funnel."
 )
 
@@ -805,7 +810,7 @@ def log_trade(symbol, entry, exit_price, reason, strategy,
         if traded_fraction >= 1.0:
             cb_register(net_pnl)
         return round(net_pnl, 2)
-      # ==================== ИНДИКАТОРЫ ====================
+        # ==================== ИНДИКАТОРЫ ====================
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
@@ -1033,7 +1038,7 @@ def detect_consolidation(df_daily):
             "upper_level": float(window["high"].max()),
             "lower_level": float(window["low"].min()),
             "vol_trend": round(vol_trend, 2)}
-  # ==================== ВЫХОДЫ (HOLD-TO-REVERSAL) ====================
+    # ==================== ВЫХОДЫ (HOLD-TO-REVERSAL) ====================
 def check_exit(results, pos):
     if not results.get(TRIGGER_TF) or not results.get("1d"):
         return False, "", 0.0
@@ -1340,7 +1345,7 @@ def fetch_current_prices(pairs):
         if sym in want:
             prices[sym] = t["last"]
     return prices
-  # ==================== СКОРИНГ ВХОДА ====================
+    # ==================== СКОРИНГ ВХОДА ====================
 def find_fresh_cross(df, window=FRESH_CROSS_WINDOW):
     ml, ms = df["macd_line"], df["macd_signal"]
     for ago in range(0, window):
@@ -1357,9 +1362,10 @@ def _rr_ok(entry, stop, target, min_rr=1.5):
         return False
     return (target - entry) / risk >= min_rr
 
-# ==================== 🎯 RANGE-BOUNCE (v21.3.0) ====================
+# ==================== 🎯 RANGE-BOUNCE (v21.4.0) ====================
 def evaluate_ws_range_bounce(df, symbol, lower_level, upper_level):
-    """Отскок от дна боковика. Вход у lower_level, SL под ним."""
+    """Отскок от дна боковика. Вход у lower_level, SL под ним.
+    v21.4.0: ZONE 4.0%, HOT 7.0%."""
     funnel_inc("bounce_total")
     if not RANGE_BOUNCE_ENABLED:
         return None
@@ -1428,10 +1434,10 @@ def evaluate_ws_range_bounce(df, symbol, lower_level, upper_level):
         "hold_mode": True,
     }
 
-# ==================== 💎 RSI DIP-BUY (v21.3.0) ====================
+# ==================== 💎 RSI DIP-BUY (v21.4.0) ====================
 def evaluate_ws_dipbuy(df, symbol):
-    """RSI зона + отскок + BB + объём + 1D bull.
-    v21.3.0: EMA мягче (×DIPBUY_EMA_SLACK)."""
+    """RSI зона + отскок + объём + 1D bull.
+    v21.4.0: BB-касание ОТКЛЮЧЕНО, EMA мягче."""
     funnel_inc("dip_total")
     if not DIPBUY_ENABLED or len(df) < MIN_BARS + 1:
         return None
@@ -1475,7 +1481,7 @@ def evaluate_ws_dipbuy(df, symbol):
         return None
     funnel_inc("dip_green")
 
-    # 4) Касание нижней BB (опционально)
+    # 4) Касание нижней BB (ОТКЛЮЧЕНО в v21.4.0)
     if DIPBUY_REQUIRE_BB:
         bb_ma = df["close"].rolling(DIPBUY_BB_PERIOD).mean().iloc[-2]
         bb_sd = df["close"].rolling(DIPBUY_BB_PERIOD).std().iloc[-2]
@@ -1522,7 +1528,7 @@ def evaluate_ws_dipbuy(df, symbol):
     score = 6
     parts = [
         f"💎 RSI зона≤{DIPBUY_RSI_ZONE} ×{DIPBUY_RSI_MIN_BARS}св → отскок {rsi_prev:.0f}→{rsi_now:.0f}",
-        f"Нижняя BB · объём {vol_ratio:.1f}×",
+        f"Объём {vol_ratio:.1f}× (без BB)",
         "1D аптренд ✓",
     ]
     if wt_confirm:
@@ -1542,9 +1548,10 @@ def evaluate_ws_dipbuy(df, symbol):
         "hold_mode": True,
     }
 
-# ==================== 🌊 WT-DIP (v21.3.0) ====================
+# ==================== 🌊 WT-DIP (v21.4.0) ====================
 def evaluate_ws_wt_dip(df, symbol):
-    """WaveTrend кросс внизу + BOTTOM + 1D bull + EMA9>21 (мягче)."""
+    """WaveTrend кросс внизу + BOTTOM + 1D bull.
+    v21.4.0: EMA-фильтр ОТКЛЮЧЕН (WT_DIP_REQUIRE_EMA_UP=False)."""
     funnel_inc("wt_total")
     if not WT_ENABLED or not WT_DIP_STRATEGY_ENABLED:
         return None
@@ -1565,8 +1572,8 @@ def evaluate_ws_wt_dip(df, symbol):
     funnel_inc("wt_cross")
     if pd.isna(sig["atr"]) or sig["atr"] <= 0:
         return None
-    # v21.3.0: EMA мягче
-    if DIPBUY_REQUIRE_EMA_UP and not (sig["ema_fast"] > sig["ema_slow"] * DIPBUY_EMA_SLACK):
+    # v21.4.0: EMA-фильтр отключён
+    if WT_DIP_REQUIRE_EMA_UP and not (sig["ema_fast"] > sig["ema_slow"] * DIPBUY_EMA_SLACK):
         return None
     funnel_inc("wt_ema")
     if not (sig["close"] > sig["open"]):
@@ -1592,16 +1599,19 @@ def evaluate_ws_wt_dip(df, symbol):
     return {
         "entry": entry, "stop": stop, "target": target, "atr": atr_value,
         "score": 7, "trend_score": trend_score,
-        "parts": [f"🌊 WT-кросс внизу (wt1={wt_now:.0f})", "🎯 BOTTOM ✓", "1D аптренд ✓"],
+        "parts": [f"🌊 WT-кросс внизу (wt1={wt_now:.0f})",
+                  "🎯 BOTTOM ✓",
+                  "1D аптренд ✓ (без EMA)"],
         "strategy": "wt_dip",
         "wt_confirm": True,
         "bottom_ok": True,
         "hold_mode": True,
     }
 
-# ==================== 💥 SQZ-DIP (v21.3.0) ====================
+# ==================== 💥 SQZ-DIP (v21.4.0: ОТКЛЮЧЁН) ====================
 def evaluate_ws_sqz_dip(df, symbol):
-    """SQZ release внизу + 1D bull + RSI растёт + close>EMA9 + объём."""
+    """v21.4.0: стратегия отключена (5 сделок = 5 убытков).
+    Код сохранён для отката — установи SQZ_DIP_STRATEGY_ENABLED=True."""
     funnel_inc("sqzdip_total")
     if not SQZ_ENABLED or not SQZ_DIP_STRATEGY_ENABLED:
         return None
@@ -1619,30 +1629,21 @@ def evaluate_ws_sqz_dip(df, symbol):
         return None
     if pd.isna(sig["rsi"]):
         return None
-
-    # v21.3.0: RSI растёт
     if SQZ_DIP_RSI_RISING:
         rsi_now = float(df["rsi"].iloc[-2])
         rsi_prev = float(df["rsi"].iloc[-3])
         if rsi_now <= rsi_prev:
             return None
     funnel_inc("sqzdip_rsi")
-
-    # v21.3.0: зелёная свеча
     if not (sig["close"] > sig["open"]):
         return None
     funnel_inc("sqzdip_green")
-
-    # v21.3.0: close > EMA9
     if SQZ_DIP_CLOSE_ABOVE_EMA9 and not (sig["close"] > sig["ema_fast"]):
         return None
-
-    # v21.3.0: объём
     vol_ratio = float(sig["vol_ratio"]) if not pd.isna(sig["vol_ratio"]) else 0.0
     if vol_ratio < SQZ_DIP_VOL_MIN:
         return None
     funnel_inc("sqzdip_vol")
-
     entry = float(df.iloc[-1]["close"])
     if not _bottom_filter_ok(symbol, entry):
         return None
@@ -1717,7 +1718,7 @@ def open_position(symbol, sig, closed_start):
     save_state(state)
     funnel_inc("opened")
     return new_state
-  # ==================== HOT-POOLS + WS-REALTIME ====================
+    # ==================== HOT-POOLS + WS-REALTIME ====================
 def _cand_hotness(s):
     return abs(s.get("macd_gap_pct", 999))
 
@@ -1801,7 +1802,7 @@ def _rebuild_hot_pools_from_buffers():
                         "source": "buffers",
                     })
 
-            # --- bounce pool ---
+            # --- bounce pool (v21.4.0: 7%) ---
             if (RANGE_BOUNCE_ENABLED and lower_lvl and upper_lvl
                     and lower_lvl > 0 and upper_lvl > lower_lvl):
                 cur = float(last["close"])
@@ -2117,9 +2118,9 @@ def _open_on_tick(symbol, cur_price, source="tick"):
                 f"<i>{' · '.join(sig['parts'])}</i>")
         return
 
-    # --- cand / cons отключены в v21.3.0 ---
+    # cand / cons / sqz отключены в v21.4.0
     return
-  # ==================== WEBSOCKET: KLINE ====================
+    # ==================== WEBSOCKET: KLINE ====================
 def on_open(ws):
     """Bybit v5 не принимает подписку на 100 топиков одним сообщением.
     Шлём чанками по 10 с паузой 0.15с."""
@@ -2212,7 +2213,7 @@ def on_message(ws, message):
             else:
                 buf.append(new_candle)
 
-            # --- мгновенные выходы по SL (partial отключён в v21.3.0) ---
+            # --- мгновенные выходы по SL ---
             exit_messages = []
             with state_lock:
                 pos = state.get(symbol, {})
@@ -2235,7 +2236,6 @@ def on_message(ws, message):
                                     "last_exit_reason": "stop-loss"})
                         state[symbol] = pos
                         save_state(state)
-                    # v21.3.0: partial TP и fixed TP отключены
                     elif (not NO_PARTIAL_TP
                           and not pos.get("partial_done")
                           and new_candle["high"] >= pos["entry_price"] + PARTIAL_TP_ATR * atr_ref):
@@ -2276,14 +2276,12 @@ def on_message(ws, message):
             elif isinstance(cache_entry, (int, float)):
                 level = cache_entry
 
-            # v21.3.0: приоритеты — bounce → WT → RSI → SQZ
+            # v21.4.0: приоритеты — bounce → WT → RSI
             sig = evaluate_ws_range_bounce(df, symbol, lower_level, level)
             if sig is None:
                 sig = evaluate_ws_wt_dip(df, symbol)
             if sig is None:
                 sig = evaluate_ws_dipbuy(df, symbol)
-            if sig is None:
-                sig = evaluate_ws_sqz_dip(df, symbol)
             if sig is None:
                 continue
 
@@ -2300,8 +2298,6 @@ def on_message(ws, message):
                 title, icon = "RSI-DIPBUY", "💎"
             elif strat == "wt_dip":
                 title, icon = "WT-DIP", "🌊"
-            elif strat == "sqz_dip":
-                title, icon = "SQZ-DIP", "💥"
             else:
                 title, icon = f"ВХОД ({strat})", "🟢"
             send_telegram(
@@ -2448,7 +2444,7 @@ def tickers_refresh_loop():
             update_ticker_subscription()
         except Exception as e:
             logger.error("tickers_refresh_loop: %s", e)
-          # ==================== ФОНОВОЕ СКАНИРОВАНИЕ ====================
+            # ==================== ФОНОВОЕ СКАНИРОВАНИЕ ====================
 TIMEFRAME_PARAMS = {
     "15m": {"bybit_interval": "15",  "min_bars": 80,  "ema_fast": 9,  "ema_slow": 21},
     "1h":  {"bybit_interval": "60",  "min_bars": 80,  "ema_fast": 9,  "ema_slow": 21},
@@ -2746,7 +2742,7 @@ def background_scan_loop():
         except Exception as e:
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
-          # ==================== 🔍 ВОРОНКА ====================
+            # ==================== 🔍 ВОРОНКА ====================
 def _format_funnel(fs):
     lines = []
     lines.append(f"🔍 <b>ВОРОНКА</b> (баров: {fs.get('bars_processed', 0)})")
@@ -2765,17 +2761,14 @@ def _format_funnel(fs):
         f"→EMA {fs['wt_ema']}→зел {fs['wt_green']}"
         f"→BOTTOM {fs['wt_bottom']}")
     lines.append(
-        f"💥 SQZ-dip: {fs['sqzdip_total']}→bull {fs['sqzdip_bull']}"
-        f"→release {fs['sqzdip_release']}→RSI {fs['sqzdip_rsi']}"
-        f"→зел {fs['sqzdip_green']}→объём {fs['sqzdip_vol']}"
-        f"→BOTTOM {fs['sqzdip_bottom']}")
+        f"💥 SQZ-dip: OFF (отключён в v21.4.0)")
     lines.append(
         f"⛔ PEAK-GUARD: {fs['peak_block']} · "
         f"🔧 BTC-блок: {fs['btc_block']} · "
         f"✅ Открыто: {fs['opened']}")
     return "\n".join(lines)
 
-# ==================== СТАТУС (v21.3.0) ====================
+# ==================== СТАТУС (v21.4.0) ====================
 def send_status(scan_summary, consolidation_list, dipbuy_candidates,
                 wtdip_candidates, bounce_candidates, found_buy, found_sell):
     with state_lock:
@@ -2800,7 +2793,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         btc_state_str += " · dip/bounce обходят"
 
     header = [
-        f"📡 <b>СТАТУС v21.3.0 «EMOJI + BOUNCE-FIX»</b> | <i>{now_str} UTC</i>",
+        f"📡 <b>СТАТУС v21.4.0 «BOUNCE-WIDE + RSI-PURE»</b> | <i>{now_str} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔹 Пар WS kline: <b>{len(PAIRS_WS)}</b> · Тренд 3/3: <b>{q3}</b>",
         f"🔹 1D-bull (EMA50&gt;200): <b>{bull_1d}</b> пар",
@@ -2897,7 +2890,6 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         HOT_PAIRS_CACHE["bounce"] = list(display_bounce)
         HOT_PAIRS_CACHE["candidates_pool"] = list(cand_pool)
         HOT_PAIRS_CACHE["consolidations_pool"] = list(cons_pool)
-        # bounce_pool обновляется в _rebuild_hot_pools_from_buffers
         HOT_PAIRS_CACHE["ts"] = time.time()
 
     def cand_line(i, s, with_link):
@@ -2988,12 +2980,12 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔄 Следующий статус через 2 ч · лимиты {MAX_OPEN_POSITIONS} поз / "
         f"{MAX_TRADES_PER_HOUR} в час",
-        f"🔒 HOLD-TO-REVERSAL: BE +{BREAKEVEN_TRIGGER_ATR_FAST}×ATR, "
+        f"🔒 HOLD-TO-REVERSAL: BE +{BREAKVEN_TRIGGER_ATR_FAST}×ATR, "
         f"без partial TP, без fixed TP",
         f"🚪 Выход: EMA-кросс 4h / трейлинг / SL / time-stop {TIME_STOP_DAYS}д",
         f"🎯 Все стратегии ищут ДНО. Никаких пробоев и momentum.",
         f"🔧 BTC-фильтр: -{abs(BTC_DROP_6H_PCT):.0f}%/6ч или ADX&gt;{BTC_ADX_BLOCK_THRESHOLD:.0f}",
-        f"💎 RSI-dip · 🌊 WT-dip · 💥 SQZ-dip · 🎯 BOUNCE · /funnel — счётчики",
+        f"💎 RSI-dip · 🌊 WT-dip · 🎯 BOUNCE · /funnel — счётчики",
     ]
 
     def build(with_links, max_cand, max_cons, max_dip, max_wtdip, max_bounce):
@@ -3066,7 +3058,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         text = build(True, 5, 5, 3, 3, 3)
 
     _send_to_all_one(text)
-    logger.info("Статус v21.3.0: %d симв · bounce=%d dip=%d wt=%d cons=%d · tickers=%d",
+    logger.info("Статус v21.4.0: %d симв · bounce=%d dip=%d wt=%d cons=%d · tickers=%d",
                 len(text), len(bounce_candidates), len(dipbuy_candidates),
                 len(wtdip_candidates), len(consolidation_list), tickers_count)
     funnel_reset()
@@ -3079,7 +3071,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v21.3.0 «EMOJI + BOUNCE-FIX» (Bybit) ...")
+    logger.info("Запуск бота v21.4.0 «BOUNCE-WIDE + RSI-PURE» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
@@ -3154,17 +3146,15 @@ if __name__ == "__main__":
     threading.Thread(target=tickers_refresh_loop, daemon=True).start()
 
     _send_to_all_one(
-        f"🟢 <b>СКАНЕР v21.3.0 «EMOJI + BOUNCE-FIX» ЗАПУЩЕН</b>\n"
+        f"🟢 <b>СКАНЕР v21.4.0 «BOUNCE-WIDE + RSI-PURE» ЗАПУЩЕН</b>\n"
         f"📡 WS kline: {len(PAIRS_WS)} пар (подписка чанками по {WS_SUBSCRIBE_CHUNK})\n"
         f"⚡ WS tickers: {WS_TICKERS_QUOTA_CAND} cand + {WS_TICKERS_QUOTA_CONS} cons + "
         f"{WS_TICKERS_QUOTA_DIP} dip + {WS_TICKERS_QUOTA_WT} wt + "
         f"{WS_TICKERS_QUOTA_BOUNCE} bounce (макс {WS_TICKERS_MAX_PAIRS})\n"
         f"🎯 BOUNCE: отскок от дна боковика (≤{RANGE_BOUNCE_ZONE_PCT}%)\n"
-        f"💎 RSI-DIPBUY: RSI≤{DIPBUY_RSI_ZONE} × {DIPBUY_RSI_MIN_BARS}св + BB + объём\n"
-        f"🌊 WT-DIP: WaveTrend кросс внизу\n"
-        f"💥 SQZ-DIP: Squeeze release + RSI растёт + close&gt;EMA9\n"
+        f"💎 RSI-DIPBUY: RSI≤{DIPBUY_RSI_ZONE} × {DIPBUY_RSI_MIN_BARS}св + объём (без BB)\n"
+        f"🌊 WT-DIP: WaveTrend кросс внизу (без EMA)\n"
         f"🔒 HOLD-TO-REVERSAL: BE +{BREAKEVEN_TRIGGER_ATR_FAST}×ATR, "
-        f"без partial TP, без fixed TP\n"
         f"🚪 Выход: EMA-кросс 4h / трейлинг / SL / time-stop {TIME_STOP_DAYS}д\n"
         f"🔧 BTC-фильтр: -{abs(BTC_DROP_6H_PCT):.0f}%/6ч или ADX&gt;{BTC_ADX_BLOCK_THRESHOLD:.0f}\n"
         f"Тренд 3/3: {q3} · 1D-bull: {bull_1d} · "
