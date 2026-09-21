@@ -2,22 +2,24 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v21.5.0 «FULL-FIX» — ЕДИНЫЙ ФАЙЛ VPS
+BYBIT SCANNER v21.6.0 «VOLUME-AWARE-HOLD» — ЕДИНЫЙ ФАЙЛ VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
-НОВОЕ В v21.5.0 (относительно v21.4.0):
-• FIX: BREAKVEN_TRIGGER_ATR_FAST -> BREAKEVEN_TRIGGER_ATR_FAST (statuses).
-• FIX: WT-DIP/BOUNCE/RSI-DIPBUY заголовки алертов + «ВХОД».
-• FIX: WT-dip использует WT_DIP_REQUIRE_EMA_UP (не DIPBUY_...).
-• FIX: risk sizing — чистая формула risk_budget / stop_dist.
-• FIX: R-unit consistency (r_unit_price сохраняется при входе).
-• FIX: circuit breaker по % счёта (account_pnl), не по % сделки.
-• FIX: Peak Guard — реальный входной фильтр + счётчик в воронке.
-• FIX: TP -> REF в алертах, когда NO_FIXED_TP=True.
-• FIX: found_buy/found_sell считаются в on_message и scan-loop.
-• NEW: ACCOUNT_SIZE_USD=10000 для risk/CB (настраивается).
-• NEW: логи also_valid для пересекающихся стратегий.
+НОВОЕ В v21.6.0 (относительно v21.5.0):
+• 🚀 3-режимная логика удержания позиции:
+    ДНО       — обычная логика (BE, EMA-кросс, трейлинг 2R)
+    У ПРОБОЯ  — цена ≥ upper×0.97: при vol_score ≥ 0.6 EMA-кросс
+                игнорируется, при vol_score < 0.4 + красная 4h — выход
+    ПОСЛЕ     — cur > upper: трейлинг 2×R под high,
+                возврат ниже upper−0.5% → «Ложный пробой»
+• 📊 VOLUME-AWARE оценка по 4h: vol_ratio, ADX slope, trend_up, MACD.
+• 🌊 Оценка накопления в боковике (vol_trend) — бонус/штраф к скору bounce.
+• 🛡 Флаг broke_out — фиксирует факт пробоя для проверки ложного пробоя.
+• ⚡ Отображение режима в статусе: «⚡ у пробоя (держим, vol=0.72)»
+• 🐛 FIX: breakout_cache сохраняет vol_trend.
+• 🐛 FIX: сброс near_upper_bars при уходе от upper.
+• Миграция старых позиций: добавляет box_upper, broke_out и др.
 ==============================================================================
 """
 import json
@@ -40,7 +42,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 BASE_URL = "https://api.bybit.com/v5/market"
 WS_URL = "wss://stream.bybit.com/v5/public/spot"
 
-# --- v21.5.0: аккаунт для risk/CB ---
+# --- аккаунт для risk/CB ---
 ACCOUNT_SIZE_USD = 10_000.0
 
 TOP_N = 200
@@ -59,10 +61,6 @@ MAX_OPEN_POSITIONS = 8
 MAX_TRADES_PER_HOUR = 15
 ENTRY_COOLDOWN_SECONDS = 1800
 MIN_STOP_DISTANCE_PCT = 0.5
-MAX_BREAKOUT_DISTANCE_PCT = 4.5
-BREAKOUT_MIN_TRIGGER_PCT = 0.5
-BREAKOUT_MAX_ADX = 30
-BREAKOUT_VOL_ACCUM_MULT = 1.0
 
 CONSOLIDATION_WINDOWS = (30, 45, 60)
 CONSOLIDATION_MAX_RANGE_PCT = 24.0
@@ -82,7 +80,7 @@ BTC_STRONG_MIN_TREND_SCORE = 3
 BTC_STRONG_MIN_SCORE = 8
 BTC_STRONG_SIZE_MULT = 0.5
 
-# --- CIRCUIT BREAKER (по % счёта) ---
+# --- CIRCUIT BREAKER ---
 CB_MAX_CONSEC_LOSSES = 4
 CB_PAUSE_SECONDS = 6 * 3600
 CB_DAILY_LOSS_PCT = 3.0
@@ -104,14 +102,14 @@ SECTOR_MAP = {
 }
 
 # --- RISK ---
-RISK_PER_TRADE_PCT = 1.0        # % счёта на одну сделку
-MAX_PORTFOLIO_RISK_PCT = 6.0    # суммарный риск открытых позиций
+RISK_PER_TRADE_PCT = 1.0
+MAX_PORTFOLIO_RISK_PCT = 6.0
 
 # --- КОМИССИИ ---
 FEE_PCT = 0.25
 SLIPPAGE_PCT = 0.05
 
-# --- ATR-МУЛЬТИПЛИКАТОРЫ (для стратегий) ---
+# --- ATR-МУЛЬТИПЛИКАТОРЫ ---
 ATR_MULT_SL = 3.0
 ATR_MULT_TP = 6.0
 PARTIAL_TP_ATR = 3.0
@@ -132,7 +130,7 @@ STATUS_ADX_MIN, STATUS_ADX_MAX = 18, 55
 STATUS_MIN_PRICE = 0.0001
 STATUS_READY_SCORE = 3
 
-# --- 🛡 PEAK-GUARD (v21.5.0: реальный фильтр) ---
+# --- 🛡 PEAK-GUARD ---
 PEAK_GUARD_ENABLED = True
 PEAK_LOOKBACK_CANDLES = 20
 PEAK_MAX_POSITION_PCT = 85
@@ -175,7 +173,7 @@ WT_OS2 = -53
 WT_OB1 = 60
 WT_OB2 = 53
 WT_DIP_STRATEGY_ENABLED = True
-WT_DIP_REQUIRE_EMA_UP = False   # v21.5.0: отдельный флаг
+WT_DIP_REQUIRE_EMA_UP = False
 WT_CONFIRM_BYPASS_BTC = True
 WT_DIP_SL_ATR = 2.5
 WT_DIP_TP_ATR = 5.0
@@ -191,7 +189,7 @@ SQZ_KC_MULT = 1.5
 SQZ_BREAKOUT_VOL_MULT = 1.4
 SQZ_RELEASE_MAX_BARS = 3
 SQZ_BREAKOUT_STRATEGY_ENABLED = False
-SQZ_DIP_STRATEGY_ENABLED = False   # отключён (5 сделок = 5 убытков)
+SQZ_DIP_STRATEGY_ENABLED = False
 SQZ_DIP_SL_ATR = 2.5
 SQZ_DIP_TP_ATR = 5.0
 SQZ_DIP_VOL_MIN = 1.2
@@ -212,6 +210,18 @@ HOLD_MODE_ENABLED = True
 BREAKEVEN_TRIGGER_ATR_FAST = 0.5
 NO_PARTIAL_TP = True
 NO_FIXED_TP = True
+
+# --- 🚀 VOLUME-AWARE HOLD (v21.6.0) ---
+# 3 режима позиции: дно → у пробоя → после пробоя
+VOL_HOLD_ENABLED = True
+VOL_HOLD_NEAR_UPPER_PCT = 3.0       # цена ≥ upper×0.97 = «у пробоя»
+VOL_HOLD_SCORE_KEEP = 0.60          # vol_score ≥ 0.6 → держим, EMA-кросс игнор
+VOL_HOLD_SCORE_WEAK = 0.40          # vol_score < 0.4 + красная 4h → выход
+# Внимание: check_exit вызывается из scan-loop раз в 2 часа,
+# а НЕ на каждой 4h-свече. Поэтому 12 «баров» ≈ 24 часа реального времени.
+VOL_HOLD_MAX_BARS_NEAR = 12
+VOL_HOLD_AFTER_BREAK_TRAIL = 2.0    # после пробоя — трейлинг 2×R
+VOL_HOLD_FALSE_BREAK_PCT = 0.5      # ушли ниже upper на 0.5% → ложный пробой
 
 # --- ПОРОГИ БОКОВИКОВ ---
 HOT_DIST_PCT_1 = 1.0
@@ -289,10 +299,17 @@ FUNNEL = {
     # Общие
     "peak_block": 0, "btc_block": 0, "opened": 0,
     "bars_processed": 0,
+    # v21.6.0: удержания
+    "hold_kept": 0,      # «держим» у пробоя
+    "hold_weak": 0,      # «слабый объём у пробоя»
+    "hold_false": 0,     # «ложный пробой»
 }
 FUNNEL_LOCK = threading.Lock()
+_FUNNEL_SILENT = threading.local()   # v21.6.0: тихий режим для also_valid
 
 def funnel_inc(key, n=1):
+    if getattr(_FUNNEL_SILENT, "on", False):
+        return
     with FUNNEL_LOCK:
         if key in FUNNEL:
             FUNNEL[key] += n
@@ -327,11 +344,10 @@ SESSION = requests.Session()
 market_context = {"ok": True, "reason": "", "ts": 0.0}
 market_context_lock = threading.RLock()
 
-# v21.5.0: CB работает по % счёта, сохраняем отдельно trade и account pnl
 cb_state = {
     "consec": 0, "paused_until": 0.0, "day": "",
-    "day_account_pnl_pct": 0.0,     # % от ACCOUNT_SIZE_USD
-    "day_trades_pnl_sum": 0.0,      # суммарный net_pnl_pct сделок (для логов)
+    "day_account_pnl_pct": 0.0,
+    "day_trades_pnl_sum": 0.0,
     "day_trades": 0,
 }
 cb_lock = threading.Lock()
@@ -357,7 +373,6 @@ WS_TICKERS_CONNECTED = threading.Event()
 
 LAST_PEAK_ALERT = {}
 
-# v21.5.0: счётчики для статуса
 SESSION_STATS = {"entries": 0, "exits": 0, "session_day": ""}
 SESSION_STATS_LOCK = threading.Lock()
 
@@ -394,13 +409,8 @@ def http_get(url, params=None, timeout=20, retries=3):
 def api_ok(data):
     return bool(data) and data.get("retCode") == 0
 
-# ==================== CIRCUIT BREAKER (v21.5.0: по % счёта) ====================
+# ==================== CIRCUIT BREAKER ====================
 def cb_register(net_pnl_pct, size_fraction=1.0):
-    """
-    v21.5.0: принимает net_pnl_pct (процент сделки) и size_fraction.
-    Считает % счёта: account_pnl_pct = net_pnl_pct * size_fraction.
-    Дневной лимит CB_DAILY_LOSS_PCT применяется к сумме account_pnl_pct.
-    """
     account_pnl_pct = net_pnl_pct * size_fraction
     with cb_lock:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -423,7 +433,6 @@ def cb_register(net_pnl_pct, size_fraction=1.0):
         else:
             cb_state["consec"] = 0
 
-        # Дневной лимит — по % счёта, а не по % сделки
         if cb_state["day_account_pnl_pct"] <= -CB_DAILY_LOSS_PCT:
             midnight = (datetime.now(timezone.utc).replace(
                 hour=0, minute=0, second=0, microsecond=0)
@@ -504,9 +513,8 @@ def btc_extra_tag(signal):
         return " 🎯BOTTOM (BTC-обход)"
     return " ⚠️BTC-БЛОК ×0.5"
 
-# ==================== 🛡 PEAK-GUARD (v21.5.0: реальный фильтр) ====================
+# ==================== 🛡 PEAK-GUARD ====================
 def check_peak_guard(df, entry_price):
-    """v21.5.0: возвращает (ok, reason, metrics). Реально блокирует вход."""
     if not PEAK_GUARD_ENABLED:
         return True, "", {}
     try:
@@ -545,18 +553,7 @@ def check_peak_guard_rsi(rsi_val):
         return False, f"RSI {rsi_val:.0f} > {PEAK_MAX_RSI}"
     return True, ""
 
-def check_peak_guard_drift(current_price, entry_price):
-    if not PEAK_GUARD_ENABLED:
-        return True, ""
-    if entry_price <= 0 or current_price <= 0:
-        return True, ""
-    drift_pct = abs(current_price - entry_price) / entry_price * 100
-    if drift_pct > PEAK_MAX_DRIFT_PCT:
-        return False, f"цена ушла на {drift_pct:.1f}%"
-    return True, ""
-
 def peak_guard_ok(df, symbol, entry, rsi_val=None):
-    """v21.5.0: единая проверка. Возвращает (ok, reason). Увеличивает счётчик."""
     if not PEAK_GUARD_ENABLED:
         return True, ""
     ok1, r1, _ = check_peak_guard(df, entry)
@@ -606,32 +603,23 @@ def sector_slot_free(symbol):
               if v.get("position") == "open" and sector_of(p) == sec)
     return cnt < MAX_SECTOR_POSITIONS
 
-# ==================== РАЗМЕР ПОЗИЦИИ (v21.5.0: чистая формула) ====================
+# ==================== РАЗМЕР ПОЗИЦИИ ====================
 def position_size_fraction(stop_dist_pct, confidence=1.0,
                             portfolio_risk_pct=0.0, btc_blocked=False):
-    """
-    v21.5.0: чистая формула риск-сайзинга.
-    size_fraction = risk_budget_pct / stop_dist_pct × confidence
-    где risk_budget_pct = RISK_PER_TRADE_PCT (% счёта на сделку).
-    Возвращает долю счёта, которую надо вложить в позицию.
-    """
     if stop_dist_pct <= 0:
         return 0.0
     risk_budget_pct = RISK_PER_TRADE_PCT * max(0.5, min(1.5, confidence))
     if btc_blocked:
         risk_budget_pct *= BTC_STRONG_SIZE_MULT
-    # Ограничение по портфельному риску
     remaining = MAX_PORTFOLIO_RISK_PCT - portfolio_risk_pct
     if remaining <= 0:
         return 0.0
     risk_budget_pct = min(risk_budget_pct, remaining)
-    # Ограничение — не больше 25% счёта на одну позицию
     size = risk_budget_pct / stop_dist_pct
     size = min(size, 0.25)
     return round(max(size, 0.0), 4)
 
 def portfolio_risk_used():
-    """Суммарный риск открытых позиций в % счёта."""
     total = 0.0
     for v in state.values():
         if v.get("position") == "open" and v.get("entry_price"):
@@ -641,7 +629,6 @@ def portfolio_risk_used():
     return total
 
 def confidence_for_signal(sig):
-    """v21.5.0: 0.5..1.5 от score."""
     score = sig.get("score", 6) if isinstance(sig.get("score", 6), int) else 6
     if score >= 9:
         return 1.5
@@ -654,7 +641,7 @@ def confidence_for_signal(sig):
     if score >= 5:
         return 0.8
     return 0.5
-  # ==================== TELEGRAM: ПОДПИСЧИКИ ====================
+    # ==================== TELEGRAM: ПОДПИСЧИКИ ====================
 def _load_subscribers():
     global SUBSCRIBERS, MAIN_CHAT_ID
     ids = set()
@@ -769,18 +756,22 @@ def tv_link(symbol: str) -> str:
     url = f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol}"
     return f'<a href="{url}">📈 {symbol}</a>'
 
-# v21.5.0: маркер TP/REF в зависимости от NO_FIXED_TP
 def tp_label():
     return "REF" if NO_FIXED_TP else "TP"
 
 HELP_TEXT = (
-    "📡 <b>Bybit Scanner v21.5.0 «FULL-FIX» — справка</b>\n"
+    "📡 <b>Bybit Scanner v21.6.0 «VOLUME-AWARE-HOLD» — справка</b>\n"
     "Все стратегии ищут дно.\n"
     "🎯 RANGE-BOUNCE: отскок от дна боковика (≤4%).\n"
     "💎 RSI-DIPBUY: RSI≤35 × 3св → отскок + объём + 1D bull.\n"
     "🌊 WT-DIP: WaveTrend кросс внизу (без EMA-фильтра).\n"
-    "🔒 HOLD-TO-REVERSAL: BE +0.5×ATR, без partial TP.\n"
-    f"Выход: EMA-кросс 4h / трейлинг / SL / time-stop {TIME_STOP_DAYS}д.\n"
+    "🔒 HOLD-TO-REVERSAL: BE +0.5×R, без partial TP.\n"
+    "🚀 VOLUME-AWARE-HOLD (v21.6.0):\n"
+    "   • у пробоя (≥ upper×0.97): vol_score ≥ 0.6 → держим\n"
+    "   • vol_score < 0.4 + красная 4h → выход\n"
+    "   • после пробоя → трейлинг 2×R, ложный пробой −0.5%\n"
+    f"Выход по умолчанию: EMA-кросс 4h / трейлинг / SL / "
+    f"time-stop {TIME_STOP_DAYS}д.\n"
     "🔧 BTC-фильтр: -10%/6ч или ADX>55. dip/bounce обходят.\n"
     "🛡 Peak Guard: реальный входной фильтр.\n"
     "💥 SQZ-dip отключён (убытки).\n"
@@ -868,19 +859,10 @@ def load_state():
                 pass
             return {}
 
-# ==================== ЖУРНАЛ СДЕЛОК (v21.5.0) ====================
+# ==================== ЖУРНАЛ СДЕЛОК ====================
 def log_trade(symbol, entry, exit_price, reason, strategy,
               entry_time=None, size_fraction=1.0, traded_fraction=1.0,
               daily_regime=None):
-    """
-    v21.5.0:
-    - net_pnl_pct — % сделки.
-    - account_pnl_pct = net_pnl_pct × size_fraction × traded_fraction
-      (вклад в счёт).
-    - CB вызывается только при полном закрытии (traded_fraction >= 1.0)
-      и учитывает account_pnl_pct.
-    - Возвращает (net_pnl_pct, account_pnl_pct).
-    """
     with state_lock:
         trades = []
         if os.path.exists(TRADES_LOG_FILE):
@@ -895,7 +877,6 @@ def log_trade(symbol, entry, exit_price, reason, strategy,
         raw_pnl = (exit_price - entry) / entry * 100 if entry else 0.0
         costs = (FEE_PCT * 2 + SLIPPAGE_PCT) * traded_fraction
         net_pnl_pct = raw_pnl * traded_fraction - costs
-        # вклад в счёт = % сделки × доля позиции × доля сделки
         account_pnl_pct = net_pnl_pct * size_fraction
         trades.append({
             "symbol": symbol, "entry_price": entry,
@@ -913,10 +894,8 @@ def log_trade(symbol, entry, exit_price, reason, strategy,
         })
         with open(TRADES_LOG_FILE, "w") as f:
             json.dump(trades, f, indent=2)
-        # CB учитывает только полное закрытие
         if traded_fraction >= 1.0:
             cb_register(net_pnl_pct, size_fraction)
-        # Счётчики сессии
         with SESSION_STATS_LOCK:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             if SESSION_STATS["session_day"] != today:
@@ -927,7 +906,6 @@ def log_trade(symbol, entry, exit_price, reason, strategy,
         return round(net_pnl_pct, 2), round(account_pnl_pct, 4)
 
 def register_entry():
-    """v21.5.0: счётчик входов для статуса."""
     with SESSION_STATS_LOCK:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if SESSION_STATS["session_day"] != today:
@@ -941,7 +919,6 @@ def get_session_stats():
         return dict(SESSION_STATS)
 
 def _format_stats():
-    """v21.5.0: команда /stats — сводка по сделкам."""
     try:
         if not os.path.exists(TRADES_LOG_FILE):
             return "📊 Сделок пока нет."
@@ -954,7 +931,16 @@ def _format_stats():
         losses = total - wins
         sum_net = sum(t.get("net_pnl_pct", 0) for t in trades)
         sum_acc = sum(t.get("account_pnl_pct", 0) for t in trades)
-        # последние 5 сделок
+        # разбивка по стратегиям
+        by_strat = {}
+        for t in trades:
+            s = t.get("strategy", "?")
+            if s not in by_strat:
+                by_strat[s] = {"n": 0, "wins": 0, "sum": 0.0}
+            by_strat[s]["n"] += 1
+            if t.get("result") == "win":
+                by_strat[s]["wins"] += 1
+            by_strat[s]["sum"] += t.get("net_pnl_pct", 0)
         last5 = trades[-5:]
         lines = [
             "📊 <b>СТАТИСТИКА СДЕЛОК</b>",
@@ -962,8 +948,15 @@ def _format_stats():
             f"WR <b>{wins / total * 100:.1f}%</b>",
             f"Σ PnL сделок: <b>{sum_net:+.2f}%</b>",
             f"Σ вклад в счёт: <b>{sum_acc:+.2f}%</b>",
-            "── последние 5 ──",
+            "── по стратегиям ──",
         ]
+        for s, d in sorted(by_strat.items(),
+                            key=lambda x: -x[1]["sum"]):
+            wr = d["wins"] / d["n"] * 100 if d["n"] else 0
+            lines.append(
+                f"{s}: {d['n']} сделок · WR {wr:.0f}% · "
+                f"Σ {d['sum']:+.2f}%")
+        lines.append("── последние 5 ──")
         for t in last5:
             pnl = t.get("net_pnl_pct", 0)
             icon = "🟢" if pnl > 0 else "🔴"
@@ -976,14 +969,13 @@ def _format_stats():
         return f"Ошибка /stats: {e}"
 
 def _format_reset():
-    """v21.5.0: /reset — очистить trades.json (для тестов)."""
     try:
         if os.path.exists(TRADES_LOG_FILE):
             os.replace(TRADES_LOG_FILE, TRADES_LOG_FILE + ".bak")
         return "♻️ Журнал сделок сброшен (bybit_trades.json.bak)."
     except Exception as e:
         return f"Ошибка /reset: {e}"
-      # ==================== ИНДИКАТОРЫ ====================
+        # ==================== ИНДИКАТОРЫ ====================
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
@@ -1018,7 +1010,6 @@ def adx(df, period=14):
 
 # ==================== 🌊 WAVETREND (LazyBear) ====================
 def wavetrend(df, n1=10, n2=21, sma_len=4):
-    """LazyBear WaveTrend Oscillator. Возвращает (wt1, wt2)."""
     ap = (df["high"] + df["low"] + df["close"]) / 3.0
     esa = ap.ewm(span=n1, adjust=False).mean()
     d = (ap - esa).abs().ewm(span=n1, adjust=False).mean()
@@ -1029,7 +1020,6 @@ def wavetrend(df, n1=10, n2=21, sma_len=4):
     return wt1, wt2
 
 def detect_wt_buy_cross(df, os_level=None):
-    """True, если wt1 пересёк wt2 снизу вверх при wt1 < os_level."""
     if not WT_ENABLED:
         return False
     if os_level is None:
@@ -1052,7 +1042,6 @@ def detect_wt_buy_cross(df, os_level=None):
 
 # ==================== 💥 SQUEEZE MOMENTUM (LazyBear) ====================
 def squeeze_momentum(df, bb_len=20, bb_mult=2.0, kc_len=20, kc_mult=1.5):
-    """LazyBear Squeeze Momentum. Возвращает (val, sqz_on, sqz_off)."""
     src = df["close"]
     basis = src.rolling(bb_len).mean()
     dev = bb_mult * src.rolling(bb_len).std(ddof=0)
@@ -1088,7 +1077,6 @@ def squeeze_momentum(df, bb_len=20, bb_mult=2.0, kc_len=20, kc_mult=1.5):
     return val, sqz_on, sqz_off
 
 def detect_sqz_release_bull(df, max_bars=None):
-    """True, если sqz был ON и только что OFF, val растёт."""
     if not SQZ_ENABLED:
         return False
     if max_bars is None:
@@ -1114,7 +1102,6 @@ def detect_sqz_release_bull(df, max_bars=None):
     return False
 
 def sqz_state(df):
-    """Возвращает (val, is_on, is_off, color)."""
     if not SQZ_ENABLED or len(df) < SQZ_KC_LEN + 5:
         return 0.0, False, False, "grey"
     try:
@@ -1218,27 +1205,70 @@ def detect_consolidation(df_daily):
         "lower_level": float(window["low"].min()),
         "vol_trend": round(vol_trend, 2),
     }
-  # ==================== ВЫХОДЫ (HOLD-TO-REVERSAL, v21.5.0) ====================
+    # ==================== ВЫХОДЫ (v21.6.0) ====================
 def _get_r_unit(pos):
-    """
-    v21.5.0: R-unit из самой позиции.
-    r_unit_price = entry - stop при открытии (в цене).
-    Если сохранён — используем. Иначе fallback на atr_ref.
-    """
+    """R-unit из позиции. r_unit_price = entry - stop при входе."""
     entry = pos.get("entry_price") or 0.0
     if entry <= 0:
         return 0.0
     r_unit = pos.get("r_unit_price") or 0.0
     if r_unit > 0:
         return r_unit
-    # fallback — atr_ref
     atr_ref = pos.get("atr_ref") or 0.0
     return atr_ref if atr_ref > 0 else entry * 0.01
 
+
+def _volume_before_breakout(r4h):
+    """
+    v21.6.0: оценка «есть ли агрессивный покупатель» у пробоя.
+    Score 0.0..1.0 из 4 компонент:
+      vol_ratio (4h vs SMA20), ADX slope, trend_up (EMA9>EMA21), MACD.
+    """
+    if not r4h:
+        return 0.0
+    score = 0.0
+    weights = 0.0
+
+    vr = r4h.get("vol_ratio", 0.0)
+    if vr >= 1.5:
+        score += 1.0
+    elif vr >= 1.2:
+        score += 0.7
+    elif vr >= 1.0:
+        score += 0.4
+    else:
+        score += 0.0
+    weights += 1.0
+
+    if r4h.get("adx_slope_up"):
+        score += 1.0
+    elif r4h.get("adx", 0) >= 25:
+        score += 0.5
+    weights += 1.0
+
+    if r4h.get("trend_up"):
+        score += 1.0
+    weights += 1.0
+
+    if r4h.get("macd_line", 0) > r4h.get("macd_signal", 0):
+        score += 0.7
+    weights += 1.0
+
+    return round(score / weights, 3) if weights > 0 else 0.0
+
+
 def check_exit(results, pos):
     """
-    v21.5.0: все триггеры BE/трейлинга считаются от r_unit_price (в цене),
-    а не от 1D ATR. Это устраняет рассинхрон entry/manage.
+    v21.6.0: 3 режима позиции + broke_out flag.
+
+    ДНО       — обычная логика (BE, EMA-кросс, трейлинг 2×R).
+    У ПРОБОЯ  — cur ≥ upper×0.97:
+                vol_score ≥ 0.6 → держим (EMA-кросс игнор)
+                vol_score < 0.4 + красная 4h → выход
+                0.4–0.6 → падаем в дно-логику
+    ПОСЛЕ     — cur > upper (broke_out=True):
+                трейлинг 2×R под high,
+                возврат ниже upper−0.5% → «Ложный пробой».
     """
     if not results.get(TRIGGER_TF) or not results.get("1d"):
         return False, "", 0.0
@@ -1252,7 +1282,7 @@ def check_exit(results, pos):
     if r4h["low"] <= pos["stop"]:
         return True, "Stop-Loss", min(r4h["open"], pos["stop"])
 
-    # Fixed TP (при NO_FIXED_TP=False)
+    # Fixed TP
     if not NO_FIXED_TP:
         if r4h["high"] >= pos["target"]:
             return True, "Take-Profit", pos["target"]
@@ -1261,7 +1291,7 @@ def check_exit(results, pos):
     if r_unit <= 0:
         return False, "", 0.0
 
-    # Partial TP (при NO_PARTIAL_TP=False)
+    # Partial TP
     if not NO_PARTIAL_TP:
         if (not pos.get("partial_done")
                 and r4h["high"] >= entry + PARTIAL_TP_ATR * r_unit):
@@ -1269,7 +1299,7 @@ def check_exit(results, pos):
             pos["stop"] = max(pos["stop"], entry * 1.001)
             return False, "partial", entry + PARTIAL_TP_ATR * r_unit
 
-    # Breakeven: BE +0.5×R (HOLD_MODE) или BE +1.0×R
+    # Breakeven
     be_trig = (BREAKEVEN_TRIGGER_ATR_FAST
                if HOLD_MODE_ENABLED else BREAKEVEN_TRIGGER_ATR)
     if (not pos.get("breakeven_moved")
@@ -1277,7 +1307,7 @@ def check_exit(results, pos):
         pos["breakeven_moved"] = True
         pos["stop"] = max(pos["stop"], entry * 1.001)
 
-    # Трейлинг: close >= entry + 2.0×R
+    # Базовый трейлинг +2R
     if r4h["close"] >= entry + TRAILING_TRIGGER_ATR * r_unit:
         pos["highest_close"] = max(
             pos.get("highest_close", r4h["close"]), r4h["close"])
@@ -1288,7 +1318,60 @@ def check_exit(results, pos):
         if new_stop > pos["stop"]:
             pos["stop"] = max(new_stop, floor)
 
-    # EMA-кросс 4h вниз — основной выход
+    # ===== v21.6.0: 3-режимная логика =====
+    box_upper = pos.get("box_upper")
+    cur = r4h["close"]
+
+    # Проверка ложного пробоя (только если уже был пробой)
+    if (box_upper and box_upper > 0
+            and pos.get("broke_out")):
+        false_thr = box_upper * (1 - VOL_HOLD_FALSE_BREAK_PCT / 100)
+        if cur < false_thr:
+            return True, "Ложный пробой", cur
+
+    if VOL_HOLD_ENABLED and box_upper and box_upper > 0:
+        near_upper_thr = box_upper * (1 - VOL_HOLD_NEAR_UPPER_PCT / 100)
+
+        # --- РЕЖИМ: ПОСЛЕ ПРОБОЯ ---
+        if cur > box_upper:
+            pos["broke_out"] = True
+            pos["near_upper_bars"] = 0
+            pos["highest_close"] = max(
+                pos.get("highest_close", cur), cur)
+            trail_stop = (pos["highest_close"]
+                          - VOL_HOLD_AFTER_BREAK_TRAIL * r_unit)
+            floor = (entry * 1.001
+                     if (pos.get("partial_done")
+                         or pos.get("breakeven_moved"))
+                     else pos["stop"])
+            if trail_stop > pos["stop"]:
+                pos["stop"] = max(trail_stop, floor)
+            return False, "", 0.0
+
+        # --- РЕЖИМ: У ПРОБОЯ ---
+        if cur >= near_upper_thr:
+            pos["near_upper_bars"] = pos.get("near_upper_bars", 0) + 1
+            vol_score = _volume_before_breakout(r4h)
+            pos["last_vol_score"] = vol_score
+
+            red_candle = r4h["close"] < r4h["open"]
+
+            # Зона 1: сильный объём → держим
+            if vol_score >= VOL_HOLD_SCORE_KEEP:
+                if pos["near_upper_bars"] >= VOL_HOLD_MAX_BARS_NEAR:
+                    return True, "Не пробили upper", cur
+                return False, "", 0.0
+
+            # Зона 2: слабый объём + красная → выход
+            if vol_score < VOL_HOLD_SCORE_WEAK and red_candle:
+                return True, "Слабый объём у пробоя", cur
+
+            # Зона 3 (0.4–0.6): падаем в дно-логику ниже
+        else:
+            # Ушли от upper — сбрасываем счётчик
+            pos["near_upper_bars"] = 0
+
+    # --- РЕЖИМ: ДНО ---
     if r4h.get("ema_cross_down"):
         return True, "Разворот", r4h["close"]
     return False, "", 0.0
@@ -1567,7 +1650,7 @@ def fetch_current_prices(pairs):
         if sym in want:
             prices[sym] = t["last"]
     return prices
-  # ==================== СКОРИНГ ВХОДА ====================
+    # ==================== СКОРИНГ ВХОДА ====================
 def find_fresh_cross(df, window=FRESH_CROSS_WINDOW):
     ml, ms = df["macd_line"], df["macd_signal"]
     for ago in range(0, window):
@@ -1584,9 +1667,9 @@ def _rr_ok(entry, stop, target, min_rr=1.5):
         return False
     return (target - entry) / risk >= min_rr
 
-# ==================== 🎯 RANGE-BOUNCE (v21.5.0) ====================
+# ==================== 🎯 RANGE-BOUNCE (v21.6.0) ====================
 def evaluate_ws_range_bounce(df, symbol, lower_level, upper_level):
-    """Отскок от дна боковика. + Peak Guard."""
+    """Отскок от дна боковика + оценка накопления (vol_trend)."""
     funnel_inc("bounce_total")
     if not RANGE_BOUNCE_ENABLED:
         return None
@@ -1602,19 +1685,25 @@ def evaluate_ws_range_bounce(df, symbol, lower_level, upper_level):
     if pd.isna(sig["rsi"]):
         return None
 
+    # 1) v21.6.0: касание зоны в последних 5 свечах
     zone = lower_level * (1 + RANGE_BOUNCE_ZONE_PCT / 100)
-    if sig["low"] > zone:
+    recent = df.iloc[-6:-1]
+    touched_recently = bool((recent["low"] <= zone).any())
+    if not touched_recently:
         return None
     funnel_inc("bounce_zone")
 
+    # 2) RSI
     if sig["rsi"] > RANGE_BOUNCE_RSI_MAX:
         return None
     funnel_inc("bounce_rsi")
 
+    # 3) Зелёная свеча (на текущей закрытой)
     if not (sig["close"] > sig["open"]):
         return None
     funnel_inc("bounce_green")
 
+    # 4) Объём свечи
     vol_ratio = (float(sig["vol_ratio"])
                  if not pd.isna(sig["vol_ratio"]) else 0.0)
     if vol_ratio < RANGE_BOUNCE_VOL_MULT:
@@ -1637,7 +1726,7 @@ def evaluate_ws_range_bounce(df, symbol, lower_level, upper_level):
         return None
     funnel_inc("bounce_rr")
 
-    # v21.5.0: Peak Guard — реальный фильтр
+    # Peak Guard
     pg_ok, pg_reason = peak_guard_ok(df, symbol, entry, sig["rsi"])
     if not pg_ok:
         logger.debug("bounce peak-block %s: %s", symbol, pg_reason)
@@ -1645,22 +1734,40 @@ def evaluate_ws_range_bounce(df, symbol, lower_level, upper_level):
 
     ti = get_trend(symbol)
     trend_score = ti["score"] if ti else 0
+
+    # v21.6.0: накопление в боковике
+    box_vol_trend = 1.0
+    with breakout_cache_lock:
+        ce = breakout_cache.get(symbol)
+    if isinstance(ce, dict):
+        box_vol_trend = float(ce.get("vol_trend", 1.0) or 1.0)
+
+    score = 7
+    parts = [
+        f"🎯 Bounce от дна боковика (lower={lower_level:.6g})",
+        f"RSI {sig['rsi']:.0f}, объём {vol_ratio:.1f}×",
+        "🛡 Peak OK",
+    ]
+    if box_vol_trend >= 1.1:
+        score += 1
+        parts.append(f"🌊 Накопление (vol_trend {box_vol_trend:.2f}×) +1")
+    elif box_vol_trend < 0.7:
+        score -= 1
+        parts.append(f"🥀 Распределение (vol_trend {box_vol_trend:.2f}×) −1")
+
     return {
         "entry": entry, "stop": stop, "target": target, "atr": atr_value,
-        "score": 7, "trend_score": trend_score,
-        "parts": [
-            f"🎯 Bounce от дна боковика (lower={lower_level:.6g})",
-            f"RSI {sig['rsi']:.0f}, объём {vol_ratio:.1f}×",
-            "🛡 Peak OK",
-        ],
+        "score": score, "trend_score": trend_score,
+        "parts": parts,
         "strategy": "range_bounce",
         "bottom_ok": True,
         "hold_mode": True,
+        "box_upper": float(upper_level),
+        "box_vol_trend": box_vol_trend,
     }
 
-# ==================== 💎 RSI DIP-BUY (v21.5.0) ====================
+# ==================== 💎 RSI DIP-BUY (v21.6.0) ====================
 def evaluate_ws_dipbuy(df, symbol):
-    """RSI зона + отскок + объём + 1D bull. + Peak Guard."""
     funnel_inc("dip_total")
     if not DIPBUY_ENABLED or len(df) < MIN_BARS + 1:
         return None
@@ -1765,10 +1872,8 @@ def evaluate_ws_dipbuy(df, symbol):
         "hold_mode": True,
     }
 
-# ==================== 🌊 WT-DIP (v21.5.0) ====================
+# ==================== 🌊 WT-DIP (v21.6.0) ====================
 def evaluate_ws_wt_dip(df, symbol):
-    """WaveTrend кросс внизу + BOTTOM + 1D bull. + Peak Guard.
-    v21.5.0: использует WT_DIP_REQUIRE_EMA_UP (не DIPBUY_)."""
     funnel_inc("wt_total")
     if not WT_ENABLED or not WT_DIP_STRATEGY_ENABLED:
         return None
@@ -1792,7 +1897,6 @@ def evaluate_ws_wt_dip(df, symbol):
     if pd.isna(sig["atr"]) or sig["atr"] <= 0:
         return None
 
-    # v21.5.0: отдельный флаг для WT
     if WT_DIP_REQUIRE_EMA_UP:
         if not (sig["ema_fast"] > sig["ema_slow"] * DIPBUY_EMA_SLACK):
             return None
@@ -1839,10 +1943,8 @@ def evaluate_ws_wt_dip(df, symbol):
         "hold_mode": True,
     }
 
-# ==================== 💥 SQZ-DIP (v21.5.0: ОТКЛЮЧЁН) ====================
+# ==================== 💥 SQZ-DIP (ОТКЛЮЧЁН) ====================
 def evaluate_ws_sqz_dip(df, symbol):
-    """v21.5.0: стратегия отключена (5 сделок = 5 убытков).
-    Код сохранён для отката: SQZ_DIP_STRATEGY_ENABLED=True."""
     funnel_inc("sqzdip_total")
     if not SQZ_ENABLED or not SQZ_DIP_STRATEGY_ENABLED:
         return None
@@ -1911,14 +2013,8 @@ def evaluate_ws_sqz_dip(df, symbol):
         "hold_mode": True,
     }
 
-# ==================== ОТКРЫТИЕ ПОЗИЦИИ (v21.5.0) ====================
+# ==================== ОТКРЫТИЕ ПОЗИЦИИ (v21.6.0) ====================
 def open_position(symbol, sig, closed_start, also_valid=None):
-    """
-    v21.5.0:
-    - Сохраняет r_unit_price = entry - stop (для check_exit).
-    - Новая формула размера: risk_budget / stop_dist.
-    - Логирует also_valid (какие ещё стратегии тоже давали сигнал).
-    """
     btc_blocked_raw = not market_allows_longs()
     bypassed = _signal_bypasses_btc(sig)
     btc_blocked = btc_blocked_raw and not bypassed
@@ -1947,7 +2043,6 @@ def open_position(symbol, sig, closed_start, also_valid=None):
         logger.info("🚫 %s: size=0 (риск-лимит)", symbol)
         return None
 
-    # v21.5.0: R-unit в цене (entry - stop)
     r_unit_price = max(entry - stop, entry * 0.001)
 
     new_state = old_state.copy()
@@ -1957,7 +2052,7 @@ def open_position(symbol, sig, closed_start, also_valid=None):
         "stop": stop,
         "target": sig["target"],
         "atr_ref": sig["atr"],
-        "r_unit_price": r_unit_price,   # v21.5.0
+        "r_unit_price": r_unit_price,
         "entry_time": datetime.now(timezone.utc).isoformat(),
         "last_signal_candle": closed_start,
         "last_entry_ts": time.time(),
@@ -1969,6 +2064,12 @@ def open_position(symbol, sig, closed_start, also_valid=None):
         "hold_mode": sig.get("hold_mode", True),
         "confidence": confidence,
         "also_valid": also_valid or [],
+        # v21.6.0: 3-режимная логика
+        "box_upper": sig.get("box_upper"),
+        "box_vol_trend": sig.get("box_vol_trend", 1.0),
+        "near_upper_bars": 0,
+        "last_vol_score": 0.0,
+        "broke_out": False,
     })
     state[symbol] = new_state
     trade_times.append(time.time())
@@ -1976,7 +2077,7 @@ def open_position(symbol, sig, closed_start, also_valid=None):
     funnel_inc("opened")
     register_entry()
     return new_state
-  # ==================== HOT-POOLS ====================
+    # ==================== HOT-POOLS ====================
 def _cand_hotness(s):
     return abs(s.get("macd_gap_pct", 999))
 
@@ -1985,7 +2086,11 @@ def _cons_hotness(item):
     lvl = item.get("upper_level", 0)
     if cur <= 0 or lvl <= 0:
         return 999
-    return max((lvl - cur) / cur * 100, 0)
+    dist = (lvl - cur) / cur * 100
+    # v21.6.0: пробитые — в конец списка
+    if dist < 0:
+        return 10_000 + abs(dist)
+    return dist
 
 def _dip_hotness(s):
     return s.get("rsi_now", 999)
@@ -1997,8 +2102,7 @@ def _bounce_hotness(s):
     return s.get("dist_to_bottom", 999)
 
 def _rebuild_hot_pools_from_buffers():
-    """Отбор «горячих» пулов из ohlc_buffers (без REST).
-    Запускается раз в WS_TICKERS_REFRESH_SEC (5 мин)."""
+    """Отбор «горячих» пулов из ohlc_buffers (без REST)."""
     cand_pool = []
     cons_pool = []
     dip_pool = []
@@ -2146,7 +2250,6 @@ def _rebuild_hot_pools_from_buffers():
                  len(wtdip_pool), len(bounce_pool))
 
 def update_ticker_subscription():
-    """Диффим WS-tickers подписку."""
     if not WS_TICKERS_ENABLED:
         return
     with HOT_PAIRS_LOCK:
@@ -2310,32 +2413,33 @@ def _build_df_with_indicators(buf):
         df["wt2"] = np.nan
     return df
 
-# ==================== v21.5.0: сбор всех валидных стратегий ====================
+# ==================== v21.6.0: also_valid в тихом режиме ====================
 def _collect_also_valid(df, symbol, lower, upper, primary_kind):
     """
-    Прогоняет все стратегии и возвращает список названий,
-    которые ДАЛИ БЫ сигнал, кроме primary.
-    Для логов: показывает пересечения.
+    v21.6.0: прогоняет все стратегии в ТИХОМ режиме — воронка не портится.
+    Возвращает список названий стратегий, которые тоже дали бы сигнал.
     """
-    also = []
-    if primary_kind != "bounce" and lower and upper:
-        s = evaluate_ws_range_bounce(df, symbol, lower, upper)
-        if s is not None:
-            also.append("bounce")
-            funnel_inc("bounce_total", -1)  # не считаем двойной раз
-    if primary_kind != "wtdip":
-        s = evaluate_ws_wt_dip(df, symbol)
-        if s is not None:
-            also.append("wt_dip")
-    if primary_kind != "dip":
-        s = evaluate_ws_dipbuy(df, symbol)
-        if s is not None:
-            also.append("rsi_dipbuy")
-    return also
+    _FUNNEL_SILENT.on = True
+    try:
+        also = []
+        if primary_kind != "bounce" and lower and upper:
+            s = evaluate_ws_range_bounce(df, symbol, lower, upper)
+            if s is not None:
+                also.append("bounce")
+        if primary_kind != "wtdip":
+            s = evaluate_ws_wt_dip(df, symbol)
+            if s is not None:
+                also.append("wt_dip")
+        if primary_kind != "dip":
+            s = evaluate_ws_dipbuy(df, symbol)
+            if s is not None:
+                also.append("rsi_dipbuy")
+        return also
+    finally:
+        _FUNNEL_SILENT.on = False
 
-# ==================== v21.5.0: единая форма алерта ====================
+# ==================== v21.6.0: единая форма алерта ====================
 def _format_entry_alert(sig, symbol, also_valid=None):
-    """Единый формат для всех входов."""
     strat = sig.get("strategy", "")
     titles = {
         "range_bounce": ("BOUNCE ВХОД", "🎯"),
@@ -2357,7 +2461,7 @@ def _format_entry_alert(sig, symbol, also_valid=None):
         lines.append(f"<i>Также валидны: {', '.join(also_valid)}</i>")
     return "\n".join(lines)
 
-# ==================== ОТКРЫТИЕ ПО ТИКУ (v21.5.0) ====================
+# ==================== ОТКРЫТИЕ ПО ТИКУ ====================
 def _open_on_tick(symbol, cur_price, source="tick"):
     if not WS_TICKERS_ENABLED:
         return
@@ -2434,9 +2538,9 @@ def _open_on_tick(symbol, cur_price, source="tick"):
             send_telegram(_format_entry_alert(sig, symbol, also))
         return
 
-    # cand / cons / sqz отключены в v21.5.0
+    # cand / cons / sqz отключены
     return
-  # ==================== WEBSOCKET: KLINE ====================
+    # ==================== WEBSOCKET: KLINE ====================
 def on_open(ws):
     logger.info("WS kline подключен. Подписка на %d пар (по %d)...",
                 len(PAIRS_WS), WS_SUBSCRIBE_CHUNK)
@@ -2490,15 +2594,10 @@ def extend_ws_subscription(extra_pairs):
         time.sleep(0.1)
     logger.info("WS-подписка расширена на %d пар", len(new))
 
-# ==================== v21.5.0: единый формат алерта выхода ====================
+# ==================== v21.6.0: единый формат алерта выхода ====================
 def _format_exit_alert(symbol, reason, exit_price, net_pnl_pct,
                        account_pnl_pct, size_fraction, suffix="",
                        source="WS"):
-    """
-    v21.5.0: все выходы в одном формате с двумя PnL:
-    - % сделки
-    - вклад в счёт
-    """
     icon = "🟢" if net_pnl_pct > 0 else "🔴"
     return (
         f"{icon} <b>ВЫХОД · {reason.upper()}</b> ({source}){suffix}\n"
@@ -2566,15 +2665,49 @@ def on_message(ws, message):
                             symbol, pos["entry_price"], exit_price,
                             "Stop-Loss", pos.get("strategy", "?"),
                             pos.get("entry_time"), size, frac, regime)
+                        # v21.6.0: определяем причину по режиму
+                        if pos.get("broke_out"):
+                            reason_tag = "Stop-Loss (после пробоя)"
+                        elif (pos.get("box_upper")
+                              and new_candle["close"]
+                                  >= pos["box_upper"] * 0.97):
+                            reason_tag = "Stop-Loss (у пробоя)"
+                        else:
+                            reason_tag = "Stop-Loss"
                         exit_messages.append(_format_exit_alert(
-                            symbol, "Stop-Loss", exit_price,
+                            symbol, reason_tag, exit_price,
                             net_pnl, acc_pnl, size, suffix="",
                             source="WS"))
                         pos.update({
                             "position": "closed",
                             "last_exit_ts": time.time(),
                             "last_exit_price": exit_price,
-                            "last_exit_reason": "stop-loss",
+                            "last_exit_reason": reason_tag.lower(),
+                        })
+                        state[symbol] = pos
+                        save_state(state)
+
+                    # v21.6.0: ложный пробой по моментальному тику
+                    # (быстрая реакция — не ждём scan-loop)
+                    elif (pos.get("broke_out")
+                          and pos.get("box_upper")
+                          and new_candle["close"]
+                              < pos["box_upper"]
+                                  * (1 - VOL_HOLD_FALSE_BREAK_PCT / 100)):
+                        exit_price = new_candle["close"]
+                        net_pnl, acc_pnl = log_trade(
+                            symbol, pos["entry_price"], exit_price,
+                            "Ложный пробой", pos.get("strategy", "?"),
+                            pos.get("entry_time"), size, frac, regime)
+                        exit_messages.append(_format_exit_alert(
+                            symbol, "Ложный пробой", exit_price,
+                            net_pnl, acc_pnl, size, suffix="",
+                            source="WS-тик"))
+                        pos.update({
+                            "position": "closed",
+                            "last_exit_ts": time.time(),
+                            "last_exit_price": exit_price,
+                            "last_exit_reason": "ложный пробой",
                         })
                         state[symbol] = pos
                         save_state(state)
@@ -2603,7 +2736,7 @@ def on_message(ws, message):
             elif isinstance(cache_entry, (int, float)):
                 level = cache_entry
 
-            # ===== Приоритеты: bounce → WT → RSI =====
+            # Приоритеты: bounce → WT → RSI
             sig = evaluate_ws_range_bounce(df, symbol, lower_level, level)
             primary = "bounce" if sig else None
             if sig is None:
@@ -2617,7 +2750,6 @@ def on_message(ws, message):
             if sig is None:
                 continue
 
-            # ===== also_valid для логов =====
             also = _collect_also_valid(
                 df, symbol, lower_level, level, primary) if primary else []
 
@@ -2774,7 +2906,7 @@ def tickers_refresh_loop():
             update_ticker_subscription()
         except Exception as e:
             logger.error("tickers_refresh_loop: %s", e)
-          # ==================== ФОНОВОЕ СКАНИРОВАНИЕ ====================
+            # ==================== ФОНОВОЕ СКАНИРОВАНИЕ ====================
 TIMEFRAME_PARAMS = {
     "15m": {"bybit_interval": "15",  "min_bars": 80,  "ema_fast": 9,  "ema_slow": 21},
     "1h":  {"bybit_interval": "60",  "min_bars": 80,  "ema_fast": 9,  "ema_slow": 21},
@@ -2946,7 +3078,7 @@ def background_scan_loop():
                                     "days": cons["days"],
                                 })
 
-                    # ===== УПРАВЛЕНИЕ ПОЗИЦИЕЙ (v21.5.0) =====
+                    # ===== УПРАВЛЕНИЕ ПОЗИЦИЕЙ (v21.6.0) =====
                     messages = []
                     time_stopped = False
                     with state_lock:
@@ -3009,6 +3141,12 @@ def background_scan_loop():
                                         f"Зафиксировано: <b>{net_pnl:+.2f}%</b>\n"
                                         f"Вклад в счёт: <b>{acc_pnl:+.3f}%</b>")
                                 if exit_now:
+                                    # v21.6.0: счётчик удержаний
+                                    if reason == "Ложный пробой":
+                                        funnel_inc("hold_false")
+                                    elif reason == "Слабый объём у пробоя":
+                                        funnel_inc("hold_weak")
+
                                     frac = (PARTIAL_TP_FRACTION
                                             if pos.get("partial_done") else 1.0)
                                     net_pnl, acc_pnl = log_trade(
@@ -3032,6 +3170,11 @@ def background_scan_loop():
                                         "last_exit_price": exit_price,
                                         "last_exit_reason": reason,
                                     })
+                                # v21.6.0: если держим у пробоя — считаем
+                                elif (pos.get("near_upper_bars", 0) > 0
+                                      and pos.get("last_vol_score", 0)
+                                          >= VOL_HOLD_SCORE_KEEP):
+                                    funnel_inc("hold_kept")
                                 state[pair] = pos
                                 save_state(state)
                     for msg in messages:
@@ -3088,7 +3231,7 @@ def background_scan_loop():
                     logger.error("Ошибка во втором проходе %s: %s", pair, e)
                     continue
 
-            # ========== Обновление breakout_cache ==========
+            # ========== Обновление breakout_cache (v21.6.0 fix A) ==========
             with breakout_cache_lock:
                 consolidation_list.sort(
                     key=lambda x: (-x["days"], x.get("vol_trend", 1.0)))
@@ -3098,8 +3241,10 @@ def background_scan_loop():
                         "upper": item["upper_level"],
                         "lower": item["lower_level"],
                         "days": item["days"],
+                        # v21.6.0 fix A: vol_trend сохраняется!
+                        "vol_trend": float(item.get("vol_trend", 1.0) or 1.0),
                     }
-            logger.info("Breakout-кэш: %d уровней",
+            logger.info("Breakout-кэш: %d уровней (upper+lower+vol_trend)",
                         len(breakout_cache))
 
             with breakout_cache_lock:
@@ -3138,7 +3283,7 @@ def background_scan_loop():
         except Exception as e:
             logger.critical("Критическая ошибка в фоне: %s", e)
             time.sleep(SCAN_INTERVAL_SECONDS)
-          # ==================== 🔍 ВОРОНКА ====================
+            # ==================== 🔍 ВОРОНКА ====================
 def _format_funnel(fs):
     lines = []
     lines.append(f"🔍 <b>ВОРОНКА</b> (баров: {fs.get('bars_processed', 0)})")
@@ -3157,14 +3302,18 @@ def _format_funnel(fs):
         f"→EMA {fs['wt_ema']}→зел {fs['wt_green']}"
         f"→BOTTOM {fs['wt_bottom']}")
     lines.append(
-        f"💥 SQZ-dip: OFF (отключён с v21.4.0)")
+        f"💥 SQZ-dip: OFF (отключён)")
+    lines.append(
+        f"🚀 HOLD: ✅ kept {fs['hold_kept']} · "
+        f"⚠️ weak {fs['hold_weak']} · "
+        f"❌ false {fs['hold_false']}")
     lines.append(
         f"⛔ PEAK-GUARD: {fs['peak_block']} · "
         f"🔧 BTC-блок: {fs['btc_block']} · "
         f"✅ Открыто: {fs['opened']}")
     return "\n".join(lines)
 
-# ==================== СТАТУС (v21.5.0) ====================
+# ==================== СТАТУС (v21.6.0) ====================
 def send_status(scan_summary, consolidation_list, dipbuy_candidates,
                 wtdip_candidates, bounce_candidates, found_buy, found_sell):
     with state_lock:
@@ -3204,7 +3353,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         cb_str += f" · сегодня {cb_day_acc:+.2f}%"
 
     header = [
-        f"📡 <b>СТАТУС v21.5.0 «FULL-FIX»</b> | <i>{now_str} UTC</i>",
+        f"📡 <b>СТАТУС v21.6.0 «VOLUME-AWARE-HOLD»</b> | <i>{now_str} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔹 Пар WS kline: <b>{len(PAIRS_WS)}</b> · Тренд 3/3: <b>{q3}</b>",
         f"🔹 1D-bull (EMA50&gt;200): <b>{bull_1d}</b> пар",
@@ -3223,7 +3372,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
     header += _format_funnel(funnel_snap).split("\n")
     header.append("━━━━━━━━━━━━━━━━━━━━━")
 
-    # ===== Позиции =====
+    # ===== Позиции (v21.6.0: с режимом) =====
     pos_lines = []
     if open_snapshot:
         for pair, pos in open_snapshot:
@@ -3259,6 +3408,23 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
             also = pos.get("also_valid") or []
             if also:
                 line += f" · also:{','.join(also)}"
+
+            # v21.6.0: показываем режим у пробоя / после пробоя
+            box_upper = pos.get("box_upper")
+            if box_upper and entry > 0:
+                cur = entry
+                buf = ohlc_buffers.get(pair)
+                if buf and len(buf) > 0:
+                    cur = float(buf[-1].get("close", entry))
+                if pos.get("broke_out"):
+                    line += " · 🚀 после пробоя"
+                elif cur >= box_upper * 0.97:
+                    vs = pos.get("last_vol_score", 0.0)
+                    nb = pos.get("near_upper_bars", 0)
+                    keep = ("держим" if vs >= VOL_HOLD_SCORE_KEEP
+                            else "наблюдаем")
+                    line += (f" · ⚡ у пробоя ({keep}, "
+                             f"vol={vs:.2f}, {nb}б)")
             pos_lines.append(line)
     else:
         pos_lines.append("💰 Позиций нет")
@@ -3279,7 +3445,11 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         lvl = item.get("upper_level", 0)
         if cur <= 0 or lvl <= 0:
             return 999
-        return max((lvl - cur) / cur * 100, 0)
+        dist = (lvl - cur) / cur * 100
+        # v21.6.0: пробитые — в конец списка
+        if dist < 0:
+            return 10_000 + abs(dist)
+        return dist
 
     consolidation_list = sorted(consolidation_list, key=_hot_score)
     dipbuy_candidates = sorted(dipbuy_candidates,
@@ -3369,7 +3539,10 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
             dist_pct = (lvl - cur) / cur * 100
         else:
             dist_pct = 999
-        if dist_pct <= HOT_DIST_PCT_1:
+        # v21.6.0: пробитые отдельно
+        if dist_pct < 0:
+            mark = "🚀"
+        elif dist_pct <= HOT_DIST_PCT_1:
             mark = "🔥"
         elif dist_pct <= HOT_DIST_PCT_2:
             mark = "⚡"
@@ -3378,9 +3551,11 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         else:
             mark = ""
         dist_txt = f"({dist_pct:.1f}%)" if dist_pct < 999 else ""
+        vt = item.get("vol_trend", 1.0)
+        vt_txt = f" 📊{vt:.2f}×" if vt >= 1.1 else ""
         return (f"{mark}{i}.{name} {item['days']}д "
                 f"{item['range_pct']:.0f}% ADX{item['adx']:.0f}{dry} "
-                f"🚀{lvl:.6g} 💰{cur:.6g}{dist_txt}")
+                f"🚀{lvl:.6g} 💰{cur:.6g}{dist_txt}{vt_txt}")
 
     def dip_line(i, s, with_link):
         name = tv_link(s["pair"]) if with_link else s["pair"]
@@ -3407,19 +3582,25 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
                 f"upper={upper:.6g} 💰{cur:.6g} (+{dist:.1f}%) "
                 f"RSI{rsi_now:.0f}")
 
-    # ===== Footer (v21.5.0: правильное BREAKEVEN) =====
+    # ===== Footer (v21.6.0) =====
     footer = [
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔄 Следующий статус через 2 ч · лимиты {MAX_OPEN_POSITIONS} поз / "
         f"{MAX_TRADES_PER_HOUR} в час",
-        f"🔒 HOLD-TO-REVERSAL: BE +{BREAKEVEN_TRIGGER_ATR_FAST}×R, "
+        f"🔒 HOLD: BE +{BREAKEVEN_TRIGGER_ATR_FAST}×R, "
         f"без partial TP, без fixed TP",
-        f"🚪 Выход: EMA-кросс 4h / трейлинг / SL / time-stop {TIME_STOP_DAYS}д",
-        f"🎯 Все стратегии ищут ДНО. Никаких пробоев и momentum.",
-        f"🔧 BTC-фильтр: -{abs(BTC_DROP_6H_PCT):.0f}%/6ч или "
-        f"ADX&gt;{BTC_ADX_BLOCK_THRESHOLD:.0f}",
-        f"🛡 Peak Guard — реальный фильтр · 🚫 SQZ-dip off",
-        f"💎 RSI-dip · 🌊 WT-dip · 🎯 BOUNCE · /funnel · /stats · /reset",
+        f"🚀 VOL-HOLD: у пробоя ≥{VOL_HOLD_SCORE_KEEP} держим, "
+        f"<{VOL_HOLD_SCORE_WEAK}+🔴 выходим",
+        f"🚀 после пробоя: трейлинг {VOL_HOLD_AFTER_BREAK_TRAIL}×R, "
+        f"ложный −{VOL_HOLD_FALSE_BREAK_PCT}%",
+        f"🚪 Выход: EMA-кросс 4h / трейлинг / SL / "
+        f"time-stop {TIME_STOP_DAYS}д",
+        f"🎯 Все стратегии ищут ДНО. Пробои удерживаем по объёму.",
+        f"🔧 BTC: -{abs(BTC_DROP_6H_PCT):.0f}%/6ч или "
+        f"ADX&gt;{BTC_ADX_BLOCK_THRESHOLD:.0f} · "
+        f"🛡 Peak Guard · 🚫 SQZ-dip off",
+        f"💎 RSI-dip · 🌊 WT-dip · 🎯 BOUNCE · "
+        f"/funnel · /stats · /reset",
     ]
 
     def build(with_links, max_cand, max_cons, max_dip, max_wtdip, max_bounce):
@@ -3494,11 +3675,15 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         text = build(True, 5, 5, 3, 3, 3)
 
     _send_to_all_one(text)
-    logger.info("Статус v21.5.0: %d симв · bounce=%d dip=%d wt=%d "
-                "cons=%d · tickers=%d",
+    logger.info("Статус v21.6.0: %d симв · bounce=%d dip=%d wt=%d "
+                "cons=%d · tickers=%d · hold_kept=%d hold_weak=%d "
+                "hold_false=%d",
                 len(text), len(bounce_candidates),
                 len(dipbuy_candidates), len(wtdip_candidates),
-                len(consolidation_list), tickers_count)
+                len(consolidation_list), tickers_count,
+                funnel_snap.get("hold_kept", 0),
+                funnel_snap.get("hold_weak", 0),
+                funnel_snap.get("hold_false", 0))
     funnel_reset()
 
 # ==================== MAIN ====================
@@ -3509,7 +3694,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v21.5.0 «FULL-FIX» (Bybit) ...")
+    logger.info("Запуск бота v21.6.0 «VOLUME-AWARE-HOLD» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
@@ -3527,7 +3712,7 @@ if __name__ == "__main__":
                 else:
                     pos["atr_ref"] = pos.get("entry_price", 0) * 0.01
 
-            # v21.5.0: миграция старых позиций — заполняем r_unit_price
+            # Миграция r_unit_price
             if "r_unit_price" not in pos or pos["r_unit_price"] <= 0:
                 entry = pos.get("entry_price", 0)
                 stop = pos.get("stop", 0)
@@ -3545,6 +3730,12 @@ if __name__ == "__main__":
             pos.setdefault("hold_mode", True)
             pos.setdefault("confidence", 1.0)
             pos.setdefault("also_valid", [])
+            # v21.6.0: миграция 3-режимной логики
+            pos.setdefault("box_upper", None)
+            pos.setdefault("box_vol_trend", 1.0)
+            pos.setdefault("near_upper_bars", 0)
+            pos.setdefault("last_vol_score", 0.0)
+            pos.setdefault("broke_out", False)
     save_state(state)
 
     refresh_market_context()
@@ -3599,7 +3790,7 @@ if __name__ == "__main__":
     threading.Thread(target=tickers_refresh_loop, daemon=True).start()
 
     _send_to_all_one(
-        f"🟢 <b>СКАНЕР v21.5.0 «FULL-FIX» ЗАПУЩЕН</b>\n"
+        f"🟢 <b>СКАНЕР v21.6.0 «VOLUME-AWARE-HOLD» ЗАПУЩЕН</b>\n"
         f"📡 WS kline: {len(PAIRS_WS)} пар "
         f"(подписка чанками по {WS_SUBSCRIBE_CHUNK})\n"
         f"⚡ WS tickers: {WS_TICKERS_QUOTA_CAND} cand + "
@@ -3607,13 +3798,21 @@ if __name__ == "__main__":
         f"{WS_TICKERS_QUOTA_DIP} dip + {WS_TICKERS_QUOTA_WT} wt + "
         f"{WS_TICKERS_QUOTA_BOUNCE} bounce "
         f"(макс {WS_TICKERS_MAX_PAIRS})\n"
-        f"🎯 BOUNCE: отскок от дна боковика (≤{RANGE_BOUNCE_ZONE_PCT}%)\n"
+        f"🎯 BOUNCE: отскок от дна (≤{RANGE_BOUNCE_ZONE_PCT}%) + "
+        f"оценка накопления (vol_trend)\n"
         f"💎 RSI-DIPBUY: RSI≤{DIPBUY_RSI_ZONE} × "
         f"{DIPBUY_RSI_MIN_BARS}св + объём (без BB)\n"
         f"🌊 WT-DIP: WaveTrend кросс внизу (без EMA)\n"
-        f"🔒 HOLD-TO-REVERSAL: BE +{BREAKEVEN_TRIGGER_ATR_FAST}×R, "
+        f"🔒 HOLD: BE +{BREAKEVEN_TRIGGER_ATR_FAST}×R, "
         f"без partial TP\n"
-        f"🚪 Выход: EMA-кросс 4h / трейлинг / SL / "
+        f"🚀 VOL-HOLD (3 режима):\n"
+        f"   • у пробоя (≥{VOL_HOLD_NEAR_UPPER_PCT}% от upper): "
+        f"vol_score ≥{VOL_HOLD_SCORE_KEEP} держим\n"
+        f"   • vol_score <{VOL_HOLD_SCORE_WEAK} + красная 4h → выход\n"
+        f"   • после пробоя: трейлинг "
+        f"{VOL_HOLD_AFTER_BREAK_TRAIL}×R, "
+        f"ложный −{VOL_HOLD_FALSE_BREAK_PCT}%\n"
+        f"🚪 Стандартный выход: EMA-кросс 4h / трейлинг / SL / "
         f"time-stop {TIME_STOP_DAYS}д\n"
         f"🛡 Peak Guard — реальный фильтр\n"
         f"📊 Risk: {RISK_PER_TRADE_PCT}%/сделку от ${ACCOUNT_SIZE_USD:.0f} · "
