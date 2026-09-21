@@ -2,24 +2,24 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
-BYBIT SCANNER v21.6.0 «VOLUME-AWARE-HOLD» — ЕДИНЫЙ ФАЙЛ VPS
+BYBIT SCANNER v21.6.1 «VOLUME-AWARE-HOLD + WS-FIX» — ЕДИНЫЙ ФАЙЛ VPS
 WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
 Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
 
-НОВОЕ В v21.6.0 (относительно v21.5.0):
-• 🚀 3-режимная логика удержания позиции:
-    ДНО       — обычная логика (BE, EMA-кросс, трейлинг 2R)
-    У ПРОБОЯ  — цена ≥ upper×0.97: при vol_score ≥ 0.6 EMA-кросс
-                игнорируется, при vol_score < 0.4 + красная 4h — выход
-    ПОСЛЕ     — cur > upper: трейлинг 2×R под high,
-                возврат ниже upper−0.5% → «Ложный пробой»
-• 📊 VOLUME-AWARE оценка по 4h: vol_ratio, ADX slope, trend_up, MACD.
+НОВОЕ В v21.6.1 (относительно v21.6.0):
+• 🐛 FIX: отключён встроенный WS-ping (websocket-client) для kline и tickers.
+  Причина: Bybit не отвечает на низкоуровневый WS-PING, отвечает только
+  на JSON {"op":"ping"} — наш кастомный pinger/tickers_pinger.
+  Было: ping/pong timed out → goodbye → reconnect каждые 30 сек.
+  Стало: соединения держатся стабильно через JSON-ping.
+
+ВСЁ ИЗ v21.6.0:
+• 🚀 3-режимная логика удержания: дно / у пробоя / после пробоя.
+• 📊 VOLUME-AWARE оценка по 4h (vol_ratio, ADX, trend, MACD).
 • 🌊 Оценка накопления в боковике (vol_trend) — бонус/штраф к скору bounce.
 • 🛡 Флаг broke_out — фиксирует факт пробоя для проверки ложного пробоя.
-• ⚡ Отображение режима в статусе: «⚡ у пробоя (держим, vol=0.72)»
 • 🐛 FIX: breakout_cache сохраняет vol_trend.
 • 🐛 FIX: сброс near_upper_bars при уходе от upper.
-• Миграция старых позиций: добавляет box_upper, broke_out и др.
 ==============================================================================
 """
 import json
@@ -42,7 +42,6 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 BASE_URL = "https://api.bybit.com/v5/market"
 WS_URL = "wss://stream.bybit.com/v5/public/spot"
 
-# --- аккаунт для risk/CB ---
 ACCOUNT_SIZE_USD = 10_000.0
 
 TOP_N = 200
@@ -70,7 +69,6 @@ WS_EXTRA_SYMBOLS = 50
 WS_SUBSCRIBE_CHUNK = 10
 WS_SUBSCRIBE_PAUSE = 0.15
 
-# --- BTC-ФИЛЬТР ---
 BTC_CONTEXT_ENABLED = True
 BTC_CONTEXT_TTL = 300
 BTC_DROP_6H_PCT = -10.0
@@ -80,7 +78,6 @@ BTC_STRONG_MIN_TREND_SCORE = 3
 BTC_STRONG_MIN_SCORE = 8
 BTC_STRONG_SIZE_MULT = 0.5
 
-# --- CIRCUIT BREAKER ---
 CB_MAX_CONSEC_LOSSES = 4
 CB_PAUSE_SECONDS = 6 * 3600
 CB_DAILY_LOSS_PCT = 3.0
@@ -101,15 +98,12 @@ SECTOR_MAP = {
     "FIL": "Storage", "AR": "Storage",
 }
 
-# --- RISK ---
 RISK_PER_TRADE_PCT = 1.0
 MAX_PORTFOLIO_RISK_PCT = 6.0
 
-# --- КОМИССИИ ---
 FEE_PCT = 0.25
 SLIPPAGE_PCT = 0.05
 
-# --- ATR-МУЛЬТИПЛИКАТОРЫ ---
 ATR_MULT_SL = 3.0
 ATR_MULT_TP = 6.0
 PARTIAL_TP_ATR = 3.0
@@ -130,7 +124,6 @@ STATUS_ADX_MIN, STATUS_ADX_MAX = 18, 55
 STATUS_MIN_PRICE = 0.0001
 STATUS_READY_SCORE = 3
 
-# --- 🛡 PEAK-GUARD ---
 PEAK_GUARD_ENABLED = True
 PEAK_LOOKBACK_CANDLES = 20
 PEAK_MAX_POSITION_PCT = 85
@@ -138,12 +131,10 @@ PEAK_MIN_DIST_TO_MAX_PCT = 1.5
 PEAK_MAX_RSI = 70
 PEAK_MAX_DRIFT_PCT = 1.0
 
-# --- ДНЕВНОЙ РЕЖИМ ---
 DAILY_REGIME_FILTER_ENABLED = True
 DAILY_REGIME_BLOCK_BELOW_SCORE = 7
 DAILY_REGIME_FETCH_BARS = 260
 
-# --- 💎 RSI DIP-BUY ---
 DIPBUY_ENABLED = True
 DIPBUY_RSI_ZONE = 35
 DIPBUY_RSI_MIN_BARS = 3
@@ -158,12 +149,10 @@ DIPBUY_BB_PERIOD = 20
 DIPBUY_BB_STD = 2.0
 DIPBUY_LOG_REJECTS = True
 
-# --- DIP-FIRST ---
 BOTTOM_FILTER_ENABLED = True
 BOTTOM_FILTER_PCT = 0.50
 BOTTOM_FILTER_LOOKBACK_BARS = 96
 
-# --- 🌊 WAVETREND ---
 WT_ENABLED = True
 WT_N1 = 10
 WT_N2 = 21
@@ -180,7 +169,6 @@ WT_DIP_TP_ATR = 5.0
 WT_HOT_RSI_MIN = 25
 WT_HOT_RSI_MAX = 55
 
-# --- 💥 SQUEEZE MOMENTUM ---
 SQZ_ENABLED = True
 SQZ_BB_LEN = 20
 SQZ_BB_MULT = 2.0
@@ -196,7 +184,6 @@ SQZ_DIP_VOL_MIN = 1.2
 SQZ_DIP_RSI_RISING = True
 SQZ_DIP_CLOSE_ABOVE_EMA9 = True
 
-# --- 🎯 RANGE-BOUNCE ---
 RANGE_BOUNCE_ENABLED = True
 RANGE_BOUNCE_ZONE_PCT = 4.0
 RANGE_BOUNCE_VOL_MULT = 1.1
@@ -205,25 +192,22 @@ RANGE_BOUNCE_SL_PCT = 0.5
 RANGE_BOUNCE_MIN_RR = 1.5
 RANGE_BOUNCE_HOT_ZONE_PCT = 7.0
 
-# --- 🔒 HOLD-TO-REVERSAL ---
 HOLD_MODE_ENABLED = True
 BREAKEVEN_TRIGGER_ATR_FAST = 0.5
 NO_PARTIAL_TP = True
 NO_FIXED_TP = True
 
 # --- 🚀 VOLUME-AWARE HOLD (v21.6.0) ---
-# 3 режима позиции: дно → у пробоя → после пробоя
 VOL_HOLD_ENABLED = True
-VOL_HOLD_NEAR_UPPER_PCT = 3.0       # цена ≥ upper×0.97 = «у пробоя»
-VOL_HOLD_SCORE_KEEP = 0.60          # vol_score ≥ 0.6 → держим, EMA-кросс игнор
-VOL_HOLD_SCORE_WEAK = 0.40          # vol_score < 0.4 + красная 4h → выход
-# Внимание: check_exit вызывается из scan-loop раз в 2 часа,
-# а НЕ на каждой 4h-свече. Поэтому 12 «баров» ≈ 24 часа реального времени.
+VOL_HOLD_NEAR_UPPER_PCT = 3.0
+VOL_HOLD_SCORE_KEEP = 0.60
+VOL_HOLD_SCORE_WEAK = 0.40
+# Внимание: check_exit вызывается из scan-loop раз в 2 часа.
+# 12 «баров» ≈ 24 часа реального времени.
 VOL_HOLD_MAX_BARS_NEAR = 12
-VOL_HOLD_AFTER_BREAK_TRAIL = 2.0    # после пробоя — трейлинг 2×R
-VOL_HOLD_FALSE_BREAK_PCT = 0.5      # ушли ниже upper на 0.5% → ложный пробой
+VOL_HOLD_AFTER_BREAK_TRAIL = 2.0
+VOL_HOLD_FALSE_BREAK_PCT = 0.5
 
-# --- ПОРОГИ БОКОВИКОВ ---
 HOT_DIST_PCT_1 = 1.0
 HOT_DIST_PCT_2 = 3.0
 HOT_DIST_PCT_3 = 5.0
@@ -234,7 +218,6 @@ MAX_SHOW_DIPBUY = 5
 MAX_SHOW_WTDIP = 5
 MAX_SHOW_BOUNCE = 10
 
-# --- ⚡ WS-REALTIME-HOT ---
 WS_TICKERS_ENABLED = True
 WS_TICKERS_MAX_PAIRS = 50
 WS_TICKERS_QUOTA_CAND = 15
@@ -284,28 +267,22 @@ logging.basicConfig(
 logger = logging.getLogger("bybit-scanner")
 # ==================== 🔍 DEBUG-FUNNEL ====================
 FUNNEL = {
-    # 🎯 Range-Bounce
     "bounce_total": 0, "bounce_zone": 0, "bounce_rsi": 0,
     "bounce_green": 0, "bounce_vol": 0, "bounce_rr": 0,
-    # 💎 RSI dip
     "dip_total": 0, "dip_bull": 0, "dip_zone": 0, "dip_rising": 0,
     "dip_green": 0, "dip_bb": 0, "dip_vol": 0, "dip_ema": 0,
-    # 🌊 WT-dip
     "wt_total": 0, "wt_bull": 0, "wt_rsi": 0, "wt_cross": 0,
     "wt_bottom": 0, "wt_ema": 0, "wt_green": 0,
-    # 💥 SQZ-dip
     "sqzdip_total": 0, "sqzdip_bull": 0, "sqzdip_release": 0,
     "sqzdip_rsi": 0, "sqzdip_green": 0, "sqzdip_vol": 0, "sqzdip_bottom": 0,
-    # Общие
     "peak_block": 0, "btc_block": 0, "opened": 0,
     "bars_processed": 0,
-    # v21.6.0: удержания
-    "hold_kept": 0,      # «держим» у пробоя
-    "hold_weak": 0,      # «слабый объём у пробоя»
-    "hold_false": 0,     # «ложный пробой»
+    "hold_kept": 0,
+    "hold_weak": 0,
+    "hold_false": 0,
 }
 FUNNEL_LOCK = threading.Lock()
-_FUNNEL_SILENT = threading.local()   # v21.6.0: тихий режим для also_valid
+_FUNNEL_SILENT = threading.local()
 
 def funnel_inc(key, n=1):
     if getattr(_FUNNEL_SILENT, "on", False):
@@ -760,13 +737,13 @@ def tp_label():
     return "REF" if NO_FIXED_TP else "TP"
 
 HELP_TEXT = (
-    "📡 <b>Bybit Scanner v21.6.0 «VOLUME-AWARE-HOLD» — справка</b>\n"
+    "📡 <b>Bybit Scanner v21.6.1 «VOLUME-AWARE-HOLD + WS-FIX» — справка</b>\n"
     "Все стратегии ищут дно.\n"
     "🎯 RANGE-BOUNCE: отскок от дна боковика (≤4%).\n"
     "💎 RSI-DIPBUY: RSI≤35 × 3св → отскок + объём + 1D bull.\n"
     "🌊 WT-DIP: WaveTrend кросс внизу (без EMA-фильтра).\n"
     "🔒 HOLD-TO-REVERSAL: BE +0.5×R, без partial TP.\n"
-    "🚀 VOLUME-AWARE-HOLD (v21.6.0):\n"
+    "🚀 VOLUME-AWARE-HOLD:\n"
     "   • у пробоя (≥ upper×0.97): vol_score ≥ 0.6 → держим\n"
     "   • vol_score < 0.4 + красная 4h → выход\n"
     "   • после пробоя → трейлинг 2×R, ложный пробой −0.5%\n"
@@ -775,6 +752,7 @@ HELP_TEXT = (
     "🔧 BTC-фильтр: -10%/6ч или ADX>55. dip/bounce обходят.\n"
     "🛡 Peak Guard: реальный входной фильтр.\n"
     "💥 SQZ-dip отключён (убытки).\n"
+    "🐛 FIX v21.6.1: WS-ping только через JSON (Bybit).\n"
     "Команды: /stop, /help, /funnel, /stats, /reset."
 )
 
@@ -931,7 +909,6 @@ def _format_stats():
         losses = total - wins
         sum_net = sum(t.get("net_pnl_pct", 0) for t in trades)
         sum_acc = sum(t.get("account_pnl_pct", 0) for t in trades)
-        # разбивка по стратегиям
         by_strat = {}
         for t in trades:
             s = t.get("strategy", "?")
@@ -1205,7 +1182,7 @@ def detect_consolidation(df_daily):
         "lower_level": float(window["low"].min()),
         "vol_trend": round(vol_trend, 2),
     }
-    # ==================== ВЫХОДЫ (v21.6.0) ====================
+    # ==================== ВЫХОДЫ (v21.6.1) ====================
 def _get_r_unit(pos):
     """R-unit из позиции. r_unit_price = entry - stop при входе."""
     entry = pos.get("entry_price") or 0.0
@@ -1766,7 +1743,7 @@ def evaluate_ws_range_bounce(df, symbol, lower_level, upper_level):
         "box_vol_trend": box_vol_trend,
     }
 
-# ==================== 💎 RSI DIP-BUY (v21.6.0) ====================
+# ==================== 💎 RSI DIP-BUY (v21.6.1) ====================
 def evaluate_ws_dipbuy(df, symbol):
     funnel_inc("dip_total")
     if not DIPBUY_ENABLED or len(df) < MIN_BARS + 1:
@@ -1872,7 +1849,7 @@ def evaluate_ws_dipbuy(df, symbol):
         "hold_mode": True,
     }
 
-# ==================== 🌊 WT-DIP (v21.6.0) ====================
+# ==================== 🌊 WT-DIP (v21.6.1) ====================
 def evaluate_ws_wt_dip(df, symbol):
     funnel_inc("wt_total")
     if not WT_ENABLED or not WT_DIP_STRATEGY_ENABLED:
@@ -2013,7 +1990,7 @@ def evaluate_ws_sqz_dip(df, symbol):
         "hold_mode": True,
     }
 
-# ==================== ОТКРЫТИЕ ПОЗИЦИИ (v21.6.0) ====================
+# ==================== ОТКРЫТИЕ ПОЗИЦИИ (v21.6.1) ====================
 def open_position(symbol, sig, closed_start, also_valid=None):
     btc_blocked_raw = not market_allows_longs()
     bypassed = _signal_bypasses_btc(sig)
@@ -2413,7 +2390,7 @@ def _build_df_with_indicators(buf):
         df["wt2"] = np.nan
     return df
 
-# ==================== v21.6.0: also_valid в тихом режиме ====================
+# ==================== also_valid в тихом режиме ====================
 def _collect_also_valid(df, symbol, lower, upper, primary_kind):
     """
     v21.6.0: прогоняет все стратегии в ТИХОМ режиме — воронка не портится.
@@ -2438,7 +2415,7 @@ def _collect_also_valid(df, symbol, lower, upper, primary_kind):
     finally:
         _FUNNEL_SILENT.on = False
 
-# ==================== v21.6.0: единая форма алерта ====================
+# ==================== единая форма алерта ====================
 def _format_entry_alert(sig, symbol, also_valid=None):
     strat = sig.get("strategy", "")
     titles = {
@@ -2560,6 +2537,8 @@ def on_open(ws):
     threading.Thread(target=pinger, args=(ws,), daemon=True).start()
 
 def pinger(ws):
+    """v21.6.1: единственный пинг — JSON {"op":"ping"} каждые 20 сек.
+    Встроенный WS-ping отключён (см. run_websocket)."""
     while True:
         time.sleep(20)
         try:
@@ -2594,7 +2573,7 @@ def extend_ws_subscription(extra_pairs):
         time.sleep(0.1)
     logger.info("WS-подписка расширена на %d пар", len(new))
 
-# ==================== v21.6.0: единый формат алерта выхода ====================
+# ==================== единый формат алерта выхода ====================
 def _format_exit_alert(symbol, reason, exit_price, net_pnl_pct,
                        account_pnl_pct, size_fraction, suffix="",
                        source="WS"):
@@ -2647,7 +2626,7 @@ def on_message(ws, message):
             else:
                 buf.append(new_candle)
 
-            # ===== Мгновенные выходы по SL =====
+            # ===== Мгновенные выходы по SL / ложному пробою =====
             exit_messages = []
             with state_lock:
                 pos = state.get(symbol, {})
@@ -2665,7 +2644,7 @@ def on_message(ws, message):
                             symbol, pos["entry_price"], exit_price,
                             "Stop-Loss", pos.get("strategy", "?"),
                             pos.get("entry_time"), size, frac, regime)
-                        # v21.6.0: определяем причину по режиму
+                        # v21.6.1: определяем причину по режиму
                         if pos.get("broke_out"):
                             reason_tag = "Stop-Loss (после пробоя)"
                         elif (pos.get("box_upper")
@@ -2687,8 +2666,7 @@ def on_message(ws, message):
                         state[symbol] = pos
                         save_state(state)
 
-                    # v21.6.0: ложный пробой по моментальному тику
-                    # (быстрая реакция — не ждём scan-loop)
+                    # v21.6.1: ложный пробой по моментальному тику
                     elif (pos.get("broke_out")
                           and pos.get("box_upper")
                           and new_candle["close"]
@@ -2773,6 +2751,7 @@ def on_close(ws, close_status_code, close_msg):
     logger.warning("WS закрыт (%s). Переподключение...", close_status_code)
     time.sleep(5)
 
+# ==================== v21.6.1: ГЛАВНЫЙ ФИКС — отключён встроенный WS-ping
 def run_websocket():
     global WS_APP
     while True:
@@ -2784,12 +2763,17 @@ def run_websocket():
             on_close=on_close,
         )
         try:
+            # v21.6.1 FIX: Bybit не отвечает на низкоуровневый WS-PING.
+            # Используем только JSON {"op":"ping"} через pinger-поток.
+            # ping_interval=0 → встроенный ping выключен.
             WS_APP.run_forever(ping_interval=0, ping_timeout=None)
         except Exception as e:
             logger.error("WS критическая ошибка: %s", e)
         time.sleep(5)
 
 def watchdog_loop():
+    """v21.6.1: следит за тишиной. Если 90 сек нет НИ ОДНОГО сообщения
+    от Bybit — перезапускаем соединение. Это не про ping, а про данные."""
     global last_ws_msg_ts
     while True:
         time.sleep(30)
@@ -2823,6 +2807,7 @@ def on_tickers_open(ws):
     threading.Thread(target=tickers_pinger, args=(ws,), daemon=True).start()
 
 def tickers_pinger(ws):
+    """v21.6.1: единственный ping для tickers — JSON {"op":"ping"}."""
     while True:
         time.sleep(20)
         try:
@@ -2878,6 +2863,7 @@ def on_tickers_close(ws, close_status_code, close_msg):
     WS_TICKERS_CONNECTED.clear()
     time.sleep(5)
 
+# ==================== v21.6.1: ГЛАВНЫЙ ФИКС — отключён встроенный WS-ping
 def run_tickers_websocket():
     global WS_TICKERS_APP
     while True:
@@ -2889,6 +2875,8 @@ def run_tickers_websocket():
             on_close=on_tickers_close,
         )
         try:
+            # v21.6.1 FIX: то же самое — только JSON-пинг через
+            # tickers_pinger. Встроенный WS-ping отключён.
             WS_TICKERS_APP.run_forever(ping_interval=0, ping_timeout=None)
         except Exception as e:
             logger.error("WS tickers критическая ошибка: %s", e)
@@ -3078,7 +3066,7 @@ def background_scan_loop():
                                     "days": cons["days"],
                                 })
 
-                    # ===== УПРАВЛЕНИЕ ПОЗИЦИЕЙ (v21.6.0) =====
+                    # ===== УПРАВЛЕНИЕ ПОЗИЦИЕЙ (v21.6.1) =====
                     messages = []
                     time_stopped = False
                     with state_lock:
@@ -3141,7 +3129,7 @@ def background_scan_loop():
                                         f"Зафиксировано: <b>{net_pnl:+.2f}%</b>\n"
                                         f"Вклад в счёт: <b>{acc_pnl:+.3f}%</b>")
                                 if exit_now:
-                                    # v21.6.0: счётчик удержаний
+                                    # v21.6.1: счётчик удержаний
                                     if reason == "Ложный пробой":
                                         funnel_inc("hold_false")
                                     elif reason == "Слабый объём у пробоя":
@@ -3170,7 +3158,7 @@ def background_scan_loop():
                                         "last_exit_price": exit_price,
                                         "last_exit_reason": reason,
                                     })
-                                # v21.6.0: если держим у пробоя — считаем
+                                # v21.6.1: если держим у пробоя — считаем
                                 elif (pos.get("near_upper_bars", 0) > 0
                                       and pos.get("last_vol_score", 0)
                                           >= VOL_HOLD_SCORE_KEEP):
@@ -3231,7 +3219,7 @@ def background_scan_loop():
                     logger.error("Ошибка во втором проходе %s: %s", pair, e)
                     continue
 
-            # ========== Обновление breakout_cache (v21.6.0 fix A) ==========
+            # ========== Обновление breakout_cache (v21.6.1 fix A) ==========
             with breakout_cache_lock:
                 consolidation_list.sort(
                     key=lambda x: (-x["days"], x.get("vol_trend", 1.0)))
@@ -3241,7 +3229,7 @@ def background_scan_loop():
                         "upper": item["upper_level"],
                         "lower": item["lower_level"],
                         "days": item["days"],
-                        # v21.6.0 fix A: vol_trend сохраняется!
+                        # v21.6.1 fix A: vol_trend сохраняется для bounce!
                         "vol_trend": float(item.get("vol_trend", 1.0) or 1.0),
                     }
             logger.info("Breakout-кэш: %d уровней (upper+lower+vol_trend)",
@@ -3313,7 +3301,7 @@ def _format_funnel(fs):
         f"✅ Открыто: {fs['opened']}")
     return "\n".join(lines)
 
-# ==================== СТАТУС (v21.6.0) ====================
+# ==================== СТАТУС (v21.6.1) ====================
 def send_status(scan_summary, consolidation_list, dipbuy_candidates,
                 wtdip_candidates, bounce_candidates, found_buy, found_sell):
     with state_lock:
@@ -3353,7 +3341,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         cb_str += f" · сегодня {cb_day_acc:+.2f}%"
 
     header = [
-        f"📡 <b>СТАТУС v21.6.0 «VOLUME-AWARE-HOLD»</b> | <i>{now_str} UTC</i>",
+        f"📡 <b>СТАТУС v21.6.1 «VOL-HOLD + WS-FIX»</b> | <i>{now_str} UTC</i>",
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔹 Пар WS kline: <b>{len(PAIRS_WS)}</b> · Тренд 3/3: <b>{q3}</b>",
         f"🔹 1D-bull (EMA50&gt;200): <b>{bull_1d}</b> пар",
@@ -3372,7 +3360,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
     header += _format_funnel(funnel_snap).split("\n")
     header.append("━━━━━━━━━━━━━━━━━━━━━")
 
-    # ===== Позиции (v21.6.0: с режимом) =====
+    # ===== Позиции с режимом (v21.6.1) =====
     pos_lines = []
     if open_snapshot:
         for pair, pos in open_snapshot:
@@ -3409,7 +3397,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
             if also:
                 line += f" · also:{','.join(also)}"
 
-            # v21.6.0: показываем режим у пробоя / после пробоя
+            # v21.6.1: режим у пробоя / после пробоя
             box_upper = pos.get("box_upper")
             if box_upper and entry > 0:
                 cur = entry
@@ -3429,7 +3417,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
     else:
         pos_lines.append("💰 Позиций нет")
 
-    # ===== Кандидаты (для отображения) =====
+    # ===== Кандидаты =====
     valid_calls = [
         s for s in scan_summary
         if s["trend_score"] >= 2
@@ -3446,7 +3434,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         if cur <= 0 or lvl <= 0:
             return 999
         dist = (lvl - cur) / cur * 100
-        # v21.6.0: пробитые — в конец списка
+        # v21.6.1: пробитые — в конец списка
         if dist < 0:
             return 10_000 + abs(dist)
         return dist
@@ -3465,7 +3453,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
     display_wtdip = wtdip_candidates[:MAX_SHOW_WTDIP]
     display_bounce = bounce_candidates[:MAX_SHOW_BOUNCE]
 
-    # ===== Обновление HOT-пулов для WS-подписок =====
+    # ===== Обновление HOT-пулов =====
     cand_pool = [s for s in valid_calls
                  if abs(s.get("macd_gap_pct", 999)) <= WS_HOT_NEAR_CROSS_PCT]
     cons_pool = []
@@ -3490,7 +3478,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         HOT_PAIRS_CACHE["consolidations_pool"] = list(cons_pool)
         HOT_PAIRS_CACHE["ts"] = time.time()
 
-    # ===== Форматтеры строк =====
+    # ===== Форматтеры =====
     def cand_line(i, s, with_link):
         gap = s.get("macd_gap_pct", 0)
         if gap < 0:
@@ -3539,7 +3527,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
             dist_pct = (lvl - cur) / cur * 100
         else:
             dist_pct = 999
-        # v21.6.0: пробитые отдельно
+        # v21.6.1: пробитые отдельно
         if dist_pct < 0:
             mark = "🚀"
         elif dist_pct <= HOT_DIST_PCT_1:
@@ -3582,7 +3570,6 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
                 f"upper={upper:.6g} 💰{cur:.6g} (+{dist:.1f}%) "
                 f"RSI{rsi_now:.0f}")
 
-    # ===== Footer (v21.6.0) =====
     footer = [
         "━━━━━━━━━━━━━━━━━━━━━",
         f"🔄 Следующий статус через 2 ч · лимиты {MAX_OPEN_POSITIONS} поз / "
@@ -3599,7 +3586,8 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         f"🔧 BTC: -{abs(BTC_DROP_6H_PCT):.0f}%/6ч или "
         f"ADX&gt;{BTC_ADX_BLOCK_THRESHOLD:.0f} · "
         f"🛡 Peak Guard · 🚫 SQZ-dip off",
-        f"💎 RSI-dip · 🌊 WT-dip · 🎯 BOUNCE · "
+        f"🐛 WS-FIX: JSON-ping (без встроенного) · "
+        f"💎 RSI-dip · 🌊 WT-dip · 🎯 BOUNCE",
         f"/funnel · /stats · /reset",
     ]
 
@@ -3653,7 +3641,6 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
     text = build(True, len(display_calls), len(display_cons),
                  len(display_dip), len(display_wtdip), len(display_bounce))
 
-    # Автосжатие если не влезает
     if len(text) > TG_SAFE_LIMIT:
         for mc in range(len(display_calls), 2, -1):
             for mcons in range(len(display_cons), 2, -1):
@@ -3675,7 +3662,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         text = build(True, 5, 5, 3, 3, 3)
 
     _send_to_all_one(text)
-    logger.info("Статус v21.6.0: %d симв · bounce=%d dip=%d wt=%d "
+    logger.info("Статус v21.6.1: %d симв · bounce=%d dip=%d wt=%d "
                 "cons=%d · tickers=%d · hold_kept=%d hold_weak=%d "
                 "hold_false=%d",
                 len(text), len(bounce_candidates),
@@ -3694,7 +3681,7 @@ def handle_stop(signum, _frame):
     raise SystemExit(0)
 
 if __name__ == "__main__":
-    logger.info("Запуск бота v21.6.0 «VOLUME-AWARE-HOLD» (Bybit) ...")
+    logger.info("Запуск бота v21.6.1 «VOL-HOLD + WS-FIX» (Bybit) ...")
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
@@ -3730,7 +3717,7 @@ if __name__ == "__main__":
             pos.setdefault("hold_mode", True)
             pos.setdefault("confidence", 1.0)
             pos.setdefault("also_valid", [])
-            # v21.6.0: миграция 3-режимной логики
+            # v21.6.1: миграция 3-режимной логики
             pos.setdefault("box_upper", None)
             pos.setdefault("box_vol_trend", 1.0)
             pos.setdefault("near_upper_bars", 0)
@@ -3790,7 +3777,7 @@ if __name__ == "__main__":
     threading.Thread(target=tickers_refresh_loop, daemon=True).start()
 
     _send_to_all_one(
-        f"🟢 <b>СКАНЕР v21.6.0 «VOLUME-AWARE-HOLD» ЗАПУЩЕН</b>\n"
+        f"🟢 <b>СКАНЕР v21.6.1 «VOL-HOLD + WS-FIX» ЗАПУЩЕН</b>\n"
         f"📡 WS kline: {len(PAIRS_WS)} пар "
         f"(подписка чанками по {WS_SUBSCRIBE_CHUNK})\n"
         f"⚡ WS tickers: {WS_TICKERS_QUOTA_CAND} cand + "
@@ -3798,6 +3785,7 @@ if __name__ == "__main__":
         f"{WS_TICKERS_QUOTA_DIP} dip + {WS_TICKERS_QUOTA_WT} wt + "
         f"{WS_TICKERS_QUOTA_BOUNCE} bounce "
         f"(макс {WS_TICKERS_MAX_PAIRS})\n"
+        f"🐛 FIX: WS-ping через JSON (Bybit) — соединения стабильны\n"
         f"🎯 BOUNCE: отскок от дна (≤{RANGE_BOUNCE_ZONE_PCT}%) + "
         f"оценка накопления (vol_trend)\n"
         f"💎 RSI-DIPBUY: RSI≤{DIPBUY_RSI_ZONE} × "
