@@ -2784,7 +2784,7 @@ def run_websocket():
             on_close=on_close,
         )
         try:
-            WS_APP.run_forever(ping_interval=30, ping_timeout=10)
+            WS_APP.run_forever(ping_interval=0, ping_timeout=None)
         except Exception as e:
             logger.error("WS критическая ошибка: %s", e)
         time.sleep(5)
@@ -2889,7 +2889,7 @@ def run_tickers_websocket():
             on_close=on_tickers_close,
         )
         try:
-            WS_TICKERS_APP.run_forever(ping_interval=30, ping_timeout=10)
+            WS_TICKERS_APP.run_forever(ping_interval=0, ping_timeout=None)
         except Exception as e:
             logger.error("WS tickers критическая ошибка: %s", e)
         WS_TICKERS_CONNECTED.clear()
