@@ -745,7 +745,7 @@ HELP_TEXT = (
     "🔒 HOLD-TO-REVERSAL: BE +0.5×R, без partial TP.\n"
     "🚀 VOLUME-AWARE-HOLD:\n"
     "   • у пробоя (≥ upper×0.97): vol_score ≥ 0.6 → держим\n"
-    "   • vol_score < 0.4 + красная 4h → выход\n"
+    "   • vol_score &lt; 0.4 + красная 4h → выход\n"
     "   • после пробоя → трейлинг 2×R, ложный пробой −0.5%\n"
     f"Выход по умолчанию: EMA-кросс 4h / трейлинг / SL / "
     f"time-stop {TIME_STOP_DAYS}д.\n"
@@ -3577,7 +3577,7 @@ def send_status(scan_summary, consolidation_list, dipbuy_candidates,
         f"🔒 HOLD: BE +{BREAKEVEN_TRIGGER_ATR_FAST}×R, "
         f"без partial TP, без fixed TP",
         f"🚀 VOL-HOLD: у пробоя ≥{VOL_HOLD_SCORE_KEEP} держим, "
-        f"<{VOL_HOLD_SCORE_WEAK}+🔴 выходим",
+        f"&lt;{VOL_HOLD_SCORE_WEAK}+🔴 выходим",
         f"🚀 после пробоя: трейлинг {VOL_HOLD_AFTER_BREAK_TRAIL}×R, "
         f"ложный −{VOL_HOLD_FALSE_BREAK_PCT}%",
         f"🚪 Выход: EMA-кросс 4h / трейлинг / SL / "
@@ -3796,7 +3796,7 @@ if __name__ == "__main__":
         f"🚀 VOL-HOLD (3 режима):\n"
         f"   • у пробоя (≥{VOL_HOLD_NEAR_UPPER_PCT}% от upper): "
         f"vol_score ≥{VOL_HOLD_SCORE_KEEP} держим\n"
-        f"   • vol_score <{VOL_HOLD_SCORE_WEAK} + красная 4h → выход\n"
+        f"   • vol_score &lt;{VOL_HOLD_SCORE_WEAK} + красная 4h → выход\n"
         f"   • после пробоя: трейлинг "
         f"{VOL_HOLD_AFTER_BREAK_TRAIL}×R, "
         f"ложный −{VOL_HOLD_FALSE_BREAK_PCT}%\n"
