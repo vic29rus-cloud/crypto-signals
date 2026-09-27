@@ -1,639 +1,480 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-==============================================================================
-BYBIT SCANNER v20.0 «WS-REALTIME-HOT» — ЕДИНЫЙ ФАЙЛ ДЛЯ LINUX VPS
-WebSocket (wss://stream.bybit.com/v5/public/spot) + REST (api.bybit.com/v5)
-Бумажная торговля: сделки -> bybit_trades.json, алерты -> Telegram
+BYBIT SCANNER v22.1 WS-SAFE — AGGRESSIVE
 
-НОВОЕ В v20.0 (относительно v19.9.1):
-• ⚡ WS-REALTIME-HOT: отдельный WebSocket на канал `tickers` для горячих монет
-• Динамическая подписка: топ-10 кандидатов + топ-10 боковиков + близкие к алерту
-• На каждом тике — мгновенная проверка входа (не ждём 15m закрытия)
-• Автодополнение: раз в 15 минут сканируем все 200 пар и добавляем горячие
-• 🛡 PEAK-GUARD сохранён (RSI≤70, дрейф≤1%, топ-15% диапазона)
-• Все прежние функции: BTC-адаптив, circuit breaker, сектора, top-10+10.
-==============================================================================
+Цель:
+- WebSocket-реальное время;
+- входы только по подтверждённым 15m свечам;
+- выходы по тикерам мгновенно;
+- больше сделок, но с сохранением защит.
+
+Стратегии:
+1. Confluence
+2. Pullback
+3. Breakout
+
+Отключено:
+- WT-DIP, RSI-DIPBUY, BOUNCE, SQZ-DIP
+- вход по шуму тикеров без подтверждения свечой
+
+AGGRESSIVE-режим (v22.1a):
+- MIN_SIGNAL_SCORE 5, MIN_RR 1.5
+- RSI 35-72, ADX 15-55, VOL 1.1x
+- BTC -3.5%/6ч, ADX>50 блок
+- TOP_N 150
+- WS ping_interval=0 (Bybit JSON-ping only)
 """
-import json
+
 import os
-import signal
+import json
 import time
+import math
 import logging
 import logging.handlers
 import threading
+import signal
+from collections import deque
+from datetime import datetime, timezone
+
 import requests
 import pandas as pd
 import numpy as np
 import websocket
-from collections import deque
-from datetime import datetime, timezone
 
-# ==================== КОНФИГУРАЦИЯ ====================
+
+# ==================== СЕКРЕТЫ ====================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+
+# ==================== ФАЙЛЫ ====================
+WORK_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(WORK_DIR, "bybit_scanner_v221.log")
+STATE_FILE = os.path.join(WORK_DIR, "bybit_state_v221.json")
+TRADES_FILE = os.path.join(WORK_DIR, "bybit_trades_v221.json")
+CB_FILE = os.path.join(WORK_DIR, "bybit_cb_v221.json")
+SUBSCRIBERS_FILE = os.path.join(WORK_DIR, "subscribers_v221.json")
+
+
+# ==================== BYBIT ====================
 BASE_URL = "https://api.bybit.com/v5/market"
 WS_URL = "wss://stream.bybit.com/v5/public/spot"
 
-TOP_N = 200
-TOTAL_PAIRS = 700
-SCAN_INTERVAL_SECONDS = 7200
-MIN_TURNOVER_USD = 50_000
-CONSOLIDATION_MIN_TURNOVER_USD = 20_000
 
-TIMEFRAME = "15"
-MIN_BARS = 80
-TRIGGER_TF = "4h"
-TIME_STOP_DAYS = 7
-TIME_STOP_MIN_R = 1.0
+# ==================== СКАН / WS ====================
+TOP_N = 150                              # AGGRESSIVE: было 100
+MIN_TURNOVER_USDT = 3_000_000
+MIN_PRICE = 0.0001
 
-MAX_OPEN_POSITIONS = 8
-MAX_TRADES_PER_HOUR = 15
-ENTRY_COOLDOWN_SECONDS = 1800
-MIN_STOP_DISTANCE_PCT = 0.5
-MAX_BREAKOUT_DISTANCE_PCT = 4.5
-BREAKOUT_MIN_TRIGGER_PCT = 0.5
-BREAKOUT_MAX_ADX = 30
-BREAKOUT_VOL_ACCUM_MULT = 1.0
+SCAN_INTERVAL_SECONDS = 1800
+STATUS_INTERVAL_SECONDS = 7200
+MANAGE_SLEEP_SECONDS = 10
 
-CONSOLIDATION_WINDOWS = (30, 45, 60)
-CONSOLIDATION_MAX_RANGE_PCT = 24.0
-CONSOLIDATION_MAX_ADX = 25
+WS_KLINE_BUFFER = 180
+WS_TICKER_MAX = 50
+WS_SUBSCRIBE_CHUNK = 10
+WS_SUBSCRIBE_PAUSE = 0.15
+WS_SILENCE_TIMEOUT = 150
 
-WS_EXTRA_SYMBOLS = 50
 
-RETEST_ENABLED = True
-RETEST_TOUCH_TOLERANCE_PCT = 0.8
-RETEST_SL_ATR = 1.5
-RETEST_TP_ATR = 4.0
+# ==================== РИСК ====================
+MAX_OPEN_POSITIONS = 5
+MAX_TRADES_PER_HOUR = 6                   # AGGRESSIVE: было 4
+MAX_TRADES_PER_30MIN = 2                  # AGGRESSIVE: было 1
 
-# --- BTC-ФИЛЬТР ---
-BTC_CONTEXT_ENABLED = True
-BTC_CONTEXT_TTL = 300
-BTC_DROP_6H_PCT = -5.0
-BTC_ADX_BLOCK_THRESHOLD = 35
-BTC_ALLOW_STRONG_WHEN_BLOCKED = True
-BTC_STRONG_MIN_TREND_SCORE = 3
-BTC_STRONG_MIN_SCORE = 8
-BTC_STRONG_SIZE_MULT = 0.5
+ENTRY_COOLDOWN_SECONDS = 3600
+PAIR_LOSS_COOLDOWN_SECONDS = 86400
 
-CB_MAX_CONSEC_LOSSES = 4
-CB_PAUSE_SECONDS = 6 * 3600
-CB_DAILY_LOSS_PCT = 3.0
+MIN_SIGNAL_SCORE = 5                      # AGGRESSIVE: было 7
+MIN_STOP_DISTANCE_PCT = 0.8               # AGGRESSIVE: было 1.2
+MIN_RR = 1.5                              # AGGRESSIVE: было 2.0
 
-MAX_SECTOR_POSITIONS = 2
-SECTOR_MAP = {
-    "SOL": "L1", "AVAX": "L1", "NEAR": "L1", "APT": "L1", "ATOM": "L1",
-    "FTM": "L1", "ALGO": "L1", "DOT": "L1", "ADA": "L1", "XRP": "L1",
-    "SUI": "L1", "SEI": "L1", "TIA": "L1", "TON": "L1", "TRX": "L1",
-    "ARB": "L2", "OP": "L2", "MATIC": "L2", "IMX": "L2", "STRK": "L2",
-    "UNI": "DeFi", "AAVE": "DeFi", "MKR": "DeFi", "COMP": "DeFi",
-    "SUSHI": "DeFi", "CRV": "DeFi", "SNX": "DeFi", "LDO": "DeFi",
-    "DYDX": "DEX", "GMX": "DEX", "JUP": "DEX",
-    "DOGE": "Meme", "SHIB": "Meme", "PEPE": "Meme", "FLOKI": "Meme",
-    "WIF": "Meme", "BONK": "Meme", "MEME": "Meme",
-    "FET": "AI", "RNDR": "AI", "AGIX": "AI", "TAO": "AI", "ARKM": "AI",
-    "SAND": "Gaming", "MANA": "Gaming", "AXS": "Gaming", "GALA": "Gaming",
-    "FIL": "Storage", "AR": "Storage",
-}
+ATR_MULT_SL = 4.0
+ATR_MULT_TP = 8.0
+PARTIAL_TP_ATR = 3.5
+TRAILING_STEP_ATR = 2.5
+TIME_STOP_HOURS = 72
 
-RISK_PER_TRADE_PCT = 1.0
-MAX_PORTFOLIO_RISK_PCT = 6.0
-SESSION_FILTER_ENABLED = True
+RISK_PER_TRADE_PCT = 0.75
+MAX_PORTFOLIO_RISK_PCT = 4.0
 
-FEE_PCT = 0.25
-SLIPPAGE_PCT = 0.05
-ATR_MULT_SL = 3.0
-ATR_MULT_TP = 6.0
-PARTIAL_TP_ATR = 3.0
-PARTIAL_TP_FRACTION = 0.5
-BREAKEVEN_TRIGGER_ATR = 1.0
-TRAILING_TRIGGER_ATR = 2.0
-TRAILING_STEP_ATR = 1.5
 
-MIN_SIGNAL_SCORE = 5
-FRESH_CROSS_WINDOW = 3
-RSI_MIN, RSI_MAX = 35, 80
-ADX_MIN, ADX_MAX = 15, 60
-MIN_VOL_MULT = 1.2
-PULLBACK_ENABLED = True
-PULLBACK_VOL_MULT = 1.1
-PULLBACK_RSI_MAX = 68
-PULLBACK_SL_ATR = 2.5
-PULLBACK_TP_ATR = 5.0
-PULLBACK_MAX_DEPTH_PCT = 0.05
-PULLBACK_MIN_PRIOR_MOVE_PCT = 0.03
+# ==================== CIRCUIT BREAKER ====================
+CB_CONSEC_LOSSES = 3
+CB_DAILY_LOSS_PCT = -2.0
+CB_PAUSE_SECONDS = 12 * 3600
+
+
+# ==================== BTC ====================
+BTC_DROP_6H_PCT = -3.5                    # AGGRESSIVE: было -2.5
+BTC_ADX_BLOCK = 50                        # AGGRESSIVE: было 45
+
+
+# ==================== ФИЛЬТРЫ ====================
+RSI_MIN, RSI_MAX = 35, 72                 # AGGRESSIVE: было 40/68
+ADX_MIN, ADX_MAX = 15, 55                 # AGGRESSIVE: было 20/50
+MIN_VOL_MULT = 1.1                        # AGGRESSIVE: было 1.3
+
+BREAKOUT_VOL_MULT = 1.4                   # AGGRESSIVE: было 1.8
+BREAKOUT_RT_VOL_MULT = 1.6
+
+CONSOL_DAYS = 20
+CONSOL_MAX_RANGE_PCT = 25.0
+
+ARM_EXPIRY_CONFLUENCE = 3600              # AGGRESSIVE: было 1800
+ARM_EXPIRY_PULLBACK = 3600                # AGGRESSIVE: было 1800
+ARM_EXPIRY_BREAKOUT = 1800                # AGGRESSIVE: было 900
+
+ENTRY_TOLERANCE_LOW = 0.992               # AGGRESSIVE: было 0.996
+ENTRY_TOLERANCE_HIGH = 1.008              # AGGRESSIVE: было 1.004
+
+BREAKOUT_ENTRY_LOW = 0.998
+BREAKOUT_ENTRY_HIGH = 1.015
 
 STATUS_RSI_MIN, STATUS_RSI_MAX = 35, 75
 STATUS_ADX_MIN, STATUS_ADX_MAX = 18, 55
 STATUS_MIN_PRICE = 0.0001
-STATUS_READY_SCORE = 3
 
-# --- 🛡 PEAK-GUARD ---
-PEAK_GUARD_ENABLED = True
-PEAK_LOOKBACK_CANDLES = 20
-PEAK_MAX_POSITION_PCT = 85
-PEAK_MIN_DIST_TO_MAX_PCT = 1.5
-PEAK_MAX_RSI = 70
-PEAK_MAX_DRIFT_PCT = 1.0
+TG_MSG_LIMIT = 3900
 
-# --- ПОРОГИ «ГОРЯЧЕСТИ» БОКОВИКОВ ---
-HOT_DIST_PCT_1 = 1.0
-HOT_DIST_PCT_2 = 3.0
-HOT_DIST_PCT_3 = 5.0
 
-MAX_SHOW_CANDIDATES = 10
-MAX_SHOW_CONSOLIDATIONS = 10
+STABLE_BASES = {
+    "USDC", "DAI", "TUSD", "FDUSD", "USD1", "PYUSD",
+    "USDT", "USDD", "EUR", "GBP", "JPY", "AUD", "CAD",
+    "XAUT", "PAXG",
+}
 
-# --- ⚡ WS-REALTIME-HOT (v20.0) ---
-WS_TICKERS_ENABLED = True
-WS_TICKERS_MAX_PAIRS = 40          # максимум пар в tickers-подписке
-WS_TICKERS_REFRESH_SEC = 900       # обновление списка (15 мин)
-WS_HOT_COOLDOWN_SEC = 60           # cooldown на попытку входа по одной паре
-WS_HOT_MIN_RR = 1.5
-WS_HOT_MIN_VOL = 1.2
-WS_HOT_BREAKOUT_VOL = 1.8
-WS_HOT_MAX_DRIFT_PCT = 1.0
 
-TREND_CACHE_REFRESH_SECONDS = 1800
-TREND_CACHE_INITIAL_LIMIT = 60
-BREAKOUT_CACHE_SIZE = 60
-CLEANUP_AFTER_DAYS = 14
-WS_SILENCE_TIMEOUT = 90
+# ==================== ЛОГИ ====================
+logger = logging.getLogger("bybit-scanner-v221")
 
-TG_MSG_LIMIT = 4096
-TG_SAFE_LIMIT = 4000
 
-WORK_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_FILE = os.path.join(WORK_DIR, "bybit_state.json")
-TRADES_LOG_FILE = os.path.join(WORK_DIR, "bybit_trades.json")
-SUBSCRIBERS_FILE = os.path.join(WORK_DIR, "subscribers.json")
-LOG_FILE = os.path.join(WORK_DIR, "bybit_scanner.log")
+def setup_logging():
+    logger.setLevel(logging.INFO)
 
-# ==================== ЛОГИРОВАНИЕ ====================
-os.makedirs(WORK_DIR, exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.StreamHandler(),
-        logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=5_000_000,
-                                             backupCount=3, encoding="utf-8"),
-    ],
-)
-logger = logging.getLogger("bybit-scanner")
+    fmt = logging.Formatter(
+        "%(asctime)s | %(levelname)-7s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
-# ==================== ГЛОБАЛЬНОЕ СОСТОЯНИЕ ====================
-state = {}
-state_lock = threading.RLock()
-trade_times = []
-ohlc_buffers = {}
-last_processed_closed = {}
-trend_cache = {}
-trend_cache_lock = threading.RLock()
-LAST_FILTERED_PAIRS = []
-breakout_cache = {}
-breakout_cache_lock = threading.RLock()
-retest_memory = {}
-last_ws_msg_ts = time.time()
-WS_APP = None
-PAIRS_WS = []
+    fh = logging.handlers.RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=5_000_000,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+
+
+# ==================== ГЛОБАЛЬНОЕ ====================
 SESSION = requests.Session()
 
-market_context = {"ok": True, "reason": "", "ts": 0.0}
-market_context_lock = threading.RLock()
-cb_state = {"consec": 0, "paused_until": 0.0, "day": "", "day_pnl": 0.0}
-cb_lock = threading.Lock()
+state = {}
+cb = {
+    "consec": 0,
+    "day_pnl": 0.0,
+    "day": "",
+    "paused_until": 0.0,
+}
 
-SUBSCRIBERS = set()
-subscribers_lock = threading.RLock()
-MAIN_CHAT_ID = None
+subscribers = set()
 
-# ⚡ Кэш горячих монет (обновляется при формировании статуса)
-HOT_PAIRS_CACHE = {"candidates": [], "consolidations": [], "ts": 0.0}
-HOT_PAIRS_LOCK = threading.RLock()
-HOT_LAST_CHECK = {}   # symbol -> ts последней попытки входа
+state_lock = threading.RLock()
+cb_lock = threading.RLock()
+file_lock = threading.RLock()
+sub_lock = threading.RLock()
+trade_times_lock = threading.RLock()
 
-# ⚡ WebSocket tickers — текущие подписки
-WS_TICKER_PAIRS = set()
-WS_TICKER_PAIRS_LOCK = threading.RLock()
-WS_TICKERS_APP = None
+trade_times = []
+entry_30 = []
+
+PAIRS = []
+pairs_lock = threading.RLock()
+
+OHLC = {}
+ohlc_lock = threading.RLock()
+
+LAST_PROCESSED = {}
+CURRENT_PRICE = {}
+price_lock = threading.RLock()
+
+CONS_LEVEL = {}
+cons_lock = threading.RLock()
+
+CANDIDATES = []
+CONSOLIDATIONS = []
+scan_lock = threading.RLock()
+LAST_SCAN_TS = 0.0
+
+ARMED = {}
+armed_lock = threading.RLock()
+
+LAST_ANALYSIS = {}
+analysis_lock = threading.RLock()
+
+TREND_CACHE = {}
+trend_lock = threading.RLock()
+
+BTC_CACHE = {
+    "ts": 0.0,
+    "ok": True,
+    "reason": "init",
+}
+btc_lock = threading.RLock()
+
+WS_KLINE_APP = None
+WS_TICKER_APP = None
+
+WS_KLINE_CONNECTED = threading.Event()
 WS_TICKERS_CONNECTED = threading.Event()
 
-# 🛡 PEAK-GUARD: кэш последних проверок (для дедупликации алертов)
-LAST_PEAK_ALERT = {}  # symbol -> ts
+WS_TICKER_PAIRS = set()
+ws_ticker_lock = threading.RLock()
 
-_http_failures = 0
-_http_open_until = 0.0
+LAST_WS_KLINE_TS = 0.0
+LAST_WS_TICKER_TS = 0.0
+ws_ts_lock = threading.RLock()
 
-# ==================== HTTP-СЛОЙ ====================
-def http_get(url, params=None, timeout=20, retries=3):
-    global _http_failures, _http_open_until
-    if time.time() < _http_open_until:
-        return None
-    for attempt in range(retries):
-        try:
-            resp = SESSION.get(url, params=params, timeout=timeout)
-            if resp.status_code == 429 or resp.status_code >= 500:
-                wait = 2 ** attempt
-                logger.warning("HTTP %s от Bybit, повтор через %d c", resp.status_code, wait)
-                time.sleep(wait)
-                continue
-            _http_failures = 0
-            return resp.json()
-        except Exception as e:
-            logger.warning("Сетевая ошибка %s (попытка %d): %s", url, attempt + 1, e)
-            time.sleep(2 ** attempt)
-    _http_failures += 1
-    if _http_failures >= 5:
-        _http_open_until = time.time() + 60
-        _http_failures = 0
-        logger.error("HTTP circuit breaker: пауза 60 c")
-    return None
+STOP_EVENT = threading.Event()
 
-def api_ok(data):
-    return bool(data) and data.get("retCode") == 0
 
-# ==================== CIRCUIT BREAKER ====================
-def cb_register(net_pnl):
-    with cb_lock:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if cb_state["day"] != today:
-            cb_state["day"], cb_state["day_pnl"] = today, 0.0
-        cb_state["day_pnl"] += net_pnl
-        if net_pnl < 0:
-            cb_state["consec"] += 1
-            if cb_state["consec"] >= CB_MAX_CONSEC_LOSSES:
-                cb_state["paused_until"] = time.time() + CB_PAUSE_SECONDS
-                logger.warning("Circuit Breaker: %d убытков подряд — пауза %d ч",
-                               cb_state["consec"], CB_PAUSE_SECONDS // 3600)
-        else:
-            cb_state["consec"] = 0
-        if cb_state["day_pnl"] <= -CB_DAILY_LOSS_PCT:
-            midnight = (datetime.now(timezone.utc).replace(hour=0, minute=0,
-                        second=0, microsecond=0) + pd.Timedelta(days=1))
-            cb_state["paused_until"] = max(cb_state["paused_until"], midnight.timestamp())
-            logger.error("Circuit Breaker: дневной лимит убытка %.1f%%", cb_state["day_pnl"])
-
-def cb_can_trade():
-    with cb_lock:
-        return time.time() >= cb_state["paused_until"]
-
-# ==================== BTC-КОНТЕКСТ ====================
-def refresh_market_context():
-    ok, reason = True, ""
-    if BTC_CONTEXT_ENABLED:
-        try:
-            candles = fetch_klines("BTCUSDT", "60", 48)
-            if candles and len(candles) >= 10:
-                closes = [c["close"] for c in candles]
-                chg_6h = (closes[-2] / closes[-8] - 1.0) * 100 if len(closes) > 8 else 0.0
-                df = pd.DataFrame(candles)
-                ef = ema(df["close"], 9).iloc[-2]
-                es = ema(df["close"], 21).iloc[-2]
-                adx_val = adx(df).iloc[-2]
-                if chg_6h <= BTC_DROP_6H_PCT:
-                    ok, reason = False, f"BTC {chg_6h:.1f}% за 6ч"
-                elif ef < es and not pd.isna(adx_val) and adx_val > BTC_ADX_BLOCK_THRESHOLD:
-                    ok, reason = False, f"BTC нисходящий тренд (ADX>{BTC_ADX_BLOCK_THRESHOLD:.0f})"
-        except Exception as e:
-            logger.debug("market context: %s", e)
-    with market_context_lock:
-        market_context.update(ok=ok, reason=reason, ts=time.time())
-    if not ok:
-        logger.info("BTC-контекст: лонги заблокированы (%s)", reason)
-
-def market_context_loop():
-    while True:
-        refresh_market_context()
-        time.sleep(BTC_CONTEXT_TTL)
-
-def market_allows_longs():
-    if not BTC_CONTEXT_ENABLED:
-        return True
-    with market_context_lock:
-        return market_context["ok"]
-
-def is_strong_signal_for_blocked_market(signal):
-    if not BTC_ALLOW_STRONG_WHEN_BLOCKED:
-        return False
-    trend_score = signal.get("trend_score", 0)
-    score = signal.get("score", 0)
-    if isinstance(score, str):
-        return False
-    return (trend_score >= BTC_STRONG_MIN_TREND_SCORE
-            and score >= BTC_STRONG_MIN_SCORE)
-
-# ==================== 🛡 PEAK-GUARD ====================
-def check_peak_guard(df, entry_price):
-    if not PEAK_GUARD_ENABLED:
-        return True, "", {}
-    try:
-        if df is None or len(df) < PEAK_LOOKBACK_CANDLES:
-            return True, "", {}
-        window = df.tail(PEAK_LOOKBACK_CANDLES)
-        local_high = float(window["high"].max())
-        local_low = float(window["low"].min())
-        if local_high <= local_low or entry_price <= 0:
-            return True, "", {}
-        position_pct = (entry_price - local_low) / (local_high - local_low) * 100
-        dist_to_max_pct = (local_high - entry_price) / entry_price * 100
-        metrics = {"position_pct": round(position_pct, 1),
-                   "dist_to_max_pct": round(dist_to_max_pct, 2),
-                   "local_high": local_high, "local_low": local_low}
-        if position_pct > PEAK_MAX_POSITION_PCT:
-            return False, f"цена в верхних {100 - PEAK_MAX_POSITION_PCT:.0f}% ({position_pct:.0f}%)", metrics
-        if dist_to_max_pct < PEAK_MIN_DIST_TO_MAX_PCT:
-            return False, f"слишком близко к максимуму ({dist_to_max_pct:.2f}%)", metrics
-        return True, "", metrics
-    except Exception as e:
-        logger.debug("peak_guard error: %s", e)
-        return True, "", {}
-
-def check_peak_guard_rsi(rsi_val):
-    if not PEAK_GUARD_ENABLED:
-        return True, ""
-    if rsi_val is None or pd.isna(rsi_val):
-        return True, ""
-    if rsi_val > PEAK_MAX_RSI:
-        return False, f"RSI {rsi_val:.0f} > {PEAK_MAX_RSI}"
-    return True, ""
-
-def check_peak_guard_drift(current_price, entry_price):
-    if not PEAK_GUARD_ENABLED:
-        return True, ""
-    if entry_price <= 0 or current_price <= 0:
-        return True, ""
-    drift_pct = abs(current_price - entry_price) / entry_price * 100
-    if drift_pct > PEAK_MAX_DRIFT_PCT:
-        return False, f"цена ушла на {drift_pct:.1f}%"
-    return True, ""
-
-# ==================== СЕКТОРА И РАЗМЕР ====================
-def sector_of(symbol):
-    base = symbol.replace("USDT", "")
-    return SECTOR_MAP.get(base)
-
-def sector_slot_free(symbol):
-    sec = sector_of(symbol)
-    if sec is None:
-        return True
-    cnt = sum(1 for p, v in state.items()
-              if v.get("position") == "open" and sector_of(p) == sec)
-    return cnt < MAX_SECTOR_POSITIONS
-
-def position_size_fraction(score, rr, atr_pct, portfolio_risk_pct, stop_dist_pct,
-                            btc_blocked=False):
-    base = RISK_PER_TRADE_PCT / 100.0
-    conf = (0.5 + (score / 10.0) * 0.5) if isinstance(score, int) else 0.7
-    vol_mult = 0.5 if atr_pct > 5 else 0.7 if atr_pct > 3 else 0.85 if atr_pct > 1.5 else 1.0
-    rr_mult = 1.0 if rr >= 3 else 0.9 if rr >= 2 else 0.7 if rr >= 1.5 else 0.5
-    size = base * conf * vol_mult * rr_mult
-    if btc_blocked:
-        size *= BTC_STRONG_SIZE_MULT
-    remaining = MAX_PORTFOLIO_RISK_PCT - portfolio_risk_pct
-    max_add = remaining / stop_dist_pct if stop_dist_pct > 0 else 0.0
-    size = min(size, max(max_add, 0.0))
-    return round(max(size, 0.01), 3) if max_add >= 0.01 else 0.01
-
-def portfolio_risk_used():
-    total = 0.0
-    for v in state.values():
-        if v.get("position") == "open" and v.get("entry_price"):
-            dist = (v["entry_price"] - v.get("stop", 0)) / v["entry_price"] * 100
-            total += dist * v.get("size_fraction", 1.0)
-    return total
-
-# ==================== TELEGRAM: ПОДПИСЧИКИ ====================
-def _load_subscribers():
-    global SUBSCRIBERS, MAIN_CHAT_ID
-    ids = set()
-    if TELEGRAM_CHAT_ID:
-        try:
-            MAIN_CHAT_ID = int(TELEGRAM_CHAT_ID)
-            ids.add(MAIN_CHAT_ID)
-        except (TypeError, ValueError):
-            pass
-    try:
-        if os.path.exists(SUBSCRIBERS_FILE):
-            with open(SUBSCRIBERS_FILE, "r") as f:
-                ids.update(int(x) for x in json.load(f).get("ids", []))
-    except Exception as e:
-        logger.error("Ошибка загрузки подписчиков: %s", e)
-    with subscribers_lock:
-        SUBSCRIBERS = ids
-    logger.info("Подписчиков загружено: %d", len(ids))
-
-def _save_subscribers():
-    with subscribers_lock:
-        extras = sorted(x for x in SUBSCRIBERS if x != MAIN_CHAT_ID)
-    try:
-        tmp = SUBSCRIBERS_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"ids": extras}, f)
-        os.replace(tmp, SUBSCRIBERS_FILE)
-    except Exception as e:
-        logger.error("Ошибка сохранения подписчиков: %s", e)
-
-def add_subscriber(cid):
-    with subscribers_lock:
-        if cid in SUBSCRIBERS:
-            return False
-        SUBSCRIBERS.add(cid)
-    _save_subscribers()
-    logger.info("➕ Новый подписчик: %s (всего %d)", cid, len(SUBSCRIBERS))
-    return True
-
-def remove_subscriber(cid):
-    with subscribers_lock:
-        if cid not in SUBSCRIBERS or cid == MAIN_CHAT_ID:
-            return False
-        SUBSCRIBERS.discard(cid)
-    _save_subscribers()
-    logger.info("➖ Отписка: %s (осталось %d)", cid, len(SUBSCRIBERS))
-    return True
-
+# ==================== TELEGRAM ====================
 def _post_telegram(chat_id, text):
     if not TELEGRAM_BOT_TOKEN:
         return False
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
     for parse_mode in ("HTML", None):
-        payload = {"chat_id": chat_id, "text": text,
-                   "disable_web_page_preview": True}
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
         if parse_mode:
             payload["parse_mode"] = parse_mode
+
         try:
-            r = requests.post(url, data=payload, timeout=10)
-            resp = r.json()
-            if resp.get("ok"):
+            r = SESSION.post(url, data=payload, timeout=15)
+            j = r.json()
+            if j.get("ok"):
                 return True
-            desc = resp.get("description", "")
-            logger.error("Telegram отклонил (parse=%s, chat=%s): %s",
-                         parse_mode, chat_id, desc)
-            low = desc.lower()
-            if any(k in low for k in ("blocked", "chat not found",
+
+            desc = str(j.get("description", "")).lower()
+            if any(k in desc for k in ("blocked", "chat not found",
                                        "deactivated", "kicked")):
-                remove_subscriber(chat_id)
+                remove_subscriber(int(chat_id))
                 return False
         except Exception as e:
-            logger.error("Ошибка отправки Telegram chat=%s: %s", chat_id, e)
+            logger.warning("Telegram send error chat=%s: %s", chat_id, e)
+
     return False
 
-def _split_html_safe(text, limit=TG_SAFE_LIMIT):
-    chunks, cur = [], ""
+
+def split_text(text, limit=TG_MSG_LIMIT):
+    chunks = []
+    cur = ""
+
     for line in text.split("\n"):
         if cur and len(cur) + len(line) + 1 > limit:
             chunks.append(cur)
             cur = ""
         cur = (cur + "\n" + line) if cur else line
+
     if cur:
         chunks.append(cur)
+
     return chunks or [""]
 
-def _send_to_all_one(text):
-    if len(text) > TG_MSG_LIMIT:
-        cut = TG_MSG_LIMIT - 10
-        text = text[:cut].rstrip()
-        if "<blockquote" in text and "</blockquote>" not in text.rsplit("<blockquote", 1)[1]:
-            text += "\n</blockquote>"
-        text += " …"
-    with subscribers_lock:
-        targets = list(SUBSCRIBERS)
-    for cid in targets:
-        _post_telegram(cid, text)
 
 def send_telegram(text):
     if not TELEGRAM_BOT_TOKEN:
         return
-    for chunk in _split_html_safe(text):
-        with subscribers_lock:
-            targets = list(SUBSCRIBERS)
+
+    with sub_lock:
+        targets = list(subscribers)
+
+    if not targets and TELEGRAM_CHAT_ID:
+        targets = [TELEGRAM_CHAT_ID]
+
+    for chunk in split_text(text):
         for cid in targets:
             _post_telegram(cid, chunk)
 
-def tv_link(symbol: str) -> str:
-    url = f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol}"
-    return f'<a href="{url}">📈 {symbol}</a>'
 
-HELP_TEXT = (
-    "📡 <b>Bybit Scanner v20.0 — справка</b>\n"
-    "Бот шлёт: входы/выходы, частичные TP и ОДИН статус каждые 2 часа.\n"
-    "⚡ WS-REALTIME-HOT: мгновенная цена для топ-40 горячих монет.\n"
-    "🛡 PEAK-GUARD: не входим на пике (RSI≤70, дрейф≤1%).\n"
-    "🔥≤1% ⚡≤3% 🟢≤5% — сортировка боковиков по % до пробоя.\n"
-    "💰 текущая · 🎯~ вход · 🚀 пробой · ✨ готов · 🥀 объём↓ · ⛔ пик\n"
-    "Команды: /stop — отписаться, /help — справка."
-)
+def load_subscribers():
+    global subscribers
 
-def polling_loop():
-    if not TELEGRAM_BOT_TOKEN:
-        logger.warning("Polling не запущен: нет TELEGRAM_BOT_TOKEN")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    offset = 0
-    logger.info("Polling /start запущен")
-    while True:
+    if os.path.exists(SUBSCRIBERS_FILE):
         try:
-            r = requests.get(url, params={"offset": offset, "timeout": 30,
-                                          "allowed_updates": '["message"]'},
-                             timeout=40)
-            data = r.json()
-            if not data.get("ok"):
-                desc = data.get("description", "")
-                logger.error("getUpdates ошибка: %s", desc)
-                if "conflict" in desc.lower():
-                    logger.error("Конфликт с webhook — polling остановлен")
-                    return
-                time.sleep(5)
+            with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                subscribers = set(int(x) for x in data.get("ids", []))
+        except Exception as e:
+            logger.error("load_subscribers error: %s", e)
+            subscribers = set()
+
+    if TELEGRAM_CHAT_ID:
+        try:
+            subscribers.add(int(TELEGRAM_CHAT_ID))
+        except Exception:
+            pass
+
+    save_subscribers()
+
+
+def save_subscribers():
+    try:
+        with sub_lock:
+            data = {"ids": sorted(list(subscribers))}
+
+        tmp = SUBSCRIBERS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, SUBSCRIBERS_FILE)
+    except Exception as e:
+        logger.error("save_subscribers error: %s", e)
+
+
+def add_subscriber(chat_id):
+    with sub_lock:
+        if chat_id in subscribers:
+            return False
+        subscribers.add(int(chat_id))
+    save_subscribers()
+    return True
+
+
+def remove_subscriber(chat_id):
+    with sub_lock:
+        if int(chat_id) not in subscribers:
+            return False
+        subscribers.discard(int(chat_id))
+    save_subscribers()
+    return True
+
+
+# ==================== REST BYBIT ====================
+def api_get(path, params, timeout=15, retries=3):
+    url = "https://api.bybit.com" + path
+
+    for attempt in range(retries):
+        try:
+            r = SESSION.get(url, params=params, timeout=timeout)
+
+            if r.status_code == 429:
+                time.sleep(2 ** attempt)
                 continue
-            for u in data.get("result", []):
-                offset = max(offset, u.get("update_id", 0) + 1)
-                msg = u.get("message") or {}
-                cid = (msg.get("chat") or {}).get("id")
-                text = (msg.get("text") or "").strip().lower()
-                if not cid or not text:
-                    continue
-                if text == "/start":
-                    if add_subscriber(int(cid)):
-                        _post_telegram(cid,
-                            "🟢 <b>Подписка оформлена!</b>\n"
-                            "Бот присылает входы/выходы и статус каждые 2 часа.\n"
-                            "/stop — отписаться, /help — справка.")
-                    else:
-                        _post_telegram(cid, "✅ Вы уже подписаны.")
-                elif text == "/stop":
-                    if remove_subscriber(int(cid)):
-                        _post_telegram(cid, "🔴 Вы отписаны.\n/start — подписаться снова.")
-                    else:
-                        _post_telegram(cid, "Вы и так не подписаны.")
-                elif text == "/help":
-                    _post_telegram(cid, HELP_TEXT)
-        except Exception as e:
-            logger.warning("Polling ошибка: %s", e)
-            time.sleep(3)
 
-# ==================== СОСТОЯНИЕ И СДЕЛКИ ====================
-def save_state(state_data):
-    with state_lock:
+            j = r.json()
+            if j.get("retCode") == 0:
+                return j
+
+            logger.debug("API retCode %s: %s", j.get("retCode"), j.get("retMsg"))
+            time.sleep(1)
+
+        except Exception as e:
+            logger.debug("API error %s: %s", path, e)
+            time.sleep(1)
+
+    return None
+
+
+def fetch_klines(symbol, interval, limit=200):
+    params = {
+        "category": "spot",
+        "symbol": symbol,
+        "interval": interval,
+        "limit": min(max(limit, 1), 1000),
+    }
+
+    j = api_get("/v5/market/kline", params)
+    if not j:
+        return None
+
+    rows = j.get("result", {}).get("list", [])
+    if not rows:
+        return None
+
+    out = []
+    for x in reversed(rows):
         try:
-            tmp_file = STATE_FILE + ".tmp"
-            with open(tmp_file, "w") as f:
-                json.dump(state_data, f, indent=2)
-            os.replace(tmp_file, STATE_FILE)
-        except Exception as e:
-            logger.error("Ошибка сохранения state: %s", e)
+            out.append({
+                "start": int(x[0]),
+                "open": float(x[1]),
+                "high": float(x[2]),
+                "low": float(x[3]),
+                "close": float(x[4]),
+                "volume": float(x[5]),
+            })
+        except Exception:
+            continue
 
-def load_state():
-    with state_lock:
+    if not out:
+        return None
+
+    return pd.DataFrame(out)
+
+
+def get_price(symbol):
+    j = api_get("/v5/market/tickers", {
+        "category": "spot",
+        "symbol": symbol,
+    })
+
+    if not j:
+        return None
+
+    rows = j.get("result", {}).get("list", [])
+    if not rows:
+        return None
+
+    try:
+        return float(rows[0].get("lastPrice", 0))
+    except Exception:
+        return None
+
+
+def get_universe():
+    j = api_get("/v5/market/tickers", {"category": "spot"})
+    if not j:
+        return []
+
+    pairs = []
+
+    for item in j.get("result", {}).get("list", []):
+        symbol = item.get("symbol", "")
+
+        if not symbol.endswith("USDT"):
+            continue
+
+        base = symbol[:-4]
+        if base in STABLE_BASES:
+            continue
+
         try:
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
-        except FileNotFoundError:
-            return {}
-        except Exception as e:
-            logger.critical("Не удалось загрузить state: %s", e)
-            try:
-                os.replace(STATE_FILE, STATE_FILE + ".corrupt")
-            except OSError:
-                pass
-            return {}
+            price = float(item.get("lastPrice", 0))
+            turnover = float(item.get("turnover24h", 0) or item.get("volume24h", 0))
+        except Exception:
+            continue
 
-def log_trade(symbol, entry, exit_price, reason, strategy,
-              entry_time=None, size_fraction=1.0, traded_fraction=1.0):
-    with state_lock:
-        trades = []
-        if os.path.exists(TRADES_LOG_FILE):
-            try:
-                with open(TRADES_LOG_FILE, "r") as f:
-                    trades = json.load(f)
-            except Exception:
-                trades = []
-        now_iso = datetime.now(timezone.utc).isoformat()
-        if not entry_time:
-            entry_time = now_iso
-        raw_pnl = (exit_price - entry) / entry * 100 if entry else 0.0
-        costs = (FEE_PCT * 2 + SLIPPAGE_PCT) * traded_fraction
-        net_pnl = raw_pnl * traded_fraction - costs
-        trades.append({
-            "symbol": symbol, "entry_price": entry, "exit_price": exit_price,
-            "entry_time": entry_time, "exit_time": now_iso,
-            "size_fraction": round(size_fraction, 3),
-            "raw_pnl_pct": round(raw_pnl, 2),
-            "net_pnl_pct": round(net_pnl, 2),
-            "pnl_pct": round(net_pnl, 2),
-            "result": "win" if net_pnl > 0 else "loss",
-            "reason": reason, "strategy": strategy,
-        })
-        with open(TRADES_LOG_FILE, "w") as f:
-            json.dump(trades, f, indent=2)
-        if traded_fraction >= 1.0:
-            cb_register(net_pnl)
-        return round(net_pnl, 2)
+        if price >= MIN_PRICE and turnover >= MIN_TURNOVER_USDT:
+            pairs.append((symbol, turnover))
+
+    pairs.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in pairs[:TOP_N]]
+
 
 # ==================== ИНДИКАТОРЫ ====================
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
+
 
 def rsi(series, period=14):
     delta = series.diff()
@@ -642,1725 +483,1673 @@ def rsi(series, period=14):
     rs = gain / loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
+
 def atr(df, period=14):
     high_low = df["high"] - df["low"]
     high_close = np.abs(df["high"] - df["close"].shift())
     low_close = np.abs(df["low"] - df["close"].shift())
+
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
     true_range = ranges.max(axis=1)
+
     return true_range.rolling(period).mean()
 
-def adx(df, period=14):
-    up = df["high"].diff()
-    down = -df["low"].diff()
-    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
-    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
-    tr = atr(df, 1).replace(0, np.nan)
-    plus_di = 100 * (plus_dm.ewm(alpha=1 / period, adjust=False).mean() / tr)
-    minus_di = 100 * (minus_dm.ewm(alpha=1 / period, adjust=False).mean() / tr)
-    di_sum = (plus_di + minus_di).replace(0, np.nan)
-    dx = 100 * np.abs((plus_di - minus_di) / di_sum)
-    return dx.ewm(alpha=1 / period, adjust=False).mean()
 
-def analyze_timeframe(df, params):
-    if df.empty or len(df) < params["min_bars"]:
+def adx(df, period=14):
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+
+    tr = pd.concat([
+        high - low,
+        np.abs(high - close.shift()),
+        np.abs(low - close.shift())
+    ], axis=1).max(axis=1)
+
+    atr_val = tr.rolling(period).mean()
+
+    plus_di = 100 * (plus_dm.rolling(period).mean() / atr_val.replace(0, np.nan))
+    minus_di = 100 * (minus_dm.rolling(period).mean() / atr_val.replace(0, np.nan))
+
+    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)
+    return dx.rolling(period).mean()
+
+
+def analyze_frame(df, drop_last=False):
+    if df is None or len(df) < 60:
         return None
-    df = df.copy()
-    df["ema_fast"] = ema(df["close"], params["ema_fast"])
-    df["ema_slow"] = ema(df["close"], params["ema_slow"])
-    df["macd_line"] = ema(df["close"], 12) - ema(df["close"], 26)
-    df["macd_signal"] = ema(df["macd_line"], 9)
-    df["rsi"] = rsi(df["close"])
-    df["adx"] = adx(df)
-    df["atr"] = atr(df)
-    df["vol_sma"] = df["volume"].rolling(20).mean()
-    if len(df) < 6:
+
+    d = df.iloc[:-1] if drop_last and len(df) > 1 else df
+    if len(d) < 50:
         return None
-    last = df.iloc[-2]
-    prev = df.iloc[-3]
-    if any(pd.isna([last["ema_fast"], last["ema_slow"], last["rsi"],
-                    last["adx"], last["macd_line"], last["macd_signal"]])):
-        return None
-    adx_ago = df["adx"].iloc[-5]
-    adx_slope_up = bool(last["adx"] > adx_ago) if not pd.isna(adx_ago) else False
-    vol_sma = last["vol_sma"]
-    vol_ratio = float(last["volume"] / vol_sma) if not pd.isna(vol_sma) and vol_sma > 0 else 0.0
+
+    c = d["close"]
+
+    e9 = ema(c, 9).iloc[-1]
+    e21 = ema(c, 21).iloc[-1]
+    e20 = ema(c, 20).iloc[-1]
+    e50 = ema(c, 50).iloc[-1]
+
+    macd_line = ema(c, 12) - ema(c, 26)
+    macd_signal = ema(macd_line, 9)
+    hist = macd_line - macd_signal
+
+    cross_fresh = False
+    if len(hist) >= 4:
+        for i in range(1, 4):
+            if hist.iloc[-i - 1] <= 0 and hist.iloc[-i] > 0:
+                cross_fresh = True
+                break
+
+    rsi_val = rsi(c).iloc[-1]
+    adx_val = adx(d).iloc[-1]
+    atr_val = atr(d).iloc[-1]
+
+    vol_sma = d["volume"].rolling(20).mean().iloc[-1]
+    vol_last = float(d["volume"].iloc[-1])
+
+    if pd.isna(vol_sma) or vol_sma <= 0:
+        vol_ratio = 0.0
+    else:
+        vol_ratio = vol_last / float(vol_sma)
+
+    last = d.iloc[-1]
+
+    values = [e9, e21, e20, e50, rsi_val, adx_val, atr_val, vol_ratio]
+    for v in values:
+        if pd.isna(v):
+            return None
+
     return {
-        "trend_up": bool(last["ema_fast"] > last["ema_slow"]),
-        "macd_cross_up": bool(prev["macd_line"] <= prev["macd_signal"]
-                              and last["macd_line"] > last["macd_signal"]),
-        "ema_cross_down": bool(prev["ema_fast"] >= prev["ema_slow"]
-                               and last["ema_fast"] < last["ema_slow"]),
-        "ema_cross_up": bool(prev["ema_fast"] <= prev["ema_slow"]
-                             and last["ema_fast"] > last["ema_slow"]),
-        "rsi": float(last["rsi"]),
-        "adx": float(last["adx"]),
-        "adx_slope_up": adx_slope_up,
-        "vol_ratio": vol_ratio,
         "close": float(last["close"]),
         "high": float(last["high"]),
         "low": float(last["low"]),
-        "open": float(last["open"]),
-        "atr": float(last["atr"]) if not pd.isna(last["atr"]) else 0.0,
-        "macd_line": float(last["macd_line"]),
-        "macd_signal": float(last["macd_signal"]),
-        "ema_fast": float(last["ema_fast"]),
-        "ema_slow": float(last["ema_slow"]),
+        "ema9": float(e9),
+        "ema21": float(e21),
+        "ema20": float(e20),
+        "ema50": float(e50),
+        "rsi": float(rsi_val),
+        "adx": float(adx_val),
+        "atr": float(atr_val),
+        "vol_ratio": float(vol_ratio),
+        "macd_cross_fresh": bool(cross_fresh),
     }
 
-# ==================== БОКОВИКИ ====================
-def _find_cons_window(closed):
-    for days in CONSOLIDATION_WINDOWS:
-        if len(closed) < days:
-            continue
-        window = closed.tail(days)
-        mean = window["close"].mean()
-        if mean <= 0:
-            continue
-        range_pct = (window["close"].max() - window["close"].min()) / mean * 100
-        if range_pct <= CONSOLIDATION_MAX_RANGE_PCT:
-            return window, range_pct
-    return None, None
 
-def detect_consolidation(df_daily):
-    closed = df_daily.iloc[:-1]
-    if len(closed) < 60:
-        return None
-    adx_val = adx(closed).iloc[-1]
-    if pd.isna(adx_val) or adx_val >= CONSOLIDATION_MAX_ADX:
-        return None
-    window, range_pct = _find_cons_window(closed)
-    if window is None:
-        return None
-    recent = closed["volume"].tail(5).mean()
-    older = closed["volume"].iloc[-25:-5].mean()
-    vol_trend = float(recent / older) if older and older > 0 else 1.0
-    return {"days": len(window), "range_pct": range_pct, "adx": float(adx_val),
-            "upper_level": float(window["high"].max()),
-            "lower_level": float(window["low"].min()),
-            "vol_trend": round(vol_trend, 2)}
+def confirmed_df(symbol):
+    with ohlc_lock:
+        buf = OHLC.get(symbol)
+        if not buf:
+            return None
+        rows = [dict(c) for c in buf if c.get("confirm")]
 
-def check_breakout(df_daily, current_price):
-    closed = df_daily.iloc[:-1]
-    if len(closed) < 60:
+    if len(rows) < 60:
         return None
-    adx_val = adx(closed).iloc[-1]
-    if pd.isna(adx_val) or adx_val >= BREAKOUT_MAX_ADX:
-        return None
-    window, range_pct = _find_cons_window(closed)
-    if window is None:
-        return None
-    high = window["high"].max()
-    if current_price < high * (1 + BREAKOUT_MIN_TRIGGER_PCT / 100):
-        return None
-    if current_price > high * (1 + MAX_BREAKOUT_DISTANCE_PCT / 100):
-        return None
-    vol_base = closed["volume"].rolling(20).mean()
-    vol_avg = vol_base.iloc[-2]
-    last_vol = closed["volume"].iloc[-1]
-    if not (vol_avg > 0 and last_vol > vol_avg * 1.8):
-        return None
-    accum = closed["volume"].tail(3).mean()
-    base_old = vol_base.iloc[-4] if not pd.isna(vol_base.iloc[-4]) else vol_avg
-    if not (base_old > 0 and accum > base_old * BREAKOUT_VOL_ACCUM_MULT):
-        return None
-    atr_val = atr(closed).iloc[-1]
-    if pd.isna(atr_val) or atr_val <= 0:
-        return None
-    return {"days": len(window), "range_pct": range_pct, "adx": float(adx_val),
-            "stop": current_price - atr_val * ATR_MULT_SL,
-            "target": current_price + atr_val * ATR_MULT_TP}
 
-# ==================== УПРАВЛЕНИЕ ПОЗИЦИЕЙ ====================
-def check_exit(results, pos):
-    if not results.get(TRIGGER_TF) or not results.get("1d"):
-        return False, "", 0.0
-    r4h = results[TRIGGER_TF]
-    r1d = results["1d"]
-    atr1d = r1d["atr"] if r1d["atr"] > 0 else pos.get("atr_ref", 0.0)
-    entry = pos.get("entry_price") or 0.0
-    if r4h["low"] <= pos["stop"]:
-        return True, "Stop-Loss", min(r4h["open"], pos["stop"])
-    if r4h["high"] >= pos["target"]:
-        return True, "Take-Profit", pos["target"]
-    if entry > 0 and atr1d > 0:
-        if not pos.get("partial_done") and r4h["high"] >= entry + PARTIAL_TP_ATR * atr1d:
-            pos["partial_done"] = True
-            pos["stop"] = max(pos["stop"], entry * 1.001)
-            return False, "partial", entry + PARTIAL_TP_ATR * atr1d
-        if (not pos.get("breakeven_moved")
-                and r4h["close"] >= entry + BREAKEVEN_TRIGGER_ATR * atr1d):
-            pos["breakeven_moved"] = True
-            pos["stop"] = max(pos["stop"], entry * 1.001)
-        if r4h["close"] >= entry + TRAILING_TRIGGER_ATR * atr1d:
-            pos["highest_close"] = max(pos.get("highest_close", r4h["close"]),
-                                       r4h["close"])
-            new_stop = pos["highest_close"] - TRAILING_STEP_ATR * atr1d
-            floor = entry * 1.001 if (pos.get("partial_done")
-                                      or pos.get("breakeven_moved")) else pos["stop"]
-            if new_stop > pos["stop"]:
-                pos["stop"] = max(new_stop, floor)
-    if r4h.get("ema_cross_down"):
-        return True, "Разворот", r4h["close"]
-    return False, "", 0.0
+    df = pd.DataFrame(rows)
+    df = df.drop_duplicates("start").sort_values("start").reset_index(drop=True)
+    return df
 
-def can_enter(pair, signal=None, signal_risk_pct=None):
+
+# ==================== ТРЕНД / BTC ====================
+def get_trend(symbol, force=False):
     now = time.time()
-    trade_times[:] = [t for t in trade_times if now - t < 3600]
+
+    with trend_lock:
+        item = TREND_CACHE.get(symbol)
+        if not force and item and now - item.get("ts", 0) < 1800:
+            return item
+
+    df4 = fetch_klines(symbol, "240", 120)
+    dfd = fetch_klines(symbol, "D", 120)
+
+    a4 = analyze_frame(df4, drop_last=True)
+    ad = analyze_frame(dfd, drop_last=True)
+
+    score = 0
+    if a4 and a4["ema9"] > a4["ema21"]:
+        score += 1
+
+    bull_1d = False
+    if ad and ad["ema20"] > ad["ema50"]:
+        score += 1
+        bull_1d = True
+
+    item = {
+        "ts": now,
+        "score": score,
+        "adx_4h": float(a4["adx"]) if a4 else 0.0,
+        "adx_1d": float(ad["adx"]) if ad else 0.0,
+        "bull_1d": bull_1d,
+    }
+
+    with trend_lock:
+        TREND_CACHE[symbol] = item
+
+    return item
+
+
+def btc_allows_longs():
+    now = time.time()
+
+    with btc_lock:
+        if now - BTC_CACHE.get("ts", 0) < 300:
+            return BTC_CACHE["ok"], BTC_CACHE["reason"]
+
+    df = fetch_klines("BTCUSDT", "60", 20)
+    a = analyze_frame(df, drop_last=True)
+
+    ok = True
+    reason = "OK"
+
+    try:
+        closes = df.iloc[:-1]["close"]
+        if len(closes) >= 7:
+            chg_6h = (float(closes.iloc[-1]) / float(closes.iloc[-7]) - 1.0) * 100.0
+        else:
+            chg_6h = 0.0
+    except Exception:
+        chg_6h = 0.0
+
+    if chg_6h <= BTC_DROP_6H_PCT:
+        ok = False
+        reason = f"BTC {chg_6h:.1f}%/6h"
+    elif a and a["ema9"] < a["ema21"] and a["adx"] > BTC_ADX_BLOCK:
+        ok = False
+        reason = f"BTC downtrend ADX {a['adx']:.0f}"
+
+    with btc_lock:
+        BTC_CACHE["ts"] = now
+        BTC_CACHE["ok"] = ok
+        BTC_CACHE["reason"] = reason
+
+    return ok, reason
+
+
+# ==================== СОСТОЯНИЕ / CB / TRADES ====================
+def save_state():
+    try:
+        with state_lock:
+            data = dict(state)
+
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        logger.error("save_state error: %s", e)
+
+
+def load_state():
+    global state
+
+    if not os.path.exists(STATE_FILE):
+        state = {}
+        return
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception as e:
+        logger.critical("load_state error: %s", e)
+        state = {}
+
+    now = time.time()
+    with state_lock:
+        for sym, pos in list(state.items()):
+            if pos.get("position") == "open":
+                if float(pos.get("atr_ref", 0)) <= 0:
+                    entry = float(pos.get("entry_price", 0))
+                    stop = float(pos.get("stop", 0))
+                    if entry > 0 and stop > 0 and entry > stop:
+                        pos["atr_ref"] = (entry - stop) / ATR_MULT_SL
+                    else:
+                        pos["position"] = "closed"
+                        pos["last_exit_ts"] = now
+                        pos["last_exit_reason"] = "invalid_state"
+
+
+def save_cb():
+    try:
+        with cb_lock:
+            data = dict(cb)
+
+        tmp = CB_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, CB_FILE)
+    except Exception as e:
+        logger.error("save_cb error: %s", e)
+
+
+def load_cb():
+    if not os.path.exists(CB_FILE):
+        return
+
+    try:
+        with open(CB_FILE, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if loaded.get("day") != today:
+            loaded["day"] = today
+            loaded["day_pnl"] = 0.0
+            loaded["consec"] = 0
+
+        with cb_lock:
+            cb.update(loaded)
+    except Exception as e:
+        logger.warning("load_cb error: %s", e)
+
+
+def append_trade(trade):
+    try:
+        with file_lock:
+            trades = []
+            if os.path.exists(TRADES_FILE):
+                try:
+                    with open(TRADES_FILE, "r", encoding="utf-8") as f:
+                        trades = json.load(f)
+                except Exception:
+                    trades = []
+
+            trades.append(trade)
+            trades = trades[-2000:]
+
+            tmp = TRADES_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(trades, f, indent=2)
+            os.replace(tmp, TRADES_FILE)
+    except Exception as e:
+        logger.error("append_trade error: %s", e)
+
+
+def portfolio_risk_used():
+    with state_lock:
+        return sum(
+            float(p.get("account_risk_pct", 0.0))
+            for p in state.values()
+            if p.get("position") == "open"
+        )
+
+
+def cb_can_trade():
+    with cb_lock:
+        return time.time() >= float(cb.get("paused_until", 0.0))
+
+
+def can_enter(symbol, account_risk_pct):
+    now = time.time()
+
     if not cb_can_trade():
         return False
-    if not market_allows_longs():
-        if signal is None or not is_strong_signal_for_blocked_market(signal):
-            return False
-    old_state = state.get(pair, {})
-    if old_state.get("position") == "open":
-        return False
-    if now - float(old_state.get("last_exit_ts", 0) or 0) < ENTRY_COOLDOWN_SECONDS:
-        return False
-    open_positions = sum(1 for p in state.values() if p.get("position") == "open")
-    if open_positions >= MAX_OPEN_POSITIONS:
-        return False
-    if len(trade_times) >= MAX_TRADES_PER_HOUR:
-        return False
-    if not sector_slot_free(pair):
-        return False
-    if signal_risk_pct is not None:
-        if portfolio_risk_used() + signal_risk_pct > MAX_PORTFOLIO_RISK_PCT:
-            return False
-    return True
 
-# ==================== ТРЕНД-КЭШ ====================
-def get_trend(symbol):
-    with trend_cache_lock:
-        return trend_cache.get(symbol)
-
-def compute_tf_trend(df, params):
-    if df is None or df.empty or len(df) < 40:
-        return False
-    f = ema(df["close"], params["ema_fast"])
-    s = ema(df["close"], params["ema_slow"])
-    if len(f) < 6 or pd.isna(f.iloc[-2]) or pd.isna(s.iloc[-2]) or pd.isna(f.iloc[-5]):
-        return False
-    return bool(f.iloc[-2] > s.iloc[-2] and f.iloc[-2] > f.iloc[-5])
-
-def refresh_trend_for(pair):
-    res = {}
-    for tf in ("4h", "1d", "1w"):
-        p = TIMEFRAME_PARAMS[tf]
-        df = pd.DataFrame(fetch_klines(pair, p["bybit_interval"], p["min_bars"]))
-        res[tf] = compute_tf_trend(df, p)
-        time.sleep(0.15)
-    score = sum(1 for v in res.values() if v)
-    with trend_cache_lock:
-        trend_cache[pair] = {"score": score, **res}
-    return score
-
-def refresh_all_trends():
     with state_lock:
-        open_pairs = [p for p, v in state.items() if v.get("position") == "open"]
-    watch = list(dict.fromkeys(LAST_FILTERED_PAIRS + open_pairs))
-    q3 = 0
-    for pair in watch:
-        try:
-            if refresh_trend_for(pair) == 3:
-                q3 += 1
-        except Exception as e:
-            logger.debug("trend %s: %s", pair, e)
-    logger.info("Тренд-кэш обновлён: %d пар, подтверждённый тренд 3/3 = %d",
-                len(watch), q3)
+        open_count = sum(1 for p in state.values() if p.get("position") == "open")
+        if open_count >= MAX_OPEN_POSITIONS:
+            return False
 
-def trend_cache_loop():
-    first = True
-    while True:
-        if not first:
-            time.sleep(TREND_CACHE_REFRESH_SECONDS)
-        first = False
-        try:
-            refresh_all_trends()
-        except Exception as e:
-            logger.error("Поток тренд-кэша: %s", e)
+        if portfolio_risk_used() + float(account_risk_pct) > MAX_PORTFOLIO_RISK_PCT:
+            return False
 
-# ==================== ВСЕЛЕННАЯ ПАР ====================
-FIAT_BASES = {"AUD", "GBP", "EUR", "CAD", "CHF", "JPY", "USD",
-              "BRL", "MXN", "TRY", "ZAR", "INR", "SGD", "HKD"}
-STABLECOINS = {"USDC", "USDT", "DAI", "PYUSD", "TUSD", "FDUSD", "AUSD", "EURR",
-               "USDR", "FRNT", "EURQ", "USDPT", "BRL1", "EUROP", "USDTB",
-               "USD1", "RLUSD", "EURT", "GUSD", "FRAX", "LUSD", "SUSD", "USDP"}
-STOCK_TOKENS = {"AAPLX", "AMZNX", "GOOGLX", "MCDX", "TSLAX", "COINX"}
-STABLE_SUBSTRINGS = ("USD", "EUR", "GBP", "AUD", "CAD", "CHF", "JPY", "BRL", "MXN")
+        old = state.get(symbol, {})
+        if old.get("position") == "open":
+            return False
 
-def is_crypto(base):
-    if not base:
-        return False
-    if base in FIAT_BASES:
-        return False
-    if base.endswith("X") or base in STOCK_TOKENS:
-        return False
-    if base in STABLECOINS:
-        return False
-    if any(s in base for s in STABLE_SUBSTRINGS):
-        return False
+        if now - float(old.get("last_entry_ts", 0.0)) < ENTRY_COOLDOWN_SECONDS:
+            return False
+
+        if now - float(old.get("last_loss_ts", 0.0)) < PAIR_LOSS_COOLDOWN_SECONDS:
+            return False
+
+    with trade_times_lock:
+        trade_times[:] = [t for t in trade_times if now - t < 3600]
+        if len(trade_times) >= MAX_TRADES_PER_HOUR:
+            return False
+
+        entry_30[:] = [t for t in entry_30 if now - t < 1800]
+        if len(entry_30) >= MAX_TRADES_PER_30MIN:
+            return False
+
     return True
 
-def fetch_spot_instruments():
-    items = []
-    cursor = ""
-    while True:
-        params = {"category": "spot", "limit": 1000}
-        if cursor:
-            params["cursor"] = cursor
-        data = http_get(f"{BASE_URL}/instruments-info", params=params)
-        if not api_ok(data):
-            break
-        result = data.get("result") or {}
-        batch = result.get("list") or []
-        items.extend(batch)
-        cursor = result.get("nextPageCursor") or ""
-        if not cursor or not batch:
-            break
-    return items
 
-def fetch_spot_tickers():
-    data = http_get(f"{BASE_URL}/tickers", params={"category": "spot"})
-    if not api_ok(data):
-        return {}
-    out = {}
-    for t in (data.get("result") or {}).get("list") or []:
-        try:
-            out[t["symbol"]] = {
-                "last": float(t["lastPrice"]),
-                "turnover": float(t.get("turnover24h", 0)),
-                "high": float(t.get("highPrice24h", 0)),
-                "low": float(t.get("lowPrice24h", 0)),
-            }
-        except (KeyError, TypeError, ValueError):
-            continue
-    return out
-
-def _spot_candidates():
-    return [it["symbol"] for it in fetch_spot_instruments()
-            if it.get("status") == "Trading"
-            and it.get("quoteCoin") == "USDT"
-            and is_crypto(it.get("baseCoin", ""))]
-
-def get_filtered_pairs(top_n):
-    global LAST_FILTERED_PAIRS
-    try:
-        candidates = _spot_candidates()
-        if not candidates:
-            return []
-        tickers = fetch_spot_tickers()
-        scored = []
-        for sym in candidates:
-            t = tickers.get(sym)
-            if not t or t["turnover"] < MIN_TURNOVER_USD or t["low"] <= 0:
-                continue
-            scored.append((sym, (t["high"] - t["low"]) / t["low"] * 100))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        LAST_FILTERED_PAIRS = [s[0] for s in scored[:top_n]]
-        return LAST_FILTERED_PAIRS
-    except Exception as e:
-        logger.error("get_filtered_pairs: %s", e)
-        return []
-
-def get_all_available_pairs(max_pairs):
-    try:
-        candidates = _spot_candidates()
-        if not candidates:
-            return []
-        tickers = fetch_spot_tickers()
-        ranked = [(sym, tickers[sym]["turnover"])
-                  for sym in candidates
-                  if sym in tickers and tickers[sym]["turnover"] >= CONSOLIDATION_MIN_TURNOVER_USD]
-        ranked.sort(key=lambda x: x[1], reverse=True)
-        return [s[0] for s in ranked[:max_pairs]]
-    except Exception as e:
-        logger.error("get_all_available_pairs: %s", e)
-        return []
-
-# ==================== ЗАГРУЗКА ДАННЫХ ====================
-def fetch_klines(pair, interval, min_bars):
-    data = http_get(f"{BASE_URL}/kline", params={
-        "category": "spot", "symbol": pair,
-        "interval": interval, "limit": min(min_bars, 1000),
-    })
-    if not api_ok(data):
-        return []
-    rows = (data.get("result") or {}).get("list") or []
-    if not rows:
-        return []
-    rows = list(reversed(rows))
-    out = []
-    for r in rows:
-        try:
-            out.append({
-                "start": int(r[0]) // 1000,
-                "open": float(r[1]), "high": float(r[2]),
-                "low": float(r[3]), "close": float(r[4]),
-                "volume": float(r[5]),
-            })
-        except (TypeError, ValueError, IndexError):
-            continue
-    return out[-min_bars:]
-
-def fetch_current_prices(pairs):
-    want = set(p for p in pairs if isinstance(p, str))
-    prices = {}
-    for sym, t in fetch_spot_tickers().items():
-        if sym in want:
-            prices[sym] = t["last"]
-    return prices
-
-# ==================== СКОРИНГ ВХОДА ====================
-def find_fresh_cross(df, window=FRESH_CROSS_WINDOW):
-    ml, ms = df["macd_line"], df["macd_signal"]
-    for ago in range(0, window):
-        i = len(df) - 2 - ago
-        if i < 1:
-            return None
-        if ml.iloc[i - 1] <= ms.iloc[i - 1] and ml.iloc[i] > ms.iloc[i]:
-            return ago
-    return None
-
-def _rr_ok(entry, stop, target, min_rr=1.5):
-    risk = entry - stop
-    if risk <= 0 or target <= entry:
-        return False
-    return (target - entry) / risk >= min_rr
-
-def evaluate_ws_entry(df, symbol):
-    if len(df) < MIN_BARS + 1:
+# ==================== СИГНАЛЫ ====================
+def make_signal(symbol, strategy, entry, atr_value, score, parts,
+                entry_low=None, entry_high=None, expiry_sec=1800):
+    if entry <= 0 or atr_value <= 0:
         return None
-    sig = df.iloc[-2]
-    if (pd.isna(sig["ema_fast"]) or pd.isna(sig["rsi"])
-            or pd.isna(sig["atr"]) or sig["atr"] <= 0):
-        return None
-    if not (RSI_MIN <= sig["rsi"] <= RSI_MAX):
-        return None
-    if not (ADX_MIN <= sig["adx"] <= ADX_MAX):
-        return None
-    if not (sig["ema_fast"] > sig["ema_slow"]):
-        return None
-    ti = get_trend(symbol)
-    if ti is None or ti["score"] < 2:
-        return None
-    score = 0
-    parts = []
-    cross_ago = find_fresh_cross(df)
-    if cross_ago == 0:
-        score += 3
-        parts.append("MACD-кросс +3")
-    elif cross_ago in (1, 2):
-        hist_now = sig["macd_line"] - sig["macd_signal"]
-        hist_prev = df.iloc[-3]["macd_line"] - df.iloc[-3]["macd_signal"]
-        if hist_now > hist_prev:
-            score += 2
-            parts.append(f"MACD-кросс ({cross_ago + 1} св. назад) +2")
-        else:
-            return None
-    else:
-        return None
-    score += 1
-    parts.append("EMA9>21 +1")
-    if bool(sig["ema_cross_up"]):
-        score += 1
-        parts.append("EMA-кросс +1")
-    score += 1
-    parts.append("RSI в зоне +1")
-    if bool(sig["adx_slope_up"]):
-        score += 1
-        parts.append("ADX растёт +1")
-    vol_ratio = float(sig["vol_ratio"]) if not pd.isna(sig["vol_ratio"]) else 0.0
-    if vol_ratio >= MIN_VOL_MULT:
-        score += 1
-        parts.append(f"Объём {vol_ratio:.1f}× +1")
-    if ti["score"] == 3:
-        score += 2
-        parts.append("Тренд 3/3 +2")
-    else:
-        score += 1
-        parts.append("Тренд 2/3 +1")
-    min_score = MIN_SIGNAL_SCORE
-    if SESSION_FILTER_ENABLED and datetime.now(timezone.utc).hour < 7:
-        min_score += 1
-    if score < min_score:
-        return None
-    entry = float(df.iloc[-1]["close"])
-    atr_value = float(sig["atr"])
+
     stop = entry - atr_value * ATR_MULT_SL
     target = entry + atr_value * ATR_MULT_TP
+
+    risk_pct = (entry - stop) / entry * 100.0
+
+    if risk_pct < MIN_STOP_DISTANCE_PCT:
+        stop = entry * (1.0 - MIN_STOP_DISTANCE_PCT / 100.0)
+        risk_pct = MIN_STOP_DISTANCE_PCT
+        target = entry + (entry - stop) * (ATR_MULT_TP / ATR_MULT_SL)
+
     if stop >= entry or target <= entry:
         return None
-    if (entry - stop) / entry * 100 < MIN_STOP_DISTANCE_PCT:
-        return None
-    if not _rr_ok(entry, stop, target):
-        return None
-    return {"entry": entry, "stop": stop, "target": target, "atr": atr_value,
-            "score": score, "parts": parts, "strategy": "ws_15m",
-            "trend_score": ti["score"]}
 
-def evaluate_ws_pullback(df, symbol):
-    if not PULLBACK_ENABLED or len(df) < MIN_BARS + 1:
+    rr = (target - entry) / (entry - stop)
+    if rr < MIN_RR:
         return None
-    ti = get_trend(symbol)
-    if ti is None or ti["score"] < 3:
-        return None
-    if find_fresh_cross(df) is not None:
-        return None
-    sig = df.iloc[-2]
-    if pd.isna(sig["ema_fast"]) or pd.isna(sig["ema_slow"]) or pd.isna(sig["atr"]):
-        return None
-    if sig["atr"] <= 0 or not (sig["ema_fast"] > sig["ema_slow"]):
-        return None
-    touched = sig["low"] <= sig["ema_slow"] * 1.002
-    recovered = sig["close"] >= sig["ema_fast"]
-    if not (touched and recovered):
-        return None
-    if sig["ema_slow"] <= df["ema_slow"].iloc[-6]:
-        return None
-    recent_high = df["high"].iloc[-11:-1].max()
-    prior_low = df["low"].iloc[-21:-6].min()
-    if sig["ema_slow"] > 0 and (recent_high - sig["low"]) / sig["ema_slow"] > PULLBACK_MAX_DEPTH_PCT:
-        return None
-    if prior_low > 0 and (recent_high - prior_low) / prior_low < PULLBACK_MIN_PRIOR_MOVE_PCT:
-        return None
-    if not (sig["close"] > sig["open"]):
-        return None
-    if not (RSI_MIN <= sig["rsi"] <= PULLBACK_RSI_MAX):
-        return None
-    if not (ADX_MIN <= sig["adx"] <= ADX_MAX):
-        return None
-    vol_ratio = float(sig["vol_ratio"]) if not pd.isna(sig["vol_ratio"]) else 0.0
-    if vol_ratio < PULLBACK_VOL_MULT:
-        return None
-    entry = float(df.iloc[-1]["close"])
-    atr_value = float(sig["atr"])
-    stop = entry - atr_value * PULLBACK_SL_ATR
-    target = entry + atr_value * PULLBACK_TP_ATR
-    if stop >= entry or target <= entry:
-        return None
-    if (entry - stop) / entry * 100 < MIN_STOP_DISTANCE_PCT:
-        return None
-    if not _rr_ok(entry, stop, target):
-        return None
-    return {"entry": entry, "stop": stop, "target": target, "atr": atr_value,
-            "score": "PB", "trend_score": ti["score"],
-            "parts": [f"Откат к EMA21 · тренд 3/3 · объём {vol_ratio:.1f}×"],
-            "strategy": "ws_pullback"}
 
-# ==================== BREAKOUT RETEST ====================
-def evaluate_ws_retest(df, symbol, level):
-    if not RETEST_ENABLED or not level or level <= 0 or len(df) < 25:
-        return None
-    mem = retest_memory.setdefault(symbol, {"above": False})
-    prev_close = float(df["close"].iloc[-3])
-    last = df.iloc[-2]
-    if prev_close < level * 0.97:
-        mem["above"] = False
-    if prev_close > level and not mem["above"]:
-        mem["above"] = True
-    if not mem["above"]:
-        return None
-    touched = last["low"] <= level * (1 + RETEST_TOUCH_TOLERANCE_PCT / 100)
-    crashed = last["close"] < level * 0.99
-    recovered = last["close"] > level and last["close"] > last["open"]
-    if not (touched and recovered and not crashed):
-        return None
-    atr_val = float(df["atr"].iloc[-2]) if not pd.isna(df["atr"].iloc[-2]) else 0.0
-    if atr_val <= 0:
-        return None
-    entry = float(df.iloc[-1]["close"])
-    if entry <= level:
-        return None
-    stop = level - RETEST_SL_ATR * atr_val
-    target = entry + RETEST_TP_ATR * atr_val
-    if stop >= entry or target <= entry:
-        return None
-    if (entry - stop) / entry * 100 < MIN_STOP_DISTANCE_PCT:
-        return None
-    if not _rr_ok(entry, stop, target):
-        return None
-    mem["above"] = False
-    ti = get_trend(symbol)
-    return {"entry": entry, "stop": stop, "target": target, "atr": atr_val,
-            "score": "RT", "trend_score": (ti["score"] if ti else 0),
-            "parts": [f"Retest уровня {level:.6f} · отскок"],
-            "strategy": "breakout_retest"}
+    size = RISK_PER_TRADE_PCT / max(risk_pct, 0.1)
+    size = max(0.05, min(1.0, size))
 
-# ==================== ОТКРЫТИЕ ПОЗИЦИИ ====================
-def open_position(symbol, sig, closed_start):
-    btc_blocked = not market_allows_longs()
-    if btc_blocked and not is_strong_signal_for_blocked_market(sig):
-        return None
-    risk_pct = (sig["entry"] - sig["stop"]) / sig["entry"] * 100
-    if not can_enter(symbol, signal=sig, signal_risk_pct=risk_pct):
-        return None
-    old_state = state.get(symbol, {})
-    if old_state.get("last_signal_candle") == closed_start:
-        return None
-    rr = (sig["target"] - sig["entry"]) / (sig["entry"] - sig["stop"])
-    atr_pct = sig["atr"] / sig["entry"] * 100
-    size = position_size_fraction(
-        sig["score"] if isinstance(sig["score"], int) else 6,
-        rr, atr_pct, portfolio_risk_used(), risk_pct,
-        btc_blocked=btc_blocked,
-    )
-    new_state = old_state.copy()
-    new_state.update({
-        "position": "open",
-        "entry_price": sig["entry"],
-        "stop": sig["stop"],
-        "target": sig["target"],
-        "atr_ref": sig["atr"],
-        "entry_time": datetime.now(timezone.utc).isoformat(),
-        "last_signal_candle": closed_start,
-        "last_entry_ts": time.time(),
-        "strategy": sig["strategy"],
-        "score": sig["score"],
-        "size_fraction": size,
-        "btc_blocked_entry": btc_blocked,
-    })
-    state[symbol] = new_state
-    trade_times.append(time.time())
-    save_state(state)
-    return new_state
+    account_risk_pct = size * risk_pct
 
-# ==================== БЫСТРЫЙ BREAKOUT ЧЕРЕЗ WS (kline) ====================
-def try_ws_breakout(symbol, new_candle, df):
-    with breakout_cache_lock:
-        level = breakout_cache.get(symbol)
-    if level is None or level <= 0:
-        return None
-    prev_close = float(df["close"].iloc[-3])
-    last_close = float(df["close"].iloc[-2])
-    vol_sma = df["volume"].rolling(20).mean()
-    vol_ratio = (float(df["volume"].iloc[-2] / vol_sma.iloc[-2])
-                 if not pd.isna(vol_sma.iloc[-2]) and vol_sma.iloc[-2] > 0 else 0.0)
-    if not (prev_close < level <= last_close):
-        return None
-    if last_close > level * (1 + MAX_BREAKOUT_DISTANCE_PCT / 100):
-        return None
-    if vol_ratio < 1.8:
-        return None
-    atr_val = float(df["atr"].iloc[-2]) if not pd.isna(df["atr"].iloc[-2]) else 0.0
-    if atr_val <= 0:
-        return None
-    entry = float(new_candle["close"])
-    stop = entry - atr_val * ATR_MULT_SL
-    target = entry + atr_val * ATR_MULT_TP
-    if stop >= entry or target <= entry:
-        return None
-    if (entry - stop) / entry * 100 < MIN_STOP_DISTANCE_PCT:
-        return None
-    if not _rr_ok(entry, stop, target):
-        return None
-    closed_start = int(df.iloc[-2]["start"])
-    risk_pct = (entry - stop) / entry * 100
-    ti = get_trend(symbol)
-    trend_score = ti["score"] if ti else 0
-    pseudo_sig = {"trend_score": trend_score, "score": 7}
-    btc_blocked = not market_allows_longs()
-    if btc_blocked and not is_strong_signal_for_blocked_market(pseudo_sig):
-        return None
+    if entry_low is None:
+        entry_low = entry * ENTRY_TOLERANCE_LOW
+    if entry_high is None:
+        entry_high = entry * ENTRY_TOLERANCE_HIGH
+
+    return {
+        "symbol": symbol,
+        "strategy": strategy,
+        "entry": float(entry),
+        "stop": float(stop),
+        "target": float(target),
+        "atr": float(atr_value),
+        "score": int(score),
+        "parts": list(parts),
+        "risk_pct": float(risk_pct),
+        "account_risk_pct": float(account_risk_pct),
+        "size_fraction": float(size),
+        "rr": float(rr),
+        "entry_low": float(entry_low),
+        "entry_high": float(entry_high),
+        "expires": time.time() + float(expiry_sec),
+    }
+
+
+def arm_signal(symbol, sig):
+    if not sig:
+        return
+
+    now = time.time()
+
     with state_lock:
-        if not can_enter(symbol, signal=pseudo_sig, signal_risk_pct=risk_pct):
-            return None
-        old_state = state.get(symbol, {})
-        if old_state.get("last_signal_candle") == closed_start:
-            return None
-        rr = (target - entry) / (entry - stop)
-        size = position_size_fraction(7, rr, atr_val / entry * 100,
-                                      portfolio_risk_used(), risk_pct,
-                                      btc_blocked=btc_blocked)
-        new_state = old_state.copy()
-        new_state.update({
+        pos = state.get(symbol, {})
+        if pos.get("position") == "open":
+            return
+        if now - float(pos.get("last_entry_ts", 0.0)) < ENTRY_COOLDOWN_SECONDS:
+            return
+        if now - float(pos.get("last_loss_ts", 0.0)) < PAIR_LOSS_COOLDOWN_SECONDS:
+            return
+
+    with armed_lock:
+        ARMED[symbol] = sig
+
+    logger.info("ARM %s %s score=%s zone=%.8g-%.8f",
+                symbol, sig["strategy"], sig["score"],
+                sig["entry_low"], sig["entry_high"])
+
+
+def expire_armed():
+    now = time.time()
+    with armed_lock:
+        for sym, sig in list(ARMED.items()):
+            if now > float(sig.get("expires", 0)):
+                ARMED.pop(sym, None)
+
+
+def open_position(sig):
+    symbol = sig["symbol"]
+
+    if not can_enter(symbol, sig["account_risk_pct"]):
+        return False
+
+    now = time.time()
+
+    with state_lock:
+        state[symbol] = {
             "position": "open",
-            "entry_price": entry,
-            "stop": stop,
-            "target": target,
-            "atr_ref": atr_val,
+            "strategy": sig["strategy"],
+            "entry_price": sig["entry"],
+            "stop": sig["stop"],
+            "target": sig["target"],
+            "atr_ref": sig["atr"],
+            "score": sig["score"],
+            "risk_pct": sig["risk_pct"],
+            "account_risk_pct": sig["account_risk_pct"],
+            "size_fraction": sig["size_fraction"],
+            "rr": sig["rr"],
+            "entry_ts": now,
             "entry_time": datetime.now(timezone.utc).isoformat(),
-            "last_signal_candle": closed_start,
-            "last_entry_ts": time.time(),
-            "strategy": "breakout_ws",
-            "score": "BWS",
-            "size_fraction": size,
-            "btc_blocked_entry": btc_blocked,
-        })
-        state[symbol] = new_state
-        trade_times.append(time.time())
-        save_state(state)
-    return {"entry": entry, "stop": stop, "target": target,
-            "vol_ratio": vol_ratio, "level": level}
+            "last_entry_ts": now,
+            "last_loss_ts": 0.0,
+            "last_exit_ts": 0.0,
+            "partial_done": False,
+            "highest": sig["entry"],
+            "last_reversal_check": 0.0,
+        }
+        save_state()
 
-# ==================== ⚡ WS-REALTIME-HOT (v20.0) ====================
-def update_ticker_subscription():
-    """
-    Обновляет список пар для подписки на tickers-канал.
-    Основа: HOT_PAIRS_CACHE (топ-10 кандидатов + топ-10 боковиков).
-    Дополняем: монеты из 200, близкие к алерту (<3% до пробоя, gap<0.5%).
-    Максимум WS_TICKERS_MAX_PAIRS.
-    """
-    if not WS_TICKERS_ENABLED:
-        return
-    with HOT_PAIRS_LOCK:
-        cands = list(HOT_PAIRS_CACHE["candidates"])
-        cons = list(HOT_PAIRS_CACHE["consolidations"])
-    base_symbols = set()
-    for s in cands:
-        base_symbols.add(s["pair"])
-    for item in cons:
-        base_symbols.add(item["pair"])
-    # Дополняем: близкие к алертам из всех 200 пар
+    with trade_times_lock:
+        trade_times.append(now)
+        entry_30.append(now)
+
+    with armed_lock:
+        ARMED.pop(symbol, None)
+
+    parts_txt = " / ".join(sig["parts"])
+
+    send_telegram(
+        f"🟢 <b>ВХОД {sig['strategy'].upper()}</b>\n"
+        f"Пара: {symbol}\n"
+        f"Цена: {sig['entry']:.8f}\n"
+        f"SL: {sig['stop']:.8f}\n"
+        f"TP: {sig['target']:.8f}\n"
+        f"Score: {sig['score']} · RR: {sig['rr']:.2f} · Size: {sig['size_fraction']:.3f}\n"
+        f"<i>{parts_txt}</i>"
+    )
+
+    logger.info(
+        "OPEN %s %s entry=%.8f sl=%.8f tp=%.8f score=%s size=%.3f",
+        symbol,
+        sig["strategy"],
+        sig["entry"],
+        sig["stop"],
+        sig["target"],
+        sig["score"],
+        sig["size_fraction"],
+    )
+
+    return True
+
+
+# ==================== ЗАКРЫТИЕ ====================
+def record_trade(symbol, pos, exit_price, reason, fraction):
+    entry = float(pos.get("entry_price", 0.0))
+    if entry <= 0:
+        return 0.0
+
+    size = float(pos.get("size_fraction", 1.0))
+    fraction = float(fraction)
+
+    pnl_pct = (float(exit_price) - entry) / entry * 100.0
+    contribution_pct = size * pnl_pct * fraction
+
+    now = time.time()
+    full_close = fraction >= 0.999
+
+    trade = {
+        "time": datetime.now(timezone.utc).isoformat(),
+        "symbol": symbol,
+        "strategy": pos.get("strategy", "?"),
+        "entry": entry,
+        "exit": float(exit_price),
+        "reason": reason,
+        "fraction": fraction,
+        "pnl_pct": pnl_pct,
+        "contribution_pct": contribution_pct,
+        "size_fraction": size,
+    }
+
+    append_trade(trade)
+
+    with cb_lock:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        if cb.get("day") != today:
+            cb["day"] = today
+            cb["day_pnl"] = 0.0
+            cb["consec"] = 0
+
+        cb["day_pnl"] = float(cb.get("day_pnl", 0.0)) + contribution_pct
+
+        if contribution_pct < 0:
+            cb["consec"] = int(cb.get("consec", 0)) + 1
+            if full_close:
+                pos["last_loss_ts"] = now
+        else:
+            cb["consec"] = 0
+
+        if cb["consec"] >= CB_CONSEC_LOSSES or cb["day_pnl"] <= CB_DAILY_LOSS_PCT:
+            cb["paused_until"] = now + CB_PAUSE_SECONDS
+            logger.warning(
+                "CIRCUIT BREAKER: consec=%s day_pnl=%.2f%% pause=%s min",
+                cb["consec"],
+                cb["day_pnl"],
+                CB_PAUSE_SECONDS // 60,
+            )
+
+        save_cb()
+
+    if full_close:
+        pos["last_exit_ts"] = now
+        pos["position"] = "closed"
+
+    return contribution_pct
+
+
+def close_position(symbol, price, reason, fraction=1.0):
     with state_lock:
-        open_pairs = set(p for p, v in state.items() if v.get("position") == "open")
-    for sym in PAIRS_WS:
-        if len(base_symbols) >= WS_TICKERS_MAX_PAIRS:
-            break
-        if sym in base_symbols:
-            continue
-        # Проверяем: есть ли в breakout_cache (боковик) и близко ли
-        with breakout_cache_lock:
-            lvl = breakout_cache.get(sym)
-        if lvl and lvl > 0:
-            # Найдём текущую цену из ohlc_buffers
-            buf = ohlc_buffers.get(sym)
-            if buf and len(buf) > 0:
-                cur = float(buf[-1]["close"])
-                if cur > 0 and (lvl - cur) / cur * 100 < 3.0:
-                    base_symbols.add(sym)
-                    continue
-    new_subset = set(list(base_symbols)[:WS_TICKERS_MAX_PAIRS])
-    # Сравниваем с текущей подпиской
-    with WS_TICKER_PAIRS_LOCK:
-        old_subset = set(WS_TICKER_PAIRS)
-    to_add = new_subset - old_subset
-    to_remove = old_subset - new_subset
-    if not to_add and not to_remove:
-        return
-    # Обновляем WS-подписку
-    app = WS_TICKERS_APP
-    if app is not None and WS_TICKERS_CONNECTED.is_set():
-        try:
-            if to_add:
-                args = [f"tickers.{s}" for s in to_add]
-                for i in range(0, len(args), 100):
-                    app.send(json.dumps({"op": "subscribe",
-                                         "args": args[i:i + 100]}))
-            if to_remove:
-                args = [f"tickers.{s}" for s in to_remove]
-                for i in range(0, len(args), 100):
-                    app.send(json.dumps({"op": "unsubscribe",
-                                         "args": args[i:i + 100]}))
-            logger.info("⚡ WS-tickers обновлён: +%d -%d (всего %d)",
-                        len(to_add), len(to_remove), len(new_subset))
-        except Exception as e:
-            logger.warning("WS-tickers send error: %s", e)
-    with WS_TICKER_PAIRS_LOCK:
-        WS_TICKER_PAIRS.clear()
-        WS_TICKER_PAIRS.update(new_subset)
+        pos = state.get(symbol)
+        if not pos or pos.get("position") != "open":
+            return
 
-def _open_on_tick(symbol, cur_price, source="tick"):
-    """Проверяет возможность входа на текущем тике (для hot-пары)."""
-    if not WS_TICKERS_ENABLED:
-        return
-    # Cooldown
-    now_ts = time.time()
-    last = HOT_LAST_CHECK.get(symbol, 0)
-    if now_ts - last < WS_HOT_COOLDOWN_SEC:
-        return
-    # Проверяем, что это кандидат или боковик
-    with HOT_PAIRS_LOCK:
-        cands = HOT_PAIRS_CACHE["candidates"]
-        cons = HOT_PAIRS_CACHE["consolidations"]
-    cand = next((s for s in cands if s["pair"] == symbol), None)
-    con = next((item for item in cons if item["pair"] == symbol), None)
-    if not cand and not con:
-        return
-    buf = ohlc_buffers.get(symbol)
-    if not buf or len(buf) < MIN_BARS + 1:
-        return
-    df = pd.DataFrame(list(buf))
-    if len(df) < MIN_BARS:
-        return
-    df["ema_fast"] = ema(df["close"], 9)
-    df["ema_slow"] = ema(df["close"], 21)
-    df["macd_line"] = ema(df["close"], 12) - ema(df["close"], 26)
-    df["macd_signal"] = ema(df["macd_line"], 9)
-    df["atr"] = atr(df)
-    df["rsi"] = rsi(df["close"])
-    df["adx"] = adx(df)
-    df["vol_sma"] = df["volume"].rolling(20).mean()
-    df["adx_slope_up"] = df["adx"] > df["adx"].shift(3)
-    df["ema_cross_up"] = ((df["ema_fast"] > df["ema_slow"])
-                          & (df["ema_fast"].shift(1) <= df["ema_slow"].shift(1)))
-    df["vol_ratio"] = df["volume"] / df["vol_sma"].replace(0, np.nan)
+        contribution = record_trade(symbol, pos, price, reason, fraction)
+        state[symbol] = pos
+        save_state()
 
-    # --- Проверка кандидата ---
-    if cand:
-        entry_ref = cand.get("close_price", 0)
-        if entry_ref > 0:
-            drift_ok, _ = check_peak_guard_drift(cur_price, entry_ref)
-            if not drift_ok:
-                return
-        sig = evaluate_ws_entry(df, symbol)
-        if sig is None:
+    icon = "🟢" if contribution > 0 else "🔴"
+
+    send_telegram(
+        f"{icon} <b>ВЫХОД · {reason}</b>\n"
+        f"Пара: {symbol}\n"
+        f"Цена: {float(price):.8f}\n"
+        f"Доля: {fraction:.2f}\n"
+        f"Вклад в счёт: <b>{contribution:+.3f}%</b>"
+    )
+
+    logger.info(
+        "CLOSE %s %s price=%.8f fraction=%.2f contribution=%.3f%%",
+        symbol,
+        reason,
+        float(price),
+        float(fraction),
+        contribution,
+    )
+
+
+def check_position_price(symbol, price):
+    if not price or price <= 0:
+        return
+
+    with state_lock:
+        pos = state.get(symbol)
+        if not pos or pos.get("position") != "open":
             return
-        peak_ok, peak_reason, _ = check_peak_guard(df, cur_price)
-        if not peak_ok:
-            if now_ts - LAST_PEAK_ALERT.get(symbol, 0) > 600:
-                logger.info("⛔ HOT cand %s: %s", symbol, peak_reason)
-                LAST_PEAK_ALERT[symbol] = now_ts
+
+        entry = float(pos.get("entry_price", 0.0))
+        atr_ref = float(pos.get("atr_ref", 0.0))
+        stop = float(pos.get("stop", 0.0))
+        target = float(pos.get("target", 0.0))
+        partial = bool(pos.get("partial_done", False))
+        highest = max(float(pos.get("highest", entry)), float(price))
+
+        if entry <= 0 or atr_ref <= 0:
             return
-        rsi_ok, rsi_reason = check_peak_guard_rsi(float(df["rsi"].iloc[-2]))
-        if not rsi_ok:
+
+        pos["highest"] = highest
+
+        # Стоп
+        if price <= stop:
+            fraction = 0.5 if partial else 1.0
+            reason = "BE/Trailing Stop" if partial else "Stop-Loss"
+            close_position(symbol, stop, reason, fraction)
             return
-        rr = (sig["target"] - sig["entry"]) / (sig["entry"] - sig["stop"])
-        if rr < WS_HOT_MIN_RR:
+
+        # Тейк
+        if price >= target:
+            fraction = 0.5 if partial else 1.0
+            close_position(symbol, target, "Take-Profit", fraction)
             return
-        HOT_LAST_CHECK[symbol] = now_ts
-        with state_lock:
-            opened = open_position(symbol, sig, int(df.iloc[-2]["start"]))
-        if opened:
-            logger.info("⚡ WS-REALTIME ВХОД (cand) %s @ %.6g", symbol, sig["entry"])
-            btc_blocked = not market_allows_longs()
-            extra = " ⚠️BTC-БЛОК ×0.5" if btc_blocked else ""
+
+        # Частичный TP
+        if not partial and price >= entry + PARTIAL_TP_ATR * atr_ref:
+            part_price = entry + PARTIAL_TP_ATR * atr_ref
+            contribution = record_trade(symbol, pos, part_price, "Partial TP 50%", 0.5)
+
+            pos["partial_done"] = True
+            pos["stop"] = max(stop, entry * 1.001)
+            state[symbol] = pos
+            save_state()
+
             send_telegram(
-                f"⚡ <b>WS-REALTIME ВХОД</b>{extra}\n"
-                f"Пара: {tv_link(symbol)}\n"
-                f"Цена: {sig['entry']:.8f}\n"
-                f"SL: {sig['stop']:.8f} · TP: {sig['target']:.8f}\n"
-                f"<i>{' · '.join(sig['parts'])}</i>")
+                f"💰 <b>ЧАСТИЧНЫЙ TP 50%</b>\n"
+                f"Пара: {symbol}\n"
+                f"Цена: {part_price:.8f}\n"
+                f"Вклад: <b>{contribution:+.3f}%</b>\n"
+                f"Стоп переведён в безубыток."
+            )
+            return
+
+        # Трейлинг после partial
+        if partial:
+            new_stop = highest - TRAILING_STEP_ATR * atr_ref
+            floor = entry * 1.001
+            if new_stop > stop:
+                pos["stop"] = max(new_stop, floor)
+
+        state[symbol] = pos
+        save_state()
+
+
+def check_armed_price(symbol, price):
+    if not price or price <= 0:
         return
 
-    # --- Проверка боковика ---
-    if con:
-        lvl = con.get("upper_level", 0)
-        if lvl <= 0:
-            return
-        if cur_price < lvl * (1 + BREAKOUT_MIN_TRIGGER_PCT / 100):
-            return
-        if cur_price > lvl * (1 + MAX_BREAKOUT_DISTANCE_PCT / 100):
-            return
-        vol_ratio = (float(df["volume"].iloc[-1] / df["vol_sma"].iloc[-1])
-                     if not pd.isna(df["vol_sma"].iloc[-1]) and df["vol_sma"].iloc[-1] > 0 else 0.0)
-        if vol_ratio < WS_HOT_BREAKOUT_VOL:
-            return
-        peak_ok, _, _ = check_peak_guard(df, cur_price)
-        if not peak_ok:
-            return
-        atr_val = float(df["atr"].iloc[-2]) if not pd.isna(df["atr"].iloc[-2]) else 0.0
-        if atr_val <= 0:
-            return
-        entry = cur_price
-        stop = entry - atr_val * ATR_MULT_SL
-        target = entry + atr_val * ATR_MULT_TP
-        if stop >= entry or target <= entry:
-            return
-        if (entry - stop) / entry * 100 < MIN_STOP_DISTANCE_PCT:
-            return
-        rr = (target - entry) / (entry - stop)
-        if rr < WS_HOT_MIN_RR:
-            return
-        ti = get_trend(symbol)
-        trend_score = ti["score"] if ti else 0
-        pseudo_sig = {"trend_score": trend_score, "score": 7}
-        btc_blocked = not market_allows_longs()
-        if btc_blocked and not is_strong_signal_for_blocked_market(pseudo_sig):
-            return
-        HOT_LAST_CHECK[symbol] = now_ts
-        with state_lock:
-            if not can_enter(symbol, signal=pseudo_sig,
-                             signal_risk_pct=(entry - stop) / entry * 100):
-                return
-            old_state = state.get(symbol, {})
-            closed_start = int(df.iloc[-2]["start"]) if len(df) >= 2 else 0
-            if old_state.get("last_signal_candle") == closed_start:
-                return
-            size = position_size_fraction(7, rr, atr_val / entry * 100,
-                                          portfolio_risk_used(),
-                                          (entry - stop) / entry * 100,
-                                          btc_blocked=btc_blocked)
-            new_state = old_state.copy()
-            new_state.update({
-                "position": "open", "entry_price": entry,
-                "stop": stop, "target": target, "atr_ref": atr_val,
-                "entry_time": datetime.now(timezone.utc).isoformat(),
-                "last_signal_candle": closed_start,
-                "last_entry_ts": time.time(),
-                "strategy": "breakout_realtime", "score": "RT",
-                "size_fraction": size,
-                "btc_blocked_entry": btc_blocked,
-            })
-            state[symbol] = new_state
-            trade_times.append(time.time())
-            save_state(state)
-        logger.info("⚡ WS-REALTIME ПРОБОЙ %s @ %.6g (уровень %.6g, vol ×%.1f)",
-                    symbol, entry, lvl, vol_ratio)
-        extra = " ⚠️BTC-БЛОК ×0.5" if btc_blocked else ""
-        send_telegram(
-            f"⚡ <b>WS-REALTIME ПРОБОЙ</b>{extra}\n"
-            f"Пара: {tv_link(symbol)}\n"
-            f"Уровень: {lvl:.6g} → цена {entry:.6g}\n"
-            f"SL: {stop:.8f} · TP: {target:.8f}\n"
-            f"Объём: ×{vol_ratio:.1f}")
+    now = time.time()
 
-# ==================== WEBSOCKET: KLINE (основной) ====================
-def on_open(ws):
-    logger.info("WS kline подключен. Подписка на %d пар...", len(PAIRS_WS))
-    args = [f"kline.{TIMEFRAME}.{p}" for p in PAIRS_WS]
-    for i in range(0, len(args), 100):
-        ws.send(json.dumps({"op": "subscribe", "args": args[i:i + 100]}))
-        time.sleep(0.2)
-    threading.Thread(target=pinger, args=(ws,), daemon=True).start()
+    with armed_lock:
+        sig = ARMED.get(symbol)
+        if not sig:
+            return
 
-def pinger(ws):
-    while True:
+        if now > float(sig.get("expires", 0)):
+            ARMED.pop(symbol, None)
+            return
+
+        if price < float(sig.get("entry_low", 0)) or price > float(sig.get("entry_high", 0)):
+            return
+
+        new_sig = make_signal(
+            symbol,
+            sig["strategy"],
+            price,
+            sig["atr"],
+            sig["score"],
+            sig["parts"],
+            expiry_sec=60,
+        )
+
+    if new_sig:
+        open_position(new_sig)
+
+
+def try_realtime_breakout(symbol, price):
+    if not price or price <= 0:
+        return
+
+    with cons_lock:
+        level = CONS_LEVEL.get(symbol)
+
+    if not level or price <= level * 1.001:
+        return
+
+    with state_lock:
+        pos = state.get(symbol, {})
+        if pos.get("position") == "open":
+            return
+
+    with armed_lock:
+        if symbol in ARMED:
+            return
+
+    with analysis_lock:
+        ana = LAST_ANALYSIS.get(symbol)
+
+    if not ana or time.time() - float(ana.get("ts", 0)) > 3600:
+        return
+
+    atr_value = float(ana.get("atr", 0))
+    if atr_value <= 0:
+        return
+
+    with ohlc_lock:
+        buf = list(OHLC.get(symbol, []))
+
+    if len(buf) < 21:
+        return
+
+    current = buf[-1]
+    confirmed = [c for c in buf[:-1] if c.get("confirm")]
+
+    if len(confirmed) < 20:
+        return
+
+    try:
+        avg_vol = float(np.mean([float(c.get("volume", 0)) for c in confirmed[-20:]]))
+        cur_vol = float(current.get("volume", 0))
+    except Exception:
+        return
+
+    if avg_vol <= 0:
+        return
+
+    vol_ratio = cur_vol / avg_vol
+    if vol_ratio < BREAKOUT_RT_VOL_MULT:
+        return
+
+    trend = get_trend(symbol)
+    if trend["score"] < 2 or not trend["bull_1d"]:
+        return
+
+    parts = [
+        f"Realtime breakout level={level:.8g}",
+        f"Vol {vol_ratio:.1f}x",
+        f"Trend {trend['score']}/2",
+    ]
+
+    sig = make_signal(symbol, "breakout_rt", price, atr_value, 8, parts, expiry_sec=60)
+    if sig:
+        open_position(sig)
+
+
+# ==================== СТРАТЕГИИ ====================
+def evaluate_signal(symbol, a, trend, cons_upper=None):
+    if not a or a["atr"] <= 0:
+        return None
+
+    if trend["score"] < 2:
+        return None
+
+    entry = float(a["close"])
+    atr_value = float(a["atr"])
+
+    best = None
+
+    # ---------- CONFLUENCE ----------
+    score = 0
+    parts = []
+
+    if trend["score"] == 2:
+        score += 2
+        parts.append("Trend 4h+1d +2")
+
+    if a["macd_cross_fresh"]:
+        score += 2
+        parts.append("MACD cross fresh +2")
+
+    if a["ema9"] > a["ema21"]:
+        score += 1
+        parts.append("EMA9>21 +1")
+
+    if RSI_MIN <= a["rsi"] <= RSI_MAX:
+        score += 1
+        parts.append(f"RSI {a['rsi']:.0f} +1")
+
+    if ADX_MIN <= trend["adx_4h"] <= ADX_MAX:
+        score += 1
+        parts.append(f"ADX4h {trend['adx_4h']:.0f} +1")
+
+    if a["vol_ratio"] >= MIN_VOL_MULT:
+        score += 1
+        parts.append(f"Vol {a['vol_ratio']:.1f}x +1")
+
+    if score >= MIN_SIGNAL_SCORE:
+        best = make_signal(
+            symbol,
+            "confluence",
+            entry,
+            atr_value,
+            score,
+            parts,
+            entry_low=entry * ENTRY_TOLERANCE_LOW,
+            entry_high=entry * ENTRY_TOLERANCE_HIGH,
+            expiry_sec=ARM_EXPIRY_CONFLUENCE,
+        )
+
+    # ---------- PULLBACK ----------
+    pb_score = 0
+    pb_parts = []
+
+    if trend["score"] == 2:
+        pb_score += 2
+        pb_parts.append("Trend 4h+1d +2")
+
+    touched_ema21 = a["low"] <= a["ema21"] * 1.004
+    recovered = a["close"] > a["ema9"]
+
+    if touched_ema21 and recovered:
+        pb_score += 2
+        pb_parts.append("Pullback EMA21 + recovery +2")
+
+    if 35 <= a["rsi"] <= 62:
+        pb_score += 1
+        pb_parts.append(f"RSI {a['rsi']:.0f} +1")
+
+    if trend["adx_4h"] >= 18:
+        pb_score += 1
+        pb_parts.append(f"ADX4h {trend['adx_4h']:.0f} +1")
+
+    if a["vol_ratio"] >= 1.0:
+        pb_score += 1
+        pb_parts.append(f"Vol {a['vol_ratio']:.1f}x +1")
+
+    if pb_score >= MIN_SIGNAL_SCORE:
+        sig = make_signal(
+            symbol,
+            "pullback",
+            entry,
+            atr_value,
+            pb_score,
+            pb_parts,
+            entry_low=entry * ENTRY_TOLERANCE_LOW,
+            entry_high=entry * ENTRY_TOLERANCE_HIGH,
+            expiry_sec=ARM_EXPIRY_PULLBACK,
+        )
+        if sig and (best is None or sig["score"] > best["score"]):
+            best = sig
+
+    # ---------- BREAKOUT ----------
+    if cons_upper and entry > cons_upper and a["vol_ratio"] >= BREAKOUT_VOL_MULT:
+        bo_score = 8
+        bo_parts = [
+            f"Breakout {CONSOL_DAYS}d +5",
+            f"Vol {a['vol_ratio']:.1f}x +2",
+            "1D bull +1",
+        ]
+
+        sig = make_signal(
+            symbol,
+            "breakout",
+            entry,
+            atr_value,
+            bo_score,
+            bo_parts,
+            entry_low=cons_upper * BREAKOUT_ENTRY_LOW,
+            entry_high=cons_upper * BREAKOUT_ENTRY_HIGH,
+            expiry_sec=ARM_EXPIRY_BREAKOUT,
+        )
+
+        if sig and (best is None or sig["score"] >= best["score"]):
+            best = sig
+
+    return best
+
+
+def process_ws_closed(symbol):
+    df = confirmed_df(symbol)
+    if df is None or len(df) < 80:
+        return
+
+    a = analyze_frame(df, drop_last=False)
+    if not a:
+        return
+
+    with analysis_lock:
+        LAST_ANALYSIS[symbol] = {
+            "ts": time.time(),
+            "atr": a["atr"],
+            "analysis": a,
+        }
+
+    trend = get_trend(symbol)
+
+    with cons_lock:
+        cons_upper = CONS_LEVEL.get(symbol)
+
+    sig = evaluate_signal(symbol, a, trend, cons_upper)
+    if sig:
+        arm_signal(symbol, sig)
+
+
+def detect_consolidation(symbol):
+    dfd = fetch_klines(symbol, "D", 80)
+    if dfd is None or len(dfd) < CONSOL_DAYS + 5:
+        return None
+
+    d = dfd.iloc[:-1]
+    if len(d) < CONSOL_DAYS:
+        return None
+
+    window = d.tail(CONSOL_DAYS)
+
+    try:
+        upper = float(window["high"].max())
+        lower = float(window["low"].min())
+        adx_val = float(adx(d).iloc[-1])
+    except Exception:
+        return None
+
+    if lower <= 0 or upper <= lower:
+        return None
+
+    range_pct = (upper - lower) / lower * 100.0
+
+    if range_pct > CONSOL_MAX_RANGE_PCT:
+        return None
+
+    if pd.isna(adx_val):
+        adx_val = 0.0
+
+    return {
+        "upper": upper,
+        "lower": lower,
+        "days": CONSOL_DAYS,
+        "range_pct": range_pct,
+        "adx": adx_val,
+    }
+
+
+def scan_cycle():
+    global CANDIDATES, CONSOLIDATIONS, LAST_SCAN_TS
+
+    btc_ok, btc_reason = btc_allows_longs()
+
+    with pairs_lock:
+        pairs = list(PAIRS)
+
+    candidates = []
+    consolidations = []
+
+    logger.info("Scan started: pairs=%d btc=%s", len(pairs), btc_reason)
+
+    for symbol in pairs:
+        try:
+            df15 = fetch_klines(symbol, "15", 180)
+            a15 = analyze_frame(df15, drop_last=True)
+
+            trend = get_trend(symbol)
+
+            cons = detect_consolidation(symbol)
+            cons_upper = None
+
+            if cons:
+                cons_upper = cons["upper"]
+                with cons_lock:
+                    CONS_LEVEL[symbol] = cons_upper
+
+                try:
+                    cur_price = CURRENT_PRICE.get(symbol) or (a15["close"] if a15 else 0)
+                    dist_pct = (cons_upper - cur_price) / cur_price * 100.0 if cur_price > 0 else 999
+                except Exception:
+                    dist_pct = 999
+
+                consolidations.append({
+                    "symbol": symbol,
+                    "upper": cons_upper,
+                    "lower": cons["lower"],
+                    "days": cons["days"],
+                    "range_pct": cons["range_pct"],
+                    "adx": cons["adx"],
+                    "price": cur_price,
+                    "dist_pct": dist_pct,
+                })
+
+            if a15:
+                sig = evaluate_signal(symbol, a15, trend, cons_upper)
+                if sig and btc_ok:
+                    arm_signal(symbol, sig)
+
+                candidates.append({
+                    "symbol": symbol,
+                    "price": a15["close"],
+                    "score": max(
+                        2 if trend["score"] == 2 else trend["score"],
+                        0,
+                    ),
+                    "trend": trend["score"],
+                    "rsi": a15["rsi"],
+                    "adx_4h": trend["adx_4h"],
+                    "vol": a15["vol_ratio"],
+                    "atr": a15["atr"],
+                    "strategy": sig["strategy"] if sig else "watch",
+                    "armed": symbol in ARMED,
+                })
+
+            time.sleep(0.12)
+
+        except Exception as e:
+            logger.debug("scan %s error: %s", symbol, e)
+
+    candidates.sort(key=lambda x: (-x.get("score", 0), x.get("rsi", 100)))
+    consolidations.sort(key=lambda x: x.get("dist_pct", 999))
+
+    with scan_lock:
+        CANDIDATES = candidates[:30]
+        CONSOLIDATIONS = consolidations[:30]
+
+    LAST_SCAN_TS = time.time()
+
+    logger.info(
+        "Scan done: candidates=%d cons=%d btc=%s",
+        len(CANDIDATES),
+        len(CONSOLIDATIONS),
+        btc_reason,
+    )
+
+    update_ticker_subscription()
+
+
+# ==================== ПЕРИОДИЧЕСКИЕ ВЫХОДЫ ====================
+def periodic_exit_checks():
+    now = time.time()
+
+    with state_lock:
+        open_items = [
+            (s, dict(p))
+            for s, p in state.items()
+            if p.get("position") == "open"
+        ]
+
+    for symbol, pos in open_items:
+        price = CURRENT_PRICE.get(symbol)
+        if not price:
+            price = get_price(symbol)
+
+        if not price or price <= 0:
+            continue
+
+        entry = float(pos.get("entry_price", 0))
+        atr_ref = float(pos.get("atr_ref", 0))
+        entry_ts = float(pos.get("entry_ts", now))
+
+        if entry <= 0 or atr_ref <= 0:
+            continue
+
+        # Time stop
+        age_hours = (now - entry_ts) / 3600.0
+        if age_hours >= TIME_STOP_HOURS:
+            r_multiple = (price - entry) / atr_ref
+            if r_multiple < 1.0:
+                fraction = 0.5 if pos.get("partial_done") else 1.0
+                close_position(symbol, price, "Time Stop", fraction)
+                continue
+
+        # EMA reversal 4h, не чаще раза в 15 минут
+        if now - float(pos.get("last_reversal_check", 0)) > 900:
+            with state_lock:
+                cur = state.get(symbol)
+                if cur and cur.get("position") == "open":
+                    cur["last_reversal_check"] = now
+                    state[symbol] = cur
+                    save_state()
+
+            df4 = fetch_klines(symbol, "240", 80)
+            a4 = analyze_frame(df4, drop_last=True)
+
+            if a4 and a4["ema9"] < a4["ema21"] and price > entry * 1.005:
+                fraction = 0.5 if pos.get("partial_done") else 1.0
+                close_position(symbol, price, "EMA reversal 4h", fraction)
+
+
+# ==================== СТАТУС ====================
+def send_status():
+    with state_lock:
+        opens = [
+            (s, dict(p))
+            for s, p in state.items()
+            if p.get("position") == "open"
+        ]
+
+    with cb_lock:
+        now = time.time()
+        paused_until = float(cb.get("paused_until", 0.0))
+        paused = now < paused_until
+        pause_min = max(0, int((paused_until - now) / 60)) if paused else 0
+        day_pnl = float(cb.get("day_pnl", 0.0))
+        consec = int(cb.get("consec", 0))
+
+    btc_ok, btc_reason = btc_allows_longs()
+
+    with scan_lock:
+        cands = list(CANDIDATES)
+        cons = list(CONSOLIDATIONS)
+        scan_age = int(now - LAST_SCAN_TS) if LAST_SCAN_TS else 0
+
+    with armed_lock:
+        armed_count = len(ARMED)
+
+    with ws_ticker_lock:
+        ticker_count = len(WS_TICKER_PAIRS)
+
+    with pairs_lock:
+        kline_count = len(PAIRS)
+
+    lines = []
+    lines.append("📡 <b>СТАТУС v22.1 WS-SAFE AGGRESSIVE</b>")
+    lines.append(datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC"))
+    lines.append("━" * 21)
+
+    lines.append(f"🔹 WS kline: {kline_count} · WS tickers: {ticker_count}/{WS_TICKER_MAX}")
+    lines.append(f"🔹 BTC: {btc_reason}")
+    lines.append(
+        f"🔹 CB: {'⏸ пауза ' + str(pause_min) + 'м' if paused else 'OK'} "
+        f"· сегодня {day_pnl:+.2f}% · серия {consec}"
+    )
+    lines.append(
+        f"🔹 Позиций: {len(opens)}/{MAX_OPEN_POSITIONS} "
+        f"· armed: {armed_count} · scan: {scan_age}s"
+    )
+    lines.append(f"🔹 Лимиты: {MAX_TRADES_PER_30MIN}/30м · {MAX_TRADES_PER_HOUR}/час")
+
+    lines.append("")
+
+    if opens:
+        lines.append("💰 <b>ОТКРЫТЫЕ ПОЗИЦИИ</b>")
+        for s, p in opens:
+            be = " · 🔒BE" if p.get("partial_done") else ""
+            lines.append(
+                f"📦 {s} "
+                f"💰{float(p.get('entry_price', 0)):.6g} "
+                f"🛑{float(p.get('stop', 0)):.6g} "
+                f"🎯{float(p.get('target', 0)):.6g}"
+                f"{be}"
+            )
+    else:
+        lines.append("💰 Позиций нет")
+
+    lines.append("")
+    lines.append("🔵 <b>ТОП КАНДИДАТОВ</b>")
+
+    if cands:
+        for i, c in enumerate(cands[:10], 1):
+            armed = " ⏳" if c.get("armed") else ""
+            lines.append(
+                f"{i}. 📈 {c['symbol']} "
+                f"{c.get('strategy', 'watch')} "
+                f"T{c.get('trend', 0)} "
+                f"ADX{c.get('adx_4h', 0):.0f} "
+                f"RSI{c.get('rsi', 0):.0f} "
+                f"V{c.get('vol', 0):.1f}x "
+                f"💰{c.get('price', 0):.6g}"
+                f"{armed}"
+            )
+    else:
+        lines.append("— нет кандидатов")
+
+    lines.append("")
+    lines.append("🟡 <b>БОКОВИКИ</b>")
+
+    if cons:
+        for i, c in enumerate(cons[:10], 1):
+            dist = c.get("dist_pct", 999)
+            mark = "🔥" if dist <= 1 else ("⚡" if dist <= 3 else ("🟢" if dist <= 5 else ""))
+            lines.append(
+                f"{mark}{i}. 📈 {c['symbol']} "
+                f"{c.get('days', 0)}д {c.get('range_pct', 0):.0f}% "
+                f"ADX{c.get('adx', 0):.0f} "
+                f"🚀{c.get('upper', 0):.6g} "
+                f"💰{c.get('price', 0):.6g} ({dist:.1f}%)"
+            )
+    else:
+        lines.append("— нет боковиков")
+
+    lines.append("")
+    lines.append("🛡 AGGRESSIVE-режим:")
+    lines.append("WT-DIP / RSI-DIP / BOUNCE / SQZ-DIP — OFF.")
+    lines.append("Стратегии: Confluence, Pullback, Breakout.")
+    lines.append("Score≥5 · RR≥1.5 · RSI 35-72 · ADX 15-55 · Vol≥1.1x.")
+
+    send_telegram("\n".join(lines))
+
+
+# ==================== WEBSOCKET KLINE ====================
+def touch_ws_ts(kind):
+    global LAST_WS_KLINE_TS, LAST_WS_TICKER_TS
+
+    now = time.time()
+    with ws_ts_lock:
+        if kind == "kline":
+            LAST_WS_KLINE_TS = now
+        else:
+            LAST_WS_TICKER_TS = now
+
+
+def ws_ping(ws, name):
+    while not STOP_EVENT.is_set():
         time.sleep(20)
         try:
             ws.send(json.dumps({"op": "ping"}))
         except Exception:
+            logger.info("WS %s ping stopped", name)
             return
 
-def extend_ws_subscription(extra_pairs):
-    global WS_APP
-    if WS_APP is None:
+
+def on_kline_open(ws):
+    logger.info("WS kline connected")
+    WS_KLINE_CONNECTED.set()
+    touch_ws_ts("kline")
+
+    with pairs_lock:
+        pairs = list(PAIRS)
+
+    if not pairs:
+        logger.warning("WS kline: нет пар для подписки")
         return
-    new = [p for p in extra_pairs if p not in ohlc_buffers][:WS_EXTRA_SYMBOLS]
-    if not new:
-        return
-    for i in range(0, len(new), 100):
+
+    args = [f"kline.15.{p}" for p in pairs]
+
+    for i in range(0, len(args), WS_SUBSCRIBE_CHUNK):
+        chunk = args[i:i + WS_SUBSCRIBE_CHUNK]
         try:
-            WS_APP.send(json.dumps({"op": "subscribe",
-                                    "args": [f"kline.{TIMEFRAME}.{p}" for p in new[i:i + 100]]}))
+            ws.send(json.dumps({"op": "subscribe", "args": chunk}))
         except Exception as e:
-            logger.warning("WS subscribe error: %s", e)
+            logger.warning("WS kline subscribe error: %s", e)
             return
-    for p in new:
-        ohlc_buffers[p] = deque(maxlen=200)
-        history = fetch_klines(p, TIMEFRAME, 80)
-        if history:
-            ohlc_buffers[p].extend(history)
-            if len(ohlc_buffers[p]) >= 2:
-                last_processed_closed[p] = int(list(ohlc_buffers[p])[-2]["start"])
-        time.sleep(0.1)
-    logger.info("WS-подписка расширена на %d пар из breakout-кэша", len(new))
+        time.sleep(WS_SUBSCRIBE_PAUSE)
 
-def on_message(ws, message):
-    global last_ws_msg_ts
-    last_ws_msg_ts = time.time()
+    threading.Thread(target=ws_ping, args=(ws, "kline"), daemon=True).start()
+
+
+def on_kline_message(ws, message):
+    touch_ws_ts("kline")
+
     try:
         data = json.loads(message)
         topic = data.get("topic", "")
+
         if not topic.startswith("kline."):
             return
+
         symbol = topic.split(".")[-1]
-        if symbol not in ohlc_buffers:
-            return
-        for item in data.get("data", []):
+        rows = data.get("data") or []
+
+        for k in rows:
             try:
-                new_candle = {
-                    "start": int(item["start"]) // 1000,
-                    "open": float(item["open"]),
-                    "high": float(item["high"]),
-                    "low": float(item["low"]),
-                    "close": float(item["close"]),
-                    "volume": float(item["volume"]),
+                start = int(k["start"])
+                item = {
+                    "start": start,
+                    "open": float(k["open"]),
+                    "high": float(k["high"]),
+                    "low": float(k["low"]),
+                    "close": float(k["close"]),
+                    "volume": float(k["volume"]),
+                    "confirm": bool(k.get("confirm", False)),
                 }
-            except (TypeError, ValueError, KeyError):
+            except Exception:
                 continue
-            buf = ohlc_buffers[symbol]
-            if buf and buf[-1]["start"] == new_candle["start"]:
-                buf[-1] = new_candle
-            else:
-                buf.append(new_candle)
 
-            exit_messages = []
-            with state_lock:
-                pos = state.get(symbol, {})
-                if pos.get("position") == "open" and pos.get("entry_price"):
-                    atr_ref = pos.get("atr_ref") or pos["entry_price"] * 0.01
-                    size = pos.get("size_fraction", 1.0)
-                    frac = PARTIAL_TP_FRACTION if pos.get("partial_done") else 1.0
-                    if new_candle["low"] <= pos["stop"]:
-                        exit_price = min(new_candle["open"], pos["stop"])
-                        pnl = log_trade(symbol, pos["entry_price"], exit_price,
-                                        "Stop-Loss", pos.get("strategy", "?"),
-                                        pos.get("entry_time"), size, frac)
-                        exit_messages.append(
-                            f"🔴 <b>СТОП-ЛОСС (WS)</b>\nПара: {tv_link(symbol)}\n"
-                            f"Цена: {exit_price:.8f}\nРезультат: <b>{pnl:+.2f}%</b>"
-                            + ("" if frac == 1.0 else " (оставшиеся 50%)"))
-                        pos.update({"position": "closed", "last_exit_ts": time.time(),
-                                    "last_exit_price": exit_price,
-                                    "last_exit_reason": "stop-loss"})
-                        state[symbol] = pos
-                        save_state(state)
-                    elif new_candle["high"] >= pos["target"]:
-                        pnl = log_trade(symbol, pos["entry_price"], pos["target"],
-                                        "Take-Profit", pos.get("strategy", "?"),
-                                        pos.get("entry_time"), size, frac)
-                        exit_messages.append(
-                            f"🟢 <b>ТЕЙК-ПРОФИТ (WS)</b>\nПара: {tv_link(symbol)}\n"
-                            f"Цена: {pos['target']:.8f}\nРезультат: <b>{pnl:+.2f}%</b>"
-                            + ("" if frac == 1.0 else " (оставшиеся 50%)"))
-                        pos.update({"position": "closed", "last_exit_ts": time.time(),
-                                    "last_exit_price": pos["target"],
-                                    "last_exit_reason": "take-profit"})
-                        state[symbol] = pos
-                        save_state(state)
-                    elif (not pos.get("partial_done")
-                          and new_candle["high"] >= pos["entry_price"] + PARTIAL_TP_ATR * atr_ref):
-                        pos["partial_done"] = True
-                        pos["stop"] = max(pos["stop"], pos["entry_price"] * 1.001)
-                        part_price = pos["entry_price"] + PARTIAL_TP_ATR * atr_ref
-                        pnl = log_trade(symbol, pos["entry_price"], part_price,
-                                        "Частичный TP (50%)", pos.get("strategy", "?"),
-                                        pos.get("entry_time"),
-                                        size * PARTIAL_TP_FRACTION, PARTIAL_TP_FRACTION)
-                        state[symbol] = pos
-                        save_state(state)
-                        exit_messages.append(
-                            f"💰 <b>ЧАСТИЧНЫЙ TP (50%)</b>\nПара: {tv_link(symbol)}\n"
-                            f"Зафиксировано: <b>{pnl:+.2f}%</b> на половину позиции\n"
-                            f"Стоп переведён в безубыток")
-            for msg in exit_messages:
-                send_telegram(msg)
+            with ohlc_lock:
+                buf = OHLC.get(symbol)
+                if buf is None:
+                    buf = deque(maxlen=WS_KLINE_BUFFER)
+                    OHLC[symbol] = buf
 
-            if len(buf) < MIN_BARS + 1:
-                continue
-            closed_start = int(buf[-2]["start"])
-            if last_processed_closed.get(symbol) == closed_start:
-                continue
-            last_processed_closed[symbol] = closed_start
-            df = pd.DataFrame(list(buf))
-            df["ema_fast"] = ema(df["close"], 9)
-            df["ema_slow"] = ema(df["close"], 21)
-            df["macd_line"] = ema(df["close"], 12) - ema(df["close"], 26)
-            df["macd_signal"] = ema(df["macd_line"], 9)
-            df["atr"] = atr(df)
-            df["rsi"] = rsi(df["close"])
-            df["adx"] = adx(df)
-            df["vol_sma"] = df["volume"].rolling(20).mean()
-            df["adx_slope_up"] = df["adx"] > df["adx"].shift(3)
-            df["ema_cross_up"] = ((df["ema_fast"] > df["ema_slow"])
-                                  & (df["ema_fast"].shift(1) <= df["ema_slow"].shift(1)))
-            df["vol_ratio"] = df["volume"] / df["vol_sma"].replace(0, np.nan)
+                if buf and buf[-1]["start"] == start:
+                    buf[-1] = item
+                else:
+                    buf.append(item)
 
-            breakout_sig = try_ws_breakout(symbol, new_candle, df)
-            if breakout_sig:
-                btc_blocked = not market_allows_longs()
-                extra = " ⚠️BTC-БЛОК ×0.5" if btc_blocked else ""
-                send_telegram(
-                    f"📦 <b>ПРОБОЙ БОКОВИКА (WS)</b>{extra}\n"
-                    f"Пара: {tv_link(symbol)}\n"
-                    f"Цена: {breakout_sig['entry']:.8f}\n"
-                    f"SL: {breakout_sig['stop']:.8f} · TP: {breakout_sig['target']:.8f}\n"
-                    f"Объём: {breakout_sig['vol_ratio']:.1f}×")
-                continue
-            with breakout_cache_lock:
-                level = breakout_cache.get(symbol)
-            sig = evaluate_ws_retest(df, symbol, level)
-            if sig is None:
-                sig = evaluate_ws_entry(df, symbol)
-            if sig is None:
-                sig = evaluate_ws_pullback(df, symbol)
-            if sig is None:
-                continue
-            cur_price_ws = float(new_candle["close"])
-            peak_ok, peak_reason, _ = check_peak_guard(df, cur_price_ws)
-            if not peak_ok:
-                logger.info("⛔ PEAK-GUARD отклонил %s: %s", symbol, peak_reason)
-                continue
-            rsi_ok, rsi_reason = check_peak_guard_rsi(float(df["rsi"].iloc[-2]))
-            if not rsi_ok:
-                logger.info("⛔ PEAK-GUARD (RSI) отклонил %s: %s", symbol, rsi_reason)
-                continue
-            with state_lock:
-                opened = open_position(symbol, sig, closed_start)
-            if opened is None:
-                continue
-            score_txt = (f" · score {sig['score']}/10"
-                         if isinstance(sig["score"], int) else f" · {sig['score']}")
-            btc_blocked = not market_allows_longs()
-            extra = " ⚠️BTC-БЛОК ×0.5" if btc_blocked else ""
-            send_telegram(
-                f"🟢 <b>ВХОД (WS{score_txt})</b>{extra}\n"
-                f"Пара: {tv_link(symbol)} · {sig['strategy']}\n"
-                f"Цена: {sig['entry']:.8f}\n"
-                f"SL: {sig['stop']:.8f} · TP: {sig['target']:.8f}\n"
-                f"<i>{' · '.join(sig['parts'])}</i>")
+            with price_lock:
+                CURRENT_PRICE[symbol] = item["close"]
+
+            if item["confirm"] and LAST_PROCESSED.get(symbol) != start:
+                LAST_PROCESSED[symbol] = start
+                process_ws_closed(symbol)
+
     except Exception as e:
-        logger.error("Ошибка WS kline: %s", e)
+        logger.debug("WS kline message error: %s", e)
 
-def on_error(ws, error):
-    logger.error("WS ошибка: %s", error)
 
-def on_close(ws, close_status_code, close_msg):
-    logger.warning("WS закрыт (%s). Переподключение...", close_status_code)
-    time.sleep(5)
+def on_kline_error(ws, error):
+    logger.warning("WS kline error: %s", error)
 
-def run_websocket():
-    global WS_APP
-    while True:
-        WS_APP = websocket.WebSocketApp(WS_URL, on_open=on_open,
-                                        on_message=on_message,
-                                        on_error=on_error, on_close=on_close)
+
+def on_kline_close(ws, close_status_code, close_msg):
+    logger.warning("WS kline closed: %s %s", close_status_code, close_msg)
+    WS_KLINE_CONNECTED.clear()
+
+
+def run_kline_ws():
+    global WS_KLINE_APP
+
+    while not STOP_EVENT.is_set():
+        with pairs_lock:
+            has_pairs = bool(PAIRS)
+
+        if not has_pairs:
+            time.sleep(5)
+            continue
+
         try:
-            WS_APP.run_forever(ping_interval=30, ping_timeout=10)
+            WS_KLINE_APP = websocket.WebSocketApp(
+                WS_URL,
+                on_open=on_kline_open,
+                on_message=on_kline_message,
+                on_error=on_kline_error,
+                on_close=on_kline_close,
+            )
+            # v22.1 FIX: Bybit не отвечает на низкоуровневый WS-PING,
+            # используем только JSON {"op":"ping"} через ws_ping.
+            WS_KLINE_APP.run_forever(ping_interval=0, ping_timeout=None)
         except Exception as e:
-            logger.error("WS критическая ошибка: %s", e)
+            logger.error("WS kline critical error: %s", e)
+
+        WS_KLINE_CONNECTED.clear()
         time.sleep(5)
 
-def watchdog_loop():
-    while True:
-        time.sleep(30)
-        silence = time.time() - last_ws_msg_ts
-        if silence > WS_SILENCE_TIMEOUT and WS_APP is not None:
-            logger.warning("Watchdog: тишина WS %.0f c — перезапуск соединения", silence)
-            try:
-                WS_APP.close()
-            except Exception:
-                pass
 
-# ==================== ⚡ WEBSOCKET TICKERS ====================
-def on_tickers_open(ws):
-    logger.info("⚡ WS tickers подключен. Подписка на %d пар...",
-                len(WS_TICKER_PAIRS))
-    WS_TICKERS_CONNECTED.set()
-    with WS_TICKER_PAIRS_LOCK:
-        pairs = list(WS_TICKER_PAIRS)
-    if pairs:
-        args = [f"tickers.{s}" for s in pairs]
-        for i in range(0, len(args), 100):
-            try:
-                ws.send(json.dumps({"op": "subscribe",
-                                    "args": args[i:i + 100]}))
-            except Exception as e:
-                logger.warning("WS tickers subscribe error: %s", e)
-            time.sleep(0.1)
-    threading.Thread(target=tickers_pinger, args=(ws,), daemon=True).start()
+# ==================== WEBSOCKET TICKERS ====================
+def desired_ticker_pairs():
+    pairs = []
 
-def tickers_pinger(ws):
-    while True:
-        time.sleep(20)
+    with state_lock:
+        pairs.extend([
+            s for s, p in state.items()
+            if p.get("position") == "open"
+        ])
+
+    with armed_lock:
+        pairs.extend(list(ARMED.keys()))
+
+    with scan_lock:
+        pairs.extend([c["symbol"] for c in CANDIDATES[:20]])
+        pairs.extend([c["symbol"] for c in CONSOLIDATIONS[:20]])
+
+    unique = []
+    seen = set()
+    for s in pairs:
+        if s and s not in seen:
+            seen.add(s)
+            unique.append(s)
+
+    return unique[:WS_TICKER_MAX]
+
+
+def subscribe_tickers(ws, symbols):
+    if not symbols:
+        return
+
+    args = [f"tickers.{s}" for s in symbols]
+
+    for i in range(0, len(args), WS_SUBSCRIBE_CHUNK):
+        chunk = args[i:i + WS_SUBSCRIBE_CHUNK]
         try:
-            ws.send(json.dumps({"op": "ping"}))
+            ws.send(json.dumps({"op": "subscribe", "args": chunk}))
+        except Exception as e:
+            logger.warning("WS tickers subscribe error: %s", e)
+            return
+        time.sleep(WS_SUBSCRIBE_PAUSE)
+
+
+def unsubscribe_tickers(ws, symbols):
+    if not symbols:
+        return
+
+    args = [f"tickers.{s}" for s in symbols]
+
+    for i in range(0, len(args), WS_SUBSCRIBE_CHUNK):
+        chunk = args[i:i + WS_SUBSCRIBE_CHUNK]
+        try:
+            ws.send(json.dumps({"op": "unsubscribe", "args": chunk}))
+        except Exception as e:
+            logger.warning("WS tickers unsubscribe error: %s", e)
+            return
+        time.sleep(0.05)
+
+
+def update_ticker_subscription():
+    desired = desired_ticker_pairs()
+
+    with ws_ticker_lock:
+        current = set(WS_TICKER_PAIRS)
+        new = [s for s in desired if s not in current]
+        gone = [s for s in current if s not in desired]
+
+        WS_TICKER_PAIRS.clear()
+        WS_TICKER_PAIRS.update(desired)
+
+    if WS_TICKER_APP and WS_TICKERS_CONNECTED.is_set():
+        if gone:
+            unsubscribe_tickers(WS_TICKER_APP, gone)
+        if new:
+            subscribe_tickers(WS_TICKER_APP, new)
+
+
+def on_tickers_open(ws):
+    logger.info("WS tickers connected")
+    WS_TICKERS_CONNECTED.set()
+    touch_ws_ts("ticker")
+
+    with ws_ticker_lock:
+        pairs = list(WS_TICKER_PAIRS)
+
+    if not pairs:
+        pairs = desired_ticker_pairs()
+        with ws_ticker_lock:
+            WS_TICKER_PAIRS.clear()
+            WS_TICKER_PAIRS.update(pairs)
+
+    subscribe_tickers(ws, pairs)
+    threading.Thread(target=ws_ping, args=(ws, "tickers"), daemon=True).start()
+
+
+def on_tickers_message(ws, message):
+    touch_ws_ts("ticker")
+
+    try:
+        data = json.loads(message)
+        topic = data.get("topic", "")
+
+        if not topic.startswith("tickers."):
+            return
+
+        symbol = topic.split(".")[-1]
+        d = data.get("data") or {}
+
+        try:
+            price = float(d.get("lastPrice", 0))
         except Exception:
             return
 
-def on_tickers_message(ws, message):
-    try:
-        data = json.loads(message)
-        if data.get("topic", "").startswith("tickers."):
-            for item in data.get("data", []):
-                symbol = item.get("symbol", "")
-                if symbol not in WS_TICKER_PAIRS:
-                    continue
-                try:
-                    cur_price = float(item.get("lastPrice", 0))
-                except (TypeError, ValueError):
-                    continue
-                if cur_price <= 0:
-                    continue
-                # Обновляем последнюю свечу в ohlc_buffers текущей ценой
-                buf = ohlc_buffers.get(symbol)
-                if buf and len(buf) > 0:
-                    buf[-1]["close"] = cur_price
-                    if cur_price > buf[-1]["high"]:
-                        buf[-1]["high"] = cur_price
-                    if cur_price < buf[-1]["low"]:
-                        buf[-1]["low"] = cur_price
-                # Проверяем вход
-                _open_on_tick(symbol, cur_price, source="tick")
+        if price <= 0:
+            return
+
+        with price_lock:
+            CURRENT_PRICE[symbol] = price
+
+        check_position_price(symbol, price)
+        check_armed_price(symbol, price)
+        try_realtime_breakout(symbol, price)
+
     except Exception as e:
-        logger.error("Ошибка WS tickers: %s", e)
+        logger.debug("WS tickers message error: %s", e)
+
 
 def on_tickers_error(ws, error):
-    logger.error("WS tickers ошибка: %s", error)
+    logger.warning("WS tickers error: %s", error)
+
 
 def on_tickers_close(ws, close_status_code, close_msg):
-    logger.warning("WS tickers закрыт (%s). Переподключение...", close_status_code)
+    logger.warning("WS tickers closed: %s %s", close_status_code, close_msg)
     WS_TICKERS_CONNECTED.clear()
-    time.sleep(5)
 
-def run_tickers_websocket():
-    global WS_TICKERS_APP
-    while True:
-        WS_TICKERS_APP = websocket.WebSocketApp(
-            WS_URL,
-            on_open=on_tickers_open,
-            on_message=on_tickers_message,
-            on_error=on_tickers_error,
-            on_close=on_tickers_close,
-        )
+
+def run_tickers_ws():
+    global WS_TICKER_APP
+
+    while not STOP_EVENT.is_set():
         try:
-            WS_TICKERS_APP.run_forever(ping_interval=30, ping_timeout=10)
+            WS_TICKER_APP = websocket.WebSocketApp(
+                WS_URL,
+                on_open=on_tickers_open,
+                on_message=on_tickers_message,
+                on_error=on_tickers_error,
+                on_close=on_tickers_close,
+            )
+            # v22.1 FIX: Bybit JSON-ping only.
+            WS_TICKER_APP.run_forever(ping_interval=0, ping_timeout=None)
         except Exception as e:
-            logger.error("WS tickers критическая ошибка: %s", e)
+            logger.error("WS tickers critical error: %s", e)
+
         WS_TICKERS_CONNECTED.clear()
         time.sleep(5)
 
-def tickers_refresh_loop():
-    """Раз в WS_TICKERS_REFRESH_SEC обновляет список подписок tickers."""
-    first = True
-    while True:
-        if not first:
-            time.sleep(WS_TICKERS_REFRESH_SEC)
-        first = False
+
+def watchdog_loop():
+    while not STOP_EVENT.is_set():
+        time.sleep(30)
+
+        now = time.time()
+
+        with ws_ts_lock:
+            kline_silence = now - LAST_WS_KLINE_TS if LAST_WS_KLINE_TS else 9999
+            ticker_silence = now - LAST_WS_TICKER_TS if LAST_WS_TICKER_TS else 9999
+
+        if kline_silence > WS_SILENCE_TIMEOUT and WS_KLINE_APP is not None:
+            logger.warning("Watchdog kline: тишина %.0fс — перезапуск", kline_silence)
+            try:
+                WS_KLINE_APP.close()
+            except Exception:
+                pass
+
+        if ticker_silence > WS_SILENCE_TIMEOUT and WS_TICKER_APP is not None:
+            logger.warning("Watchdog tickers: тишина %.0fс — перезапуск", ticker_silence)
+            try:
+                WS_TICKER_APP.close()
+            except Exception:
+                pass
+
+
+# ==================== POLLING TELEGRAM ====================
+def polling_loop():
+    if not TELEGRAM_BOT_TOKEN:
+        logger.warning("Polling не запущен: нет TELEGRAM_BOT_TOKEN")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    offset = 0
+
+    logger.info("Polling запущен")
+
+    while not STOP_EVENT.is_set():
         try:
-            update_ticker_subscription()
-        except Exception as e:
-            logger.error("update_ticker_subscription: %s", e)
+            r = SESSION.get(
+                url,
+                params={
+                    "offset": offset,
+                    "timeout": 30,
+                    "allowed_updates": json.dumps(["message"]),
+                },
+                timeout=40,
+            )
 
-# ==================== ФОНОВОЕ СКАНИРОВАНИЕ ====================
-TIMEFRAME_PARAMS = {
-    "15m": {"bybit_interval": "15",  "min_bars": 80,  "ema_fast": 9,  "ema_slow": 21},
-    "1h":  {"bybit_interval": "60",  "min_bars": 80,  "ema_fast": 9,  "ema_slow": 21},
-    "4h":  {"bybit_interval": "240", "min_bars": 80,  "ema_fast": 9,  "ema_slow": 21},
-    "1d":  {"bybit_interval": "D",   "min_bars": 150, "ema_fast": 20, "ema_slow": 50},
-    "1w":  {"bybit_interval": "W",   "min_bars": 50,  "ema_fast": 10, "ema_slow": 30},
-}
-
-def try_open_breakout(pair, df_daily, current_price, now_iso, r4h=None):
-    breakout = check_breakout(df_daily, current_price)
-    if not breakout:
-        return None
-    daily_closed_start = int(df_daily.iloc[-2]["start"])
-    stop_distance_pct = ((current_price - breakout["stop"]) / current_price * 100
-                         if current_price > 0 else 0)
-    if stop_distance_pct < MIN_STOP_DISTANCE_PCT:
-        return None
-    risk_pct = (current_price - breakout["stop"]) / current_price * 100
-    ti = get_trend(pair)
-    trend_score = ti["score"] if ti else 0
-    pseudo_sig = {"trend_score": trend_score, "score": 7}
-    btc_blocked = not market_allows_longs()
-    if btc_blocked and not is_strong_signal_for_blocked_market(pseudo_sig):
-        return None
-    with state_lock:
-        if not can_enter(pair, signal=pseudo_sig, signal_risk_pct=risk_pct):
-            return None
-        old_state = state.get(pair, {})
-        if old_state.get("last_signal_candle") == daily_closed_start:
-            return None
-        rr = (breakout["target"] - current_price) / (current_price - breakout["stop"])
-        atr_val = (current_price - breakout["stop"]) / ATR_MULT_SL
-        size = position_size_fraction(7, rr, atr_val / current_price * 100,
-                                      portfolio_risk_used(), risk_pct,
-                                      btc_blocked=btc_blocked)
-        new_state = old_state.copy()
-        new_state.update({
-            "position": "open", "entry_price": current_price,
-            "stop": breakout["stop"], "target": breakout["target"],
-            "atr_ref": atr_val,
-            "entry_time": now_iso, "last_entry_ts": time.time(),
-            "last_signal_candle": daily_closed_start,
-            "strategy": "breakout", "score": "BO",
-            "size_fraction": size,
-            "btc_blocked_entry": btc_blocked,
-        })
-        state[pair] = new_state
-        trade_times.append(time.time())
-        save_state(state)
-    return breakout
-
-def background_scan_loop():
-    global state, breakout_cache
-    while True:
-        try:
-            volatile_pairs = get_filtered_pairs(TOP_N) or []
-            all_pairs = get_all_available_pairs(TOTAL_PAIRS) or []
-            with state_lock:
-                open_pairs = [p for p, v in state.items() if v.get("position") == "open"]
-            management_pairs = list(dict.fromkeys(volatile_pairs + open_pairs))
-            if not management_pairs:
-                logger.error("Нет пар для обработки")
-                time.sleep(SCAN_INTERVAL_SECONDS)
+            j = r.json()
+            if not j.get("ok"):
+                desc = str(j.get("description", "")).lower()
+                if "conflict" in desc:
+                    logger.warning("Telegram polling conflict, sleep 30")
+                    time.sleep(30)
+                else:
+                    time.sleep(5)
                 continue
-            current_prices = fetch_current_prices(
-                list(dict.fromkeys(volatile_pairs + all_pairs + open_pairs)))
-            found_buy = found_sell = 0
-            scan_summary = []
-            consolidation_list = []
-            consolidation_seen = set()
-            now_iso = datetime.now(timezone.utc).isoformat()
-            daily_cache = {}
 
-            for pair in management_pairs:
-                if not isinstance(pair, str):
-                    continue
-                try:
-                    df_daily_data = fetch_klines(pair, TIMEFRAME_PARAMS["1d"]["bybit_interval"], 150)
-                    if not df_daily_data:
-                        continue
-                    df_daily = pd.DataFrame(df_daily_data)
-                    daily_cache[pair] = df_daily
-                    results = {"1d": analyze_timeframe(df_daily, TIMEFRAME_PARAMS["1d"])}
-                    for tf in ("4h", "1w"):
-                        params = TIMEFRAME_PARAMS[tf]
-                        df_tf = pd.DataFrame(fetch_klines(pair, params["bybit_interval"],
-                                                          params["min_bars"]))
-                        if not df_tf.empty:
-                            results[tf] = analyze_timeframe(df_tf, params)
-                    time.sleep(0.3)
-                    if not results.get("4h") or not results.get("1d"):
-                        continue
-                    r4h, r1d = results["4h"], results["1d"]
-                    trend_score = sum(1 for k in ("4h", "1d", "1w")
-                                      if results.get(k) and results[k]["ema_fast"] > results[k]["ema_slow"])
-                    macd_gap_pct = ((r4h["macd_line"] - r4h["macd_signal"])
-                                    / r4h["close"] * 100 if r4h["close"] else 0.0)
-                    current_price = current_prices.get(pair, r4h["close"])
-                    scan_summary.append({
-                        "pair": pair, "trend_score": trend_score,
-                        "rsi_4h": r4h["rsi"], "adx_1d": r1d["adx"],
-                        "adx_slope_up": r4h.get("adx_slope_up", False),
-                        "vol_ratio": r4h.get("vol_ratio", 0.0),
-                        "macd_gap_pct": macd_gap_pct,
-                        "close_price": r4h["close"],
-                        "current_price": current_price,
-                    })
-                    cons = detect_consolidation(df_daily)
-                    if cons and pair not in consolidation_seen:
-                        consolidation_seen.add(pair)
-                        consolidation_list.append({"pair": pair,
-                                                    "current_price": current_price,
-                                                    **cons})
-                    breakout = try_open_breakout(pair, df_daily, current_price,
-                                                  now_iso, r4h=r4h)
-                    if breakout:
-                        found_buy += 1
-                        btc_blocked = not market_allows_longs()
-                        extra = " ⚠️BTC-БЛОК ×0.5" if btc_blocked else ""
-                        send_telegram(
-                            f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>{extra}\n"
-                            f"Пара: {tv_link(pair)}\n"
-                            f"Цена: {current_price:.8f}\n"
-                            f"SL: {breakout['stop']:.8f} · TP: {breakout['target']:.8f}\n"
-                            f"Дней в боковике: {breakout['days']} · "
-                            f"объём ×1.8 · ADX {breakout['adx']:.0f}")
-                    messages = []
-                    time_stopped = False
-                    with state_lock:
-                        pos = state.get(pair)
-                        if pos and pos.get("position") == "open":
-                            try:
-                                entry_time = datetime.fromisoformat(
-                                    pos.get("entry_time", "2026-01-01T00:00:00+00:00"))
-                            except ValueError:
-                                entry_time = datetime.now(timezone.utc)
-                            atr1d = r1d["atr"] if r1d["atr"] > 0 else pos.get("atr_ref", 0.0)
-                            profit_r = ((r4h["close"] - pos["entry_price"]) / atr1d
-                                        if atr1d > 0 else 0.0)
-                            days_in = (datetime.now(timezone.utc) - entry_time).days
-                            size = pos.get("size_fraction", 1.0)
-                            if days_in >= TIME_STOP_DAYS and profit_r < TIME_STOP_MIN_R:
-                                frac = PARTIAL_TP_FRACTION if pos.get("partial_done") else 1.0
-                                pnl = log_trade(pair, pos["entry_price"], r4h["close"],
-                                                "Time Stop", pos.get("strategy", "?"),
-                                                pos.get("entry_time"), size, frac)
-                                messages.append(
-                                    f"⏰ <b>ВЫХОД ПО ВРЕМЕНИ</b>\n"
-                                    f"Пара: {tv_link(pair)}\n"
-                                    f"Цена: {r4h['close']:.8f}\n"
-                                    f"Результат: <b>{pnl:+.2f}%</b>")
-                                pos.update({"position": "closed",
-                                            "last_exit_ts": time.time(),
-                                            "last_exit_price": r4h["close"],
-                                            "last_exit_reason": "time-stop"})
-                                state[pair] = pos
-                                save_state(state)
-                                found_sell += 1
-                                time_stopped = True
-                            else:
-                                exit_now, reason, exit_price = check_exit(results, pos)
-                                if reason == "partial":
-                                    pnl = log_trade(pair, pos["entry_price"], exit_price,
-                                                    "Частичный TP (50%)",
-                                                    pos.get("strategy", "?"),
-                                                    pos.get("entry_time"),
-                                                    size * PARTIAL_TP_FRACTION,
-                                                    PARTIAL_TP_FRACTION)
-                                    messages.append(
-                                        f"💰 <b>ЧАСТИЧНЫЙ TP (50%)</b>\n"
-                                        f"Пара: {tv_link(pair)}\n"
-                                        f"Зафиксировано: <b>{pnl:+.2f}%</b>\n"
-                                        f"Стоп в безубытке, цель прежняя")
-                                if exit_now:
-                                    frac = PARTIAL_TP_FRACTION if pos.get("partial_done") else 1.0
-                                    pnl = log_trade(pair, pos["entry_price"], exit_price,
-                                                    reason, pos.get("strategy", "?"),
-                                                    pos.get("entry_time"), size, frac)
-                                    icon = "🟢" if pnl > 0 else "🔴"
-                                    suffix = (" (оставшиеся 50%)" if frac != 1.0 else "")
-                                    messages.append(
-                                        f"{icon} <b>{reason.upper()}</b>\n"
-                                        f"Пара: {tv_link(pair)}\n"
-                                        f"Цена: {exit_price:.8f}\n"
-                                        f"Результат: <b>{pnl:+.2f}%</b>{suffix}")
-                                    pos.update({"position": "closed",
-                                                "last_exit_ts": time.time(),
-                                                "last_exit_price": exit_price,
-                                                "last_exit_reason": reason})
-                                    found_sell += 1
-                                state[pair] = pos
-                                save_state(state)
-                    for msg in messages:
-                        send_telegram(msg)
-                    if time_stopped:
-                        continue
-                except Exception as e:
-                    logger.error("Ошибка в %s: %s", pair, e)
+            for upd in j.get("result", []):
+                offset = max(offset, int(upd.get("update_id", 0)) + 1)
+
+                msg = upd.get("message") or {}
+                cid = (msg.get("chat") or {}).get("id")
+                text = (msg.get("text") or "").strip().lower()
+
+                if not cid or not text:
                     continue
 
-            for pair in all_pairs:
-                if not isinstance(pair, str):
-                    continue
-                try:
-                    df_daily = daily_cache.get(pair)
-                    if df_daily is None:
-                        df_daily_data = fetch_klines(pair, TIMEFRAME_PARAMS["1d"]["bybit_interval"], 150)
-                        if not df_daily_data:
-                            continue
-                        df_daily = pd.DataFrame(df_daily_data)
-                        time.sleep(0.15)
-                    current_price = current_prices.get(pair, df_daily["close"].iloc[-1])
-                    cons = detect_consolidation(df_daily)
-                    if cons and pair not in consolidation_seen:
-                        consolidation_seen.add(pair)
-                        consolidation_list.append({"pair": pair,
-                                                    "current_price": current_price,
-                                                    **cons})
-                    breakout = try_open_breakout(pair, df_daily, current_price, now_iso)
-                    if breakout:
-                        found_buy += 1
-                        btc_blocked = not market_allows_longs()
-                        extra = " ⚠️BTC-БЛОК ×0.5" if btc_blocked else ""
-                        send_telegram(
-                            f"📦 <b>ПРОБОЙ БОКОВИКА (Breakout)</b>{extra}\n"
-                            f"Пара: {tv_link(pair)}\n"
-                            f"Цена: {current_price:.8f}\n"
-                            f"SL: {breakout['stop']:.8f} · TP: {breakout['target']:.8f}\n"
-                            f"Дней в боковике: {breakout['days']}")
-                except Exception as e:
-                    logger.error("Ошибка во втором проходе %s: %s", pair, e)
-                    continue
+                if text == "/start":
+                    if add_subscriber(int(cid)):
+                        _post_telegram(
+                            cid,
+                            "🟢 <b>Подписка оформлена</b>\n"
+                            "v22.1 WS-SAFE AGGRESSIVE запущен.\n"
+                            "Confluence / Pullback / Breakout.\n"
+                            "/stop — отписаться, /help — справка."
+                        )
+                    else:
+                        _post_telegram(cid, "✅ Вы уже подписаны.")
 
-            with breakout_cache_lock:
-                consolidation_list.sort(key=lambda x: (-x["days"], x.get("vol_trend", 1.0)))
-                breakout_cache = {}
-                for item in consolidation_list[:BREAKOUT_CACHE_SIZE]:
-                    breakout_cache[item["pair"]] = item["upper_level"]
-            logger.info("Breakout-кэш обновлён: %d уровней", len(breakout_cache))
+                elif text == "/stop":
+                    if remove_subscriber(int(cid)):
+                        _post_telegram(cid, "🔴 Вы отписаны.\n/start — подписаться снова.")
+                    else:
+                        _post_telegram(cid, "Вы и так не подписаны.")
 
-            with breakout_cache_lock:
-                extra = [p for p in breakout_cache.keys() if p not in PAIRS_WS]
-            extend_ws_subscription(extra)
+                elif text == "/help":
+                    _post_telegram(
+                        cid,
+                        "📡 <b>Bybit Scanner v22.1 WS-SAFE AGGRESSIVE</b>\n"
+                        "Стратегии: Confluence, Pullback, Breakout.\n"
+                        "Score≥5 · RR≥1.5 · RSI 35-72 · ADX 15-55 · Vol≥1.1x.\n"
+                        "WS kline 15m + WS tickers.\n"
+                        "Отключено: WT-DIP, RSI-DIP, BOUNCE, SQZ-DIP.\n"
+                        "Команды: /start, /stop, /help, /status."
+                    )
 
-            try:
-                with state_lock:
-                    if len(state) > 500:
-                        now_ts = time.time()
-                        for p in list(state.keys()):
-                            pos = state[p]
-                            if pos.get("position") == "closed":
-                                last_exit_ts = float(pos.get("last_exit_ts", 0) or 0)
-                                if last_exit_ts > 0 and now_ts - last_exit_ts > CLEANUP_AFTER_DAYS * 86400:
-                                    del state[p]
-                        save_state(state)
-            except Exception as e:
-                logger.error("Ошибка очистки state: %s", e)
+                elif text == "/status":
+                    threading.Thread(target=send_status, daemon=True).start()
 
-            send_status(scan_summary, consolidation_list, found_buy, found_sell)
-            # ⚡ Обновляем WS-tickers после нового статуса
-            try:
-                update_ticker_subscription()
-            except Exception as e:
-                logger.error("update_ticker_subscription (status): %s", e)
-            time.sleep(SCAN_INTERVAL_SECONDS)
         except Exception as e:
-            logger.critical("Критическая ошибка в фоне: %s", e)
-            time.sleep(SCAN_INTERVAL_SECONDS)
+            logger.warning("Polling error: %s", e)
+            time.sleep(5)
 
-# ==================== СТАТУС: ОДНО СООБЩЕНИЕ (v20.0) ====================
-def send_status(scan_summary, consolidation_list, found_buy, found_sell):
-    with state_lock:
-        open_snapshot = [(pair, dict(pos)) for pair, pos in state.items()
-                         if pos.get("position") == "open"]
-    with trend_cache_lock:
-        q3 = sum(1 for v in trend_cache.values() if v["score"] == 3)
-    with market_context_lock:
-        mok, mreason = market_context["ok"], market_context["reason"]
-    with subscribers_lock:
-        subs_count = len(SUBSCRIBERS)
-    with WS_TICKER_PAIRS_LOCK:
-        tickers_count = len(WS_TICKER_PAIRS)
 
-    breakout_strategies = ("breakout", "breakout_ws", "breakout_retest", "breakout_realtime")
-    now_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M")
+# ==================== MAIN LOOP ====================
+def manage_loop():
+    now = time.time()
 
-    btc_state_str = "OK" if mok else f"БЛОК: {mreason}"
-    if not mok and BTC_ALLOW_STRONG_WHEN_BLOCKED:
-        btc_state_str += " · сильные T3/3 score≥8 → ×0.5"
+    next_scan = now + 5
+    next_status = now + 120
+    next_ticker_refresh = now + 30
+    next_periodic = now + 10
 
-    header = [
-        f"📡 <b>СТАТУС v20.0 (Bybit)</b> | <i>{now_str} UTC</i>",
-        "━━━━━━━━━━━━━━━━━━━━━",
-        f"🔹 Пар WS kline: <b>{len(PAIRS_WS)}</b> · Тренд 3/3: <b>{q3}</b>",
-        f"🔹 ⚡ WS tickers: <b>{tickers_count}</b> горячих пар (мгновенная цена)",
-        f"🔹 BTC: <b>{btc_state_str}</b>",
-        f"🔹 Боковиков: <b>{len(consolidation_list)}</b> · "
-        f"Позиций: <b>{len(open_snapshot)}/{MAX_OPEN_POSITIONS}</b>",
-        f"🔹 Входов: <b>{found_buy}</b> · Выходов: <b>{found_sell}</b> · 👥 {subs_count}",
-        f"🔹 🛡 PEAK-GUARD: <b>{'ON' if PEAK_GUARD_ENABLED else 'OFF'}</b>",
-    ]
-    if not cb_can_trade():
-        header.append("🔹 🛑 Circuit breaker: <b>входы на паузе</b>")
-    header.append("━━━━━━━━━━━━━━━━━━━━━")
+    while not STOP_EVENT.is_set():
+        now = time.time()
 
-    pos_lines = []
-    if open_snapshot:
-        for pair, pos in open_snapshot:
-            et = str(pos.get("entry_time", "?")).replace("T", " ")[:16]
-            tag = "📦" if pos.get("strategy") in breakout_strategies else "🟢"
-            line = (f"{tag} <b>{pair}</b> {pos.get('entry_price', 0):.8f} → "
-                    f"🛑{pos.get('stop', 0):.8f} 🎯{pos.get('target', 0):.8f} · {et}")
-            if pos.get("partial_done"):
-                line += " · 💰50%"
-            if pos.get("btc_blocked_entry"):
-                line += " · ⚠️BTC×0.5"
-            pos_lines.append(line)
-    else:
-        pos_lines.append("💰 Позиций нет")
+        try:
+            if now >= next_scan:
+                scan_cycle()
+                next_scan = now + SCAN_INTERVAL_SECONDS
 
-    valid_calls = [
-        s for s in scan_summary
-        if s["trend_score"] >= 2
-        and STATUS_RSI_MIN <= s.get("rsi_4h", 0) <= STATUS_RSI_MAX
-        and STATUS_ADX_MIN <= s.get("adx_1d", 0) <= STATUS_ADX_MAX
-        and s.get("close_price", 0) >= STATUS_MIN_PRICE
-    ]
-    valid_calls.sort(key=lambda s: (-s["trend_score"],
-                                     s.get("macd_gap_pct", 999)))
+            if now >= next_status:
+                send_status()
+                next_status = now + STATUS_INTERVAL_SECONDS
 
-    def _hot_score(item):
-        cur = item.get("current_price", 0)
-        lvl = item.get("upper_level", 0)
-        if cur <= 0 or lvl <= 0:
-            return 999
-        dist_pct = (lvl - cur) / cur * 100
-        return max(dist_pct, 0)
-    consolidation_list = sorted(consolidation_list, key=_hot_score)
+            if now >= next_ticker_refresh:
+                update_ticker_subscription()
+                next_ticker_refresh = now + 300
 
-    valid_calls = valid_calls[:MAX_SHOW_CANDIDATES]
-    consolidation_list = consolidation_list[:MAX_SHOW_CONSOLIDATIONS]
+            if now >= next_periodic:
+                periodic_exit_checks()
+                next_periodic = now + 20
 
-    with HOT_PAIRS_LOCK:
-        HOT_PAIRS_CACHE["candidates"] = list(valid_calls)
-        HOT_PAIRS_CACHE["consolidations"] = list(consolidation_list)
-        HOT_PAIRS_CACHE["ts"] = time.time()
+            expire_armed()
 
-    def cand_line(i, s, with_link):
-        gap = s.get("macd_gap_pct", 0)
-        if gap < 0:
-            prox, hl = "⏳", gap > -0.25
-        elif gap < 0.5:
-            prox, hl = "🟡", True
-        else:
-            prox, hl = "⚠️", False
-        name = tv_link(s["pair"]) if with_link else s["pair"]
-        cur = s.get("current_price") or s.get("close_price", 0)
-        entry = s.get("close_price", 0)
-        buf = ohlc_buffers.get(s["pair"])
-        peak_ok, peak_reason, _ = (True, "", {})
-        if buf and len(buf) >= PEAK_LOOKBACK_CANDLES:
-            df_pk = pd.DataFrame(list(buf))
-            peak_ok, peak_reason, _ = check_peak_guard(df_pk, cur)
-        drift_pct = abs(cur - entry) / entry * 100 if entry > 0 else 0
-        drift_ok = drift_pct <= PEAK_MAX_DRIFT_PCT
-        is_ready = (s["trend_score"] == 3 and gap < 0.5
-                    and peak_ok and drift_ok)
-        if is_ready:
-            mark = "🟢"
-        elif not peak_ok:
-            mark = "⛔"
-        elif not drift_ok:
-            mark = "⚠️"
-        elif hl:
-            mark = "🟡"
-        else:
-            mark = ""
-        vol = s.get("vol_ratio", 0.0)
-        vol_txt = f" V{vol:.1f}x" if vol >= MIN_VOL_MULT else ""
-        up = "↑" if s.get("adx_slope_up") else ""
-        ready_tag = "✨" if is_ready else ""
-        drift_txt = f" ⚠️+{drift_pct:.1f}%" if not drift_ok else ""
-        return (f"{mark}{i}.{name}{ready_tag} T{s['trend_score']} "
-                f"ADX{s['adx_1d']:.0f}{up} RSI{s['rsi_4h']:.0f}{vol_txt} "
-                f"💰{cur:.6g} 🎯~{entry:.6g}{drift_txt} {prox}")
+        except Exception as e:
+            logger.exception("Manage loop error: %s", e)
 
-    def cons_line(i, item, with_link):
-        dry = "🥀" if item.get("vol_trend", 1.0) <= 0.9 else ""
-        name = tv_link(item["pair"]) if with_link else item["pair"]
-        cur = item.get("current_price", 0)
-        lvl = item.get("upper_level", 0)
-        if cur > 0 and lvl > 0:
-            dist_pct = (lvl - cur) / cur * 100
-        else:
-            dist_pct = 999
-        if dist_pct <= HOT_DIST_PCT_1:
-            mark = "🔥"
-        elif dist_pct <= HOT_DIST_PCT_2:
-            mark = "⚡"
-        elif dist_pct <= HOT_DIST_PCT_3:
-            mark = "🟢"
-        else:
-            mark = ""
-        dist_txt = f"({dist_pct:.1f}%)" if dist_pct < 999 else ""
-        return (f"{mark}{i}.{name} {item['days']}д {item['range_pct']:.0f}% "
-                f"ADX{item['adx']:.0f}{dry} 🚀{lvl:.6g} 💰{cur:.6g}{dist_txt}")
+        time.sleep(MANAGE_SLEEP_SECONDS)
 
-    footer = [
-        "━━━━━━━━━━━━━━━━━━━━━",
-        f"🔄 Следующий статус через 2 ч · лимиты {MAX_OPEN_POSITIONS} поз / "
-        f"{MAX_TRADES_PER_HOUR} в час",
-        f"ℹ️ Показаны {MAX_SHOW_CANDIDATES} кандидатов + "
-        f"{MAX_SHOW_CONSOLIDATIONS} боковиков.",
-        f"⚡ WS-tickers следит за {tickers_count} горячими монетами в реальном времени",
-        "🛡 PEAK-GUARD: не входим на пике (RSI≤70, дрейф≤1%, топ-15%)",
-        "🔥≤1% ⚡≤3% 🟢≤5% — % до пробоя · 🥀 объём↓ · ⛔ пик · ⚠️ дрейф",
-        "👇 Тапни 📈-ссылку — TradingView",
-    ]
 
-    def build(with_links, max_cand, max_cons):
-        lines = list(header)
-        lines += pos_lines
-        lines.append("")
-        lines.append("🔵🔵🔵 <b>ТОП КАНДИДАТОВ (CONFLUENCE)</b> 🔵🔵🔵")
-        lines.append("<blockquote expandable>")
-        if valid_calls:
-            for i, s in enumerate(valid_calls[:max_cand], 1):
-                lines.append(cand_line(i, s, with_links))
-        else:
-            lines.append("😴 готовых кандидатов нет")
-        lines.append("</blockquote>")
-        lines.append("🟡🟡🟡 <b>МОНЕТЫ В БОКОВИКЕ (30–60 ДНЕЙ)</b> 🟡🟡🟡")
-        lines.append("<blockquote expandable>")
-        if consolidation_list:
-            for i, item in enumerate(consolidation_list[:max_cons], 1):
-                lines.append(cons_line(i, item, with_links))
-        else:
-            lines.append("📦 боковиков нет")
-        lines.append("</blockquote>")
-        lines += footer
-        return "\n".join(lines)
-
-    text = build(True, len(valid_calls), len(consolidation_list))
-    if len(text) > TG_SAFE_LIMIT:
-        for max_cand in range(len(valid_calls), 2, -1):
-            for max_cons in range(len(consolidation_list), 2, -1):
-                text = build(True, max_cand, max_cons)
-                if len(text) <= TG_SAFE_LIMIT:
-                    break
-            if len(text) <= TG_SAFE_LIMIT:
-                break
-    if len(text) > TG_SAFE_LIMIT:
-        text = build(True, 5, 5)
-
-    _send_to_all_one(text)
-    logger.info("Статус: %d символов, кандидатов %d, боковиков %d, tickers %d",
-                len(text), len(valid_calls), len(consolidation_list), tickers_count)
-
-# ==================== MAIN ====================
-def handle_stop(signum, _frame):
-    logger.info("Получен сигнал %s — сохраняю state и завершаюсь", signum)
-    with state_lock:
-        save_state(state)
+def handle_stop(signum, frame):
+    logger.info("Получен сигнал %s — останавливаюсь", signum)
+    STOP_EVENT.set()
+    save_state()
     raise SystemExit(0)
 
-if __name__ == "__main__":
-    logger.info("Запуск бота v20.0 «WS-REALTIME-HOT» (Bybit) ...")
+
+def main():
+    setup_logging()
+
+    load_state()
+    load_cb()
+    load_subscribers()
+
+    logger.info("Bybit Scanner v22.1 WS-SAFE AGGRESSIVE starting")
+
+    pairs = get_universe()
+    if not pairs:
+        logger.critical("Не удалось получить вселенную пар")
+        raise SystemExit(1)
+
+    with pairs_lock:
+        PAIRS[:] = pairs
+
+    logger.info("Universe loaded: %d pairs", len(PAIRS))
+
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
-    _load_subscribers()
-
-    state = load_state()
-    for sym, pos in state.items():
-        if pos.get("position") == "open":
-            if "atr_ref" not in pos or pos["atr_ref"] <= 0:
-                if "atr_entry" in pos and pos["atr_entry"] > 0:
-                    pos["atr_ref"] = pos["atr_entry"]
-                elif pos.get("entry_price") and pos.get("stop"):
-                    pos["atr_ref"] = (pos["entry_price"] - pos["stop"]) / ATR_MULT_SL
-                else:
-                    pos["atr_ref"] = pos.get("entry_price", 0) * 0.01
-            pos.setdefault("partial_done", False)
-            pos.setdefault("breakeven_moved", False)
-            pos.setdefault("highest_close", pos.get("entry_price", 0))
-            pos.setdefault("size_fraction", 1.0)
-            pos.setdefault("btc_blocked_entry", False)
-    save_state(state)
-
-    refresh_market_context()
-
-    retry_count = 0
-    while not PAIRS_WS and retry_count < 3:
-        PAIRS_WS = get_filtered_pairs(TOP_N)
-        if not PAIRS_WS:
-            logger.warning("Попытка %d: нет волатильных пар, повтор...", retry_count + 1)
-            time.sleep(10)
-        retry_count += 1
-    if not PAIRS_WS:
-        logger.warning("Fallback: использую все доступные пары")
-        PAIRS_WS = get_all_available_pairs(TOP_N)
-    if not PAIRS_WS:
-        logger.critical("Не удалось получить пары для WebSocket!")
-        raise SystemExit(1)
-    logger.info("Загружено %d пар для WebSocket", len(PAIRS_WS))
-
-    warm = PAIRS_WS[:TREND_CACHE_INITIAL_LIMIT]
-    for idx, pair in enumerate(warm, 1):
-        try:
-            refresh_trend_for(pair)
-        except Exception as e:
-            logger.debug("warm %s: %s", pair, e)
-        if idx % 15 == 0:
-            logger.info("Прогрев тренд-кэша: %d/%d", idx, len(warm))
-    with trend_cache_lock:
-        q3 = sum(1 for v in trend_cache.values() if v["score"] == 3)
-    logger.info("Прогрев тренд-кэша завершён: 3/3 = %d пар", q3)
-
-    for pair in PAIRS_WS:
-        if not isinstance(pair, str):
-            continue
-        history = fetch_klines(pair, TIMEFRAME, 80)
-        if history:
-            ohlc_buffers[pair] = deque(history, maxlen=200)
-            if len(ohlc_buffers[pair]) >= 2:
-                last_processed_closed[pair] = int(list(ohlc_buffers[pair])[-2]["start"])
-        time.sleep(0.1)
-
-    # Стартуем потоки
-    threading.Thread(target=run_websocket, daemon=True).start()
+    threading.Thread(target=run_kline_ws, daemon=True).start()
+    threading.Thread(target=run_tickers_ws, daemon=True).start()
     threading.Thread(target=watchdog_loop, daemon=True).start()
-    threading.Thread(target=trend_cache_loop, daemon=True).start()
-    threading.Thread(target=market_context_loop, daemon=True).start()
     threading.Thread(target=polling_loop, daemon=True).start()
-    # ⚡ WS-tickers
-    threading.Thread(target=run_tickers_websocket, daemon=True).start()
-    threading.Thread(target=tickers_refresh_loop, daemon=True).start()
 
-    _send_to_all_one(
-        f"🟢 <b>СКАНЕР v20.0 «WS-REALTIME-HOT» ЗАПУЩЕН</b>\n"
-        f"WS kline: {len(PAIRS_WS)} пар · динам. подписка\n"
-        f"⚡ WS tickers: до {WS_TICKERS_MAX_PAIRS} горячих пар в реальном времени\n"
-        f"Тренд 3/3: {q3} · BTC: {'OK' if market_allows_longs() else 'БЛОК'}\n"
-        f"🛡 PEAK-GUARD: не входим на пике (RSI≤{PEAK_MAX_RSI}, "
-        f"дрейф≤{PEAK_MAX_DRIFT_PCT}%)\n"
-        f"🟢 BTC-адаптив: при БЛОК сильные (T3/3+score≥8) → ×0.5\n"
-        f"ℹ️ Показ: {MAX_SHOW_CANDIDATES} кандидатов + "
-        f"{MAX_SHOW_CONSOLIDATIONS} боковиков\n"
-        f"👥 Подписчиков: {len(SUBSCRIBERS)} · /start · /stop · /help")
-    background_scan_loop()
+    send_telegram(
+        "🟢 <b>Bybit Scanner v22.1 WS-SAFE AGGRESSIVE запущен</b>\n"
+        "WS kline: подтверждение 15m свечей.\n"
+        "WS tickers: горячий пул, выходы, armed entries.\n"
+        "Стратегии: Confluence / Pullback / Breakout.\n"
+        "Отключено: WT-DIP / RSI-DIP / BOUNCE / SQZ-DIP.\n"
+        "Score≥5 · RR≥1.5 · TOP_N=150.\n"
+        "Лимиты: 5 позиций, 2 входа/30мин, 6 входов/час.\n"
+        "CB: 3 убытка подряд или -2% за день → пауза 12ч."
+    )
+
+    manage_loop()
+
+
+if __name__ == "__main__":
+    main()
