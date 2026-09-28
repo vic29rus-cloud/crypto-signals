@@ -1373,49 +1373,59 @@ def send_status():
     with pairs_lock:
         kline_count = len(PAIRS)
 
-    lines = []
-    lines.append("📡 <b>СТАТУС v22.3 HARD-SAFE</b>")
-    lines.append(datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC"))
-    lines.append("━" * 21)
-    lines.append(f"🔹 WS kline: {kline_count} · WS tickers: {ticker_count}/{WS_TICKER_MAX}")
-    lines.append(f"🔹 BTC: {esc(btc_reason)}")
-    lines.append(f"🔹 Breadth: {esc(breadth_reason)}")
-    lines.append(
-        f"🔹 CB: {'⏸ пауза ' + str(pause_min) + 'м' if paused else 'OK'} "
-        f"· сегодня {day_pnl:+.2f}% · серия {consec}")
-    lines.append(
-        f"🔹 Позиций: {len(opens)}/{MAX_OPEN_POSITIONS} "
-        f"· armed: {armed_count} · scan: {scan_age}s")
-    lines.append(f"🔹 Лимиты: {MAX_TRADES_PER_30MIN}/30м · {MAX_TRADES_PER_HOUR}/час · "
-                 f"score≥{MIN_SIGNAL_SCORE} · RR≥{MIN_RR:.1f}")
-    lines.append("")
+    now_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M")
 
+    lines = []
+    lines.append(f"📡 <b>СТАТУС v22.3 HARD-SAFE</b> | <i>{now_str} UTC</i>")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"🔹 Пар WS kline: <b>{kline_count}</b> · "
+                 f"WS tickers: <b>{ticker_count}/{WS_TICKER_MAX}</b>")
+    lines.append(f"🔹 BTC: <b>{esc(btc_reason)}</b>")
+    lines.append(f"🔹 Breadth: <b>{esc(breadth_reason)}</b>")
+    cb_str = f"⏸ пауза {pause_min}м" if paused else "OK"
+    lines.append(
+        f"🔹 CB: <b>{cb_str}</b> · сегодня {day_pnl:+.2f}% · "
+        f"серия {consec}")
+    lines.append(
+        f"🔹 Позиций: <b>{len(opens)}/{MAX_OPEN_POSITIONS}</b> · "
+        f"armed: <b>{armed_count}</b> · scan: {scan_age}s")
+    lines.append(
+        f"🔹 Лимиты: {MAX_TRADES_PER_30MIN}/30м · "
+        f"{MAX_TRADES_PER_HOUR}/час · score≥{MIN_SIGNAL_SCORE} · "
+        f"RR≥{MIN_RR:.1f}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━")
+
+    # ===== Позиции =====
     if opens:
-        lines.append("💰 <b>ОТКРЫТЫЕ ПОЗИЦИИ</b>")
         for s, p in opens:
-            be = " · 🔒BE" if p.get("partial_done") else ""
             entry = float(p.get("entry_price", 0))
             cur = CURRENT_PRICE.get(s, entry)
             pnl_live = (cur - entry) / entry * 100 if entry > 0 else 0
             pnl_icon = "🟢" if pnl_live > 0 else "🔴"
+            tag = "🎯" if p.get("strategy") == "confluence" else (
+                  "🌊" if p.get("strategy") == "pullback" else "🚀")
+            be = " · 🔒BE" if p.get("partial_done") else ""
             lines.append(
-                f"📦 {tv_link(s)} "
-                f"💰{entry:.6g}→{cur:.6g} "
+                f"{tag} {tv_link(s)} "
+                f"{entry:.6g} → {cur:.6g} · "
                 f"🛑{float(p.get('stop', 0)):.6g} "
-                f"🎯{float(p.get('target', 0)):.6g} "
-                f"{pnl_icon}{pnl_live:+.2f}%"
-                f"{be}")
+                f"🎯{float(p.get('target', 0)):.6g} · "
+                f"{pnl_icon}{pnl_live:+.2f}%{be}")
     else:
         lines.append("💰 Позиций нет")
 
+    # ===== Топ кандидатов =====
     lines.append("")
-    lines.append("🔵 <b>ТОП КАНДИДАТОВ</b>")
+    lines.append("🔵🔵🔵 <b>ТОП КАНДИДАТОВ</b> 🔵🔵🔵")
+    lines.append("<blockquote expandable>")
     if cands:
         for i, c in enumerate(cands[:10], 1):
             armed = " ⏳" if c.get("armed") else ""
+            score = c.get("score", 0)
+            mark = "🟢" if score >= 6 else ("🟡" if score >= 4 else "")
             lines.append(
-                f"{i}. {tv_link(c['symbol'])} "
-                f"{c.get('strategy', 'watch')} "
+                f"{mark}{i}.{tv_link(c['symbol'])} "
+                f"<b>{c.get('strategy', 'watch')}</b> "
                 f"T{c.get('trend', 0)} "
                 f"ADX{c.get('adx_4h', 0):.0f} "
                 f"RSI{c.get('rsi', 0):.0f} "
@@ -1424,29 +1434,47 @@ def send_status():
                 f"{armed}")
     else:
         lines.append("— нет кандидатов")
+    lines.append("</blockquote>")
 
+    # ===== Боковики =====
     lines.append("")
-    lines.append("🟡 <b>БОКОВИКИ</b>")
+    lines.append("🟡🟡🟡 <b>МОНЕТЫ В БОКОВИКЕ (20 ДНЕЙ)</b> 🟡🟡🟡")
+    lines.append("<blockquote expandable>")
     if cons:
         for i, c in enumerate(cons[:10], 1):
             dist = c.get("dist_pct", 999)
-            mark = ("🔥" if dist <= 1
-                    else "⚡" if dist <= 3
-                    else "🟢" if dist <= 5 else "")
+            if dist <= 1:
+                mark = "🔥"
+            elif dist <= 3:
+                mark = "⚡"
+            elif dist <= 5:
+                mark = "🟢"
+            else:
+                mark = ""
             lines.append(
-                f"{mark}{i}. {tv_link(c['symbol'])} "
-                f"{c.get('days', 0)}д {c.get('range_pct', 0):.1f}% "
+                f"{mark}{i}.{tv_link(c['symbol'])} "
+                f"{c.get('days', 0)}д "
+                f"{c.get('range_pct', 0):.1f}% "
                 f"ADX{c.get('adx', 0):.0f} "
                 f"🚀{c.get('upper', 0):.6g} "
                 f"💰{c.get('price', 0):.6g} ({dist:.1f}%)")
     else:
         lines.append("— нет боковиков")
+    lines.append("</blockquote>")
 
+    # ===== Footer =====
     lines.append("")
-    lines.append("🛡 v22.3 HARD: BTC/ETH off · стейблы off · "
-                 "medRSI<38 блок · score≥6 · 1/30мин")
-    send_telegram("\n".join(lines))
+    lines.append("━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"🔄 Следующий статус через 2 ч")
+    lines.append(f"🛡 v22.3 HARD: BTC/ETH off · стейблы off · "
+                 f"medRSI&lt;38 блок")
+    lines.append(f"🎯 Score≥{MIN_SIGNAL_SCORE} · "
+                 f"RR≥{MIN_RR:.1f} · "
+                 f"1 вход/30мин · {MAX_TRADES_PER_HOUR}/час")
+    lines.append(f"🎯 Стратегии: Confluence · Pullback · Breakout")
+    lines.append(f"/status · /help · /start · /stop")
 
+    send_telegram("\n".join(lines))
 
 # ==================== WEBSOCKET KLINE ====================
 def touch_ws_ts(kind):
