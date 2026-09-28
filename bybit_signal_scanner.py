@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BYBIT SCANNER v22.2 WS-SAFE — финальная версия
+BYBIT SCANNER v22.3 HARD-SAFE
 
-Изменения относительно v22.1:
-- FIX: спам BE/Trailing Stop — force_close=True везде
-- FIX: BTC и ETH исключены из вселенной
-- FIX: PnL по цене (Вход→Выход), вклад в счёт убран из основных алертов
-- FIX: кликабельные ссылки TradingView на все пары
-- FIX: HTML-escape < и > в текстах (Bybit не ломался)
-- NEW: текущий PnL в строке открытой позиции
+Изменения относительно v22.2:
+- HARD: расширенный стейбл-фильтр (USDE/RLUSD/USDX + маска *USD)
+- HARD: боковик с диапазоном <1.5% отбрасывается
+- HARD: Alt Breadth фильтр (медиана RSI < 38 → блок лонгов)
+- HARD: MIN_SIGNAL_SCORE 6, MIN_RR 2.0, 1 вход / 30мин, 4 входа / час
+- FIX: всё из v22.2 (force_close, BTC/ETH off, PnL по цене, ссылки)
 
 Стратегии: Confluence / Pullback / Breakout.
 Отключено: WT-DIP, RSI-DIPBUY, BOUNCE, SQZ-DIP.
@@ -31,21 +30,18 @@ import numpy as np
 import websocket
 
 
-# ==================== СЕКРЕТЫ ====================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
-# ==================== ФАЙЛЫ ====================
 WORK_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_FILE = os.path.join(WORK_DIR, "bybit_scanner_v222.log")
-STATE_FILE = os.path.join(WORK_DIR, "bybit_state_v222.json")
-TRADES_FILE = os.path.join(WORK_DIR, "bybit_trades_v222.json")
-CB_FILE = os.path.join(WORK_DIR, "bybit_cb_v222.json")
-SUBSCRIBERS_FILE = os.path.join(WORK_DIR, "subscribers_v222.json")
+LOG_FILE = os.path.join(WORK_DIR, "bybit_scanner_v223.log")
+STATE_FILE = os.path.join(WORK_DIR, "bybit_state_v223.json")
+TRADES_FILE = os.path.join(WORK_DIR, "bybit_trades_v223.json")
+CB_FILE = os.path.join(WORK_DIR, "bybit_cb_v223.json")
+SUBSCRIBERS_FILE = os.path.join(WORK_DIR, "subscribers_v223.json")
 
 
-# ==================== BYBIT ====================
 BASE_URL = "https://api.bybit.com/v5/market"
 WS_URL = "wss://stream.bybit.com/v5/public/spot"
 
@@ -66,17 +62,17 @@ WS_SUBSCRIBE_PAUSE = 0.15
 WS_SILENCE_TIMEOUT = 150
 
 
-# ==================== РИСК ====================
+# ==================== РИСК (v22.3 HARD) ====================
 MAX_OPEN_POSITIONS = 5
-MAX_TRADES_PER_HOUR = 6
-MAX_TRADES_PER_30MIN = 2
+MAX_TRADES_PER_HOUR = 4
+MAX_TRADES_PER_30MIN = 1
 
 ENTRY_COOLDOWN_SECONDS = 3600
 PAIR_LOSS_COOLDOWN_SECONDS = 86400
 
-MIN_SIGNAL_SCORE = 5
-MIN_STOP_DISTANCE_PCT = 0.8
-MIN_RR = 1.5
+MIN_SIGNAL_SCORE = 6
+MIN_STOP_DISTANCE_PCT = 1.0
+MIN_RR = 2.0
 
 ATR_MULT_SL = 4.0
 ATR_MULT_TP = 8.0
@@ -99,6 +95,13 @@ BTC_DROP_6H_PCT = -3.5
 BTC_ADX_BLOCK = 50
 
 
+# ==================== ALT BREADTH (v22.3) ====================
+ALT_BREADTH_ENABLED = True
+ALT_BREADTH_MEDIAN_RSI = 38.0
+ALT_BREADTH_LOW_PCT = 60.0
+ALT_BREADTH_MIN_SAMPLES = 20
+
+
 # ==================== ФИЛЬТРЫ ====================
 RSI_MIN, RSI_MAX = 35, 72
 ADX_MIN, ADX_MAX = 15, 55
@@ -109,6 +112,7 @@ BREAKOUT_RT_VOL_MULT = 1.6
 
 CONSOL_DAYS = 20
 CONSOL_MAX_RANGE_PCT = 25.0
+CONSOL_MIN_RANGE_PCT = 1.5
 
 ARM_EXPIRY_CONFLUENCE = 3600
 ARM_EXPIRY_PULLBACK = 3600
@@ -126,25 +130,31 @@ STATUS_ADX_MIN, STATUS_ADX_MAX = 18, 55
 TG_MSG_LIMIT = 3900
 
 
-# Исключения из вселенной: стейблы + BTC/ETH (не торгуем)
+# ==================== СТЕЙБЛ-ФИЛЬТР (v22.3 расширен) ====================
 STABLE_BASES = {
-    "USDC", "DAI", "TUSD", "FDUSD", "USD1", "PYUSD",
-    "USDT", "USDD", "EUR", "GBP", "JPY", "AUD", "CAD",
+    # Фиат
+    "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "TRY", "BRL", "MXN",
+    "INR", "SGD", "HKD", "ZAR", "NZD", "NOK", "SEK",
+    # Стейблы USDT-квота
+    "USDC", "DAI", "TUSD", "FDUSD", "PYUSD", "USDD", "USDE",
+    "USDS", "RLUSD", "USDX", "USD1", "GUSD", "BUSD", "USDP",
+    "USTC", "USDY", "SUSD", "LUSD", "FRAX", "WUSD", "XUSD",
+    "DUSD", "AUSD", "USDF", "USD0", "EURT", "EURS", "EURI",
+    "USDR", "USDTB", "EURQ", "EUROP", "FRNT", "BRL1",
+    # Золото
     "XAUT", "PAXG",
-    "BTC", "ETH",   # v22.2: исключены из торговли
+    # Крупные мажоры — не альты
+    "BTC", "ETH",
 }
-
-
 # ==================== ЛОГИ ====================
-logger = logging.getLogger("bybit-scanner-v222")
+logger = logging.getLogger("bybit-scanner-v223")
 
 
 def setup_logging():
     logger.setLevel(logging.INFO)
     fmt = logging.Formatter(
         "%(asctime)s | %(levelname)-7s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+        datefmt="%Y-%m-%d %H:%M:%S")
     fh = logging.handlers.RotatingFileHandler(
         LOG_FILE, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
     fh.setFormatter(fmt)
@@ -200,6 +210,9 @@ trend_lock = threading.RLock()
 BTC_CACHE = {"ts": 0.0, "ok": True, "reason": "init"}
 btc_lock = threading.RLock()
 
+BREADTH_CACHE = {"ts": 0.0, "ok": True, "reason": "init"}
+breadth_lock = threading.RLock()
+
 WS_KLINE_APP = None
 WS_TICKER_APP = None
 WS_KLINE_CONNECTED = threading.Event()
@@ -217,18 +230,18 @@ STOP_EVENT = threading.Event()
 
 # ==================== HTML-HELPERS ====================
 def tv_link(symbol):
-    """v22.2: кликабельная ссылка на TradingView."""
     url = f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol}"
     return f'<a href="{url}">📈 {symbol}</a>'
 
 
 def esc(text):
-    """v22.2: HTML-escape для < > &."""
     return (str(text)
             .replace("&", "&amp;")
             .replace("<", "&lt;")
             .replace(">", "&gt;"))
-    # ==================== TELEGRAM ====================
+
+
+# ==================== TELEGRAM ====================
 def _post_telegram(chat_id, text):
     if not TELEGRAM_BOT_TOKEN:
         return False
@@ -386,16 +399,27 @@ def get_price(symbol):
 
 
 def get_universe():
+    """
+    v22.3: усиленный фильтр.
+    - base в STABLE_BASES → пропуск
+    - base.endswith("USD") → пропуск (универсальная маска)
+    - иначе — по обороту и цене
+    """
     j = api_get("/v5/market/tickers", {"category": "spot"})
     if not j:
         return []
     pairs = []
+    skipped_stable = 0
     for item in j.get("result", {}).get("list", []):
         symbol = item.get("symbol", "")
         if not symbol.endswith("USDT"):
             continue
         base = symbol[:-4]
         if base in STABLE_BASES:
+            skipped_stable += 1
+            continue
+        if base.endswith("USD"):
+            skipped_stable += 1
             continue
         try:
             price = float(item.get("lastPrice", 0))
@@ -406,6 +430,8 @@ def get_universe():
         if price >= MIN_PRICE and turnover >= MIN_TURNOVER_USDT:
             pairs.append((symbol, turnover))
     pairs.sort(key=lambda x: x[1], reverse=True)
+    logger.info("Universe: %d pairs, skipped %d stable-like",
+                min(len(pairs), TOP_N), skipped_stable)
     return [s for s, _ in pairs[:TOP_N]]
 
 
@@ -502,7 +528,7 @@ def confirmed_df(symbol):
     df = pd.DataFrame(rows)
     df = df.drop_duplicates("start").sort_values("start").reset_index(drop=True)
     return df
-    # ==================== ТРЕНД / BTC ====================
+    # ==================== ТРЕНД / BTC / BREADTH ====================
 def get_trend(symbol, force=False):
     now = time.time()
     with trend_lock:
@@ -550,11 +576,54 @@ def btc_allows_longs():
     if chg_6h <= BTC_DROP_6H_PCT:
         ok, reason = False, f"BTC {chg_6h:.1f}%/6h"
     elif a and a["ema9"] < a["ema21"] and a["adx"] > BTC_ADX_BLOCK:
-        ok, reason = False, f"BTC downtrend ADX {a['adx']:.0f}"
+        ok, reason = False, f"BTC dt ADX{a['adx']:.0f}"
     with btc_lock:
         BTC_CACHE["ts"] = now
         BTC_CACHE["ok"] = ok
         BTC_CACHE["reason"] = reason
+    return ok, reason
+
+
+def alt_breadth_allows_longs():
+    """
+    v22.3: блок новых лонгов, если альты в панике.
+    Условия блока:
+      - медиана RSI по вселенной < 38
+      - или > 60% пар с RSI < 40
+    Данные берутся из LAST_ANALYSIS (заполняется WS-тиками).
+    """
+    if not ALT_BREADTH_ENABLED:
+        return True, "off"
+    now = time.time()
+    with breadth_lock:
+        if now - BREADTH_CACHE.get("ts", 0) < 120:
+            return BREADTH_CACHE["ok"], BREADTH_CACHE["reason"]
+    rsis = []
+    with analysis_lock:
+        for sym, item in LAST_ANALYSIS.items():
+            a = item.get("analysis")
+            if a and a.get("rsi"):
+                rsis.append(float(a["rsi"]))
+    if len(rsis) < ALT_BREADTH_MIN_SAMPLES:
+        with breadth_lock:
+            BREADTH_CACHE["ts"] = now
+            BREADTH_CACHE["ok"] = True
+            BREADTH_CACHE["reason"] = f"n/a ({len(rsis)})"
+        return True, f"n/a ({len(rsis)})"
+    median_rsi = float(np.median(rsis))
+    low_pct = sum(1 for r in rsis if r < 40) / len(rsis) * 100.0
+    ok = True
+    reason = f"OK medRSI={median_rsi:.0f} low={low_pct:.0f}%"
+    if median_rsi < ALT_BREADTH_MEDIAN_RSI:
+        ok = False
+        reason = f"alt panic medRSI={median_rsi:.0f}"
+    elif low_pct > ALT_BREADTH_LOW_PCT:
+        ok = False
+        reason = f"alt panic low={low_pct:.0f}%"
+    with breadth_lock:
+        BREADTH_CACHE["ts"] = now
+        BREADTH_CACHE["ok"] = ok
+        BREADTH_CACHE["reason"] = reason
     return ok, reason
 
 
@@ -800,12 +869,8 @@ def open_position(sig):
     return True
 
 
-# ==================== RECORD TRADE (с force_close) ====================
+# ==================== RECORD TRADE ====================
 def record_trade(symbol, pos, exit_price, reason, fraction, force_close=False):
-    """
-    v22.2: force_close=True — гарантированно закрывает позицию.
-    Возвращает (pnl_pct, contribution_pct) или None.
-    """
     entry = float(pos.get("entry_price", 0.0))
     if entry <= 0:
         return None
@@ -853,17 +918,12 @@ def record_trade(symbol, pos, exit_price, reason, fraction, force_close=False):
     return pnl_pct, contribution_pct
 
 
-# ==================== ЗАКРЫТИЕ (новый формат) ====================
+# ==================== ЗАКРЫТИЕ ====================
 def close_position(symbol, price, reason, fraction=1.0, force_close=False):
-    """
-    v22.2: PnL по цене (Вход→Выход), вклад в счёт мелко.
-    force_close гарантирует закрытие и убирает спам.
-    """
     with state_lock:
         pos = state.get(symbol)
         if not pos or pos.get("position") != "open":
             return
-        # v22.2: защита от двойного вызова — если уже закрыта в этой же секунде
         if pos.get("closing_lock_ts"):
             if time.time() - float(pos["closing_lock_ts"]) < 5:
                 return
@@ -910,7 +970,6 @@ def check_position_price(symbol, price):
         pos["highest"] = highest
         state[symbol] = pos
 
-    # v22.2: все выходы через force_close — БОЛЬШЕ НЕТ СПАМА
     if price <= stop:
         if partial:
             close_position(symbol, stop, "BE/Trailing Stop",
@@ -929,7 +988,6 @@ def check_position_price(symbol, price):
                            fraction=1.0, force_close=True)
         return
 
-    # Partial TP
     if not partial and price >= entry + PARTIAL_TP_ATR * atr_ref:
         part_price = entry + PARTIAL_TP_ATR * atr_ref
         with state_lock:
@@ -955,7 +1013,6 @@ def check_position_price(symbol, price):
                     symbol, part_price, pnl_pct)
         return
 
-    # Trailing после partial
     if partial:
         new_stop = highest - TRAILING_STEP_ATR * atr_ref
         floor = entry * 1.001
@@ -1020,7 +1077,8 @@ def try_realtime_breakout(symbol, price):
     if len(confirmed) < 20:
         return
     try:
-        avg_vol = float(np.mean([float(c.get("volume", 0)) for c in confirmed[-20:]]))
+        avg_vol = float(np.mean([float(c.get("volume", 0))
+                                 for c in confirmed[-20:]]))
         cur_vol = float(current.get("volume", 0))
     except Exception:
         return
@@ -1037,7 +1095,8 @@ def try_realtime_breakout(symbol, price):
         f"Vol {vol_ratio:.1f}x",
         f"Trend {trend['score']}/2",
     ]
-    sig = make_signal(symbol, "breakout_rt", price, atr_value, 8, parts, expiry_sec=60)
+    sig = make_signal(symbol, "breakout_rt", price, atr_value, 8,
+                      parts, expiry_sec=60)
     if sig:
         open_position(sig)
         # ==================== СТРАТЕГИИ ====================
@@ -1148,6 +1207,10 @@ def process_ws_closed(symbol):
 
 
 def detect_consolidation(symbol):
+    """
+    v22.3: боковик с диапазоном < CONSOL_MIN_RANGE_PCT отбрасывается
+    (это стейбл или мёртвая пара).
+    """
     dfd = fetch_klines(symbol, "D", 80)
     if dfd is None or len(dfd) < CONSOL_DAYS + 5:
         return None
@@ -1166,6 +1229,8 @@ def detect_consolidation(symbol):
     range_pct = (upper - lower) / lower * 100.0
     if range_pct > CONSOL_MAX_RANGE_PCT:
         return None
+    if range_pct < CONSOL_MIN_RANGE_PCT:
+        return None
     if pd.isna(adx_val):
         adx_val = 0.0
     return {
@@ -1178,11 +1243,13 @@ def detect_consolidation(symbol):
 def scan_cycle():
     global CANDIDATES, CONSOLIDATIONS, LAST_SCAN_TS
     btc_ok, btc_reason = btc_allows_longs()
+    breadth_ok, breadth_reason = alt_breadth_allows_longs()
     with pairs_lock:
         pairs = list(PAIRS)
     candidates = []
     consolidations = []
-    logger.info("Scan started: pairs=%d btc=%s", len(pairs), btc_reason)
+    logger.info("Scan started: pairs=%d btc=%s breadth=%s",
+                len(pairs), btc_reason, breadth_reason)
 
     for symbol in pairs:
         try:
@@ -1213,7 +1280,7 @@ def scan_cycle():
                 })
             if a15:
                 sig = evaluate_signal(symbol, a15, trend, cons_upper)
-                if sig and btc_ok:
+                if sig and btc_ok and breadth_ok:
                     arm_signal(symbol, sig)
                 candidates.append({
                     "symbol": symbol,
@@ -1237,8 +1304,9 @@ def scan_cycle():
         CANDIDATES = candidates[:30]
         CONSOLIDATIONS = consolidations[:30]
     LAST_SCAN_TS = time.time()
-    logger.info("Scan done: candidates=%d cons=%d btc=%s",
-                len(CANDIDATES), len(CONSOLIDATIONS), btc_reason)
+    logger.info("Scan done: candidates=%d cons=%d btc=%s breadth=%s",
+                len(CANDIDATES), len(CONSOLIDATIONS),
+                btc_reason, breadth_reason)
     update_ticker_subscription()
 
 
@@ -1280,9 +1348,7 @@ def periodic_exit_checks():
                 fraction = 0.5 if pos.get("partial_done") else 1.0
                 close_position(symbol, price, "EMA reversal 4h", fraction,
                                force_close=True)
-
-
-# ==================== СТАТУС ====================
+                # ==================== СТАТУС ====================
 def send_status():
     with state_lock:
         opens = [(s, dict(p)) for s, p in state.items()
@@ -1295,6 +1361,7 @@ def send_status():
         day_pnl = float(cb.get("day_pnl", 0.0))
         consec = int(cb.get("consec", 0))
     btc_ok, btc_reason = btc_allows_longs()
+    breadth_ok, breadth_reason = alt_breadth_allows_longs()
     with scan_lock:
         cands = list(CANDIDATES)
         cons = list(CONSOLIDATIONS)
@@ -1307,18 +1374,20 @@ def send_status():
         kline_count = len(PAIRS)
 
     lines = []
-    lines.append("📡 <b>СТАТУС v22.2 WS-SAFE</b>")
+    lines.append("📡 <b>СТАТУС v22.3 HARD-SAFE</b>")
     lines.append(datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC"))
     lines.append("━" * 21)
     lines.append(f"🔹 WS kline: {kline_count} · WS tickers: {ticker_count}/{WS_TICKER_MAX}")
     lines.append(f"🔹 BTC: {esc(btc_reason)}")
+    lines.append(f"🔹 Breadth: {esc(breadth_reason)}")
     lines.append(
         f"🔹 CB: {'⏸ пауза ' + str(pause_min) + 'м' if paused else 'OK'} "
         f"· сегодня {day_pnl:+.2f}% · серия {consec}")
     lines.append(
         f"🔹 Позиций: {len(opens)}/{MAX_OPEN_POSITIONS} "
         f"· armed: {armed_count} · scan: {scan_age}s")
-    lines.append(f"🔹 Лимиты: {MAX_TRADES_PER_30MIN}/30м · {MAX_TRADES_PER_HOUR}/час")
+    lines.append(f"🔹 Лимиты: {MAX_TRADES_PER_30MIN}/30м · {MAX_TRADES_PER_HOUR}/час · "
+                 f"score≥{MIN_SIGNAL_SCORE} · RR≥{MIN_RR:.1f}")
     lines.append("")
 
     if opens:
@@ -1366,7 +1435,7 @@ def send_status():
                     else "🟢" if dist <= 5 else "")
             lines.append(
                 f"{mark}{i}. {tv_link(c['symbol'])} "
-                f"{c.get('days', 0)}д {c.get('range_pct', 0):.0f}% "
+                f"{c.get('days', 0)}д {c.get('range_pct', 0):.1f}% "
                 f"ADX{c.get('adx', 0):.0f} "
                 f"🚀{c.get('upper', 0):.6g} "
                 f"💰{c.get('price', 0):.6g} ({dist:.1f}%)")
@@ -1374,9 +1443,12 @@ def send_status():
         lines.append("— нет боковиков")
 
     lines.append("")
-    lines.append("🛡 v22.2: BTC/ETH off · PnL по цене · force_close")
+    lines.append("🛡 v22.3 HARD: BTC/ETH off · стейблы off · "
+                 "medRSI<38 блок · score≥6 · 1/30мин")
     send_telegram("\n".join(lines))
-    # ==================== WEBSOCKET KLINE ====================
+
+
+# ==================== WEBSOCKET KLINE ====================
 def touch_ws_ts(kind):
     global LAST_WS_KLINE_TS, LAST_WS_TICKER_TS
     now = time.time()
@@ -1675,8 +1747,7 @@ def polling_loop():
                     if add_subscriber(int(cid)):
                         _post_telegram(cid,
                             "🟢 <b>Подписка оформлена</b>\n"
-                            "v22.2 WS-SAFE запущен.\n"
-                            "Confluence / Pullback / Breakout.\n"
+                            "v22.3 HARD-SAFE запущен.\n"
                             "/stop — отписаться, /help — справка.")
                     else:
                         _post_telegram(cid, "✅ Вы уже подписаны.")
@@ -1687,10 +1758,11 @@ def polling_loop():
                         _post_telegram(cid, "Вы и так не подписаны.")
                 elif text == "/help":
                     _post_telegram(cid,
-                        "📡 <b>Bybit Scanner v22.2 WS-SAFE</b>\n"
+                        "📡 <b>Bybit Scanner v22.3 HARD-SAFE</b>\n"
                         "Стратегии: Confluence, Pullback, Breakout.\n"
-                        "BTC/ETH исключены из торговли.\n"
-                        "Алерты: PnL по цене (Вход→Выход).\n"
+                        "BTC/ETH off, стейблы off.\n"
+                        "Score≥6 · RR≥2.0 · 1 вход/30мин.\n"
+                        "Alt Breadth: medRSI<38 → блок.\n"
                         "Команды: /start, /stop, /help, /status.")
                 elif text == "/status":
                     threading.Thread(target=send_status, daemon=True).start()
@@ -1699,7 +1771,7 @@ def polling_loop():
             time.sleep(5)
 
 
-# ==================== MAIN LOOP ====================
+# ==================== MAIN ====================
 def manage_loop():
     now = time.time()
     next_scan = now + 5
@@ -1739,14 +1811,15 @@ def main():
     load_state()
     load_cb()
     load_subscribers()
-    logger.info("Bybit Scanner v22.2 WS-SAFE starting")
+    logger.info("Bybit Scanner v22.3 HARD-SAFE starting")
     pairs = get_universe()
     if not pairs:
         logger.critical("Не удалось получить вселенную пар")
         raise SystemExit(1)
     with pairs_lock:
         PAIRS[:] = pairs
-    logger.info("Universe loaded: %d pairs (BTC/ETH excluded)", len(PAIRS))
+    logger.info("Universe loaded: %d pairs (BTC/ETH/stables excluded)",
+                len(PAIRS))
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
     threading.Thread(target=run_kline_ws, daemon=True).start()
@@ -1754,13 +1827,13 @@ def main():
     threading.Thread(target=watchdog_loop, daemon=True).start()
     threading.Thread(target=polling_loop, daemon=True).start()
     send_telegram(
-        "🟢 <b>Bybit Scanner v22.2 WS-SAFE запущен</b>\n"
+        "🟢 <b>Bybit Scanner v22.3 HARD-SAFE запущен</b>\n"
         "WS kline 15m + WS tickers.\n"
         "Стратегии: Confluence / Pullback / Breakout.\n"
-        "BTC и ETH исключены из торговли.\n"
-        "Алерты показывают PnL по цене (Вход→Выход).\n"
-        "Ссылки TradingView на все пары.\n"
-        "fix: спам BE/Trailing Stop больше не появляется."
+        "BTC/ETH/stables — off.\n"
+        "Score≥6 · RR≥2.0 · 1 вход/30мин · 4/час.\n"
+        "Alt Breadth: medRSI<38 → блок лонгов.\n"
+        "CB: 3 стопа или -2% → пауза 12ч."
     )
     manage_loop()
 
