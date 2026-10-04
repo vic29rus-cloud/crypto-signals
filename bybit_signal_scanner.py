@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BYBIT SCANNER v22.3 HARD-SAFE
+BYBIT SCANNER v22.4 OBSERVE
 
-Изменения относительно v22.2:
-- HARD: расширенный стейбл-фильтр (USDE/RLUSD/USDX + маска *USD)
-- HARD: боковик с диапазоном <1.5% отбрасывается
-- HARD: Alt Breadth фильтр (медиана RSI < 38 → блок лонгов)
-- HARD: MIN_SIGNAL_SCORE 6, MIN_RR 2.0, 1 вход / 30мин, 4 входа / час
-- FIX: всё из v22.2 (force_close, BTC/ETH off, PnL по цене, ссылки)
+Режим наблюдения:
+- size = 1.0 всегда (100% депо на сделку)
+- НЕТ частичных закрытий (partial TP отключён)
+- BE при +0.5R вместо partial TP
+- PnL показывается ТОЛЬКО по цене (Вход→Выход), без вклада в счёт
 
-Стратегии: Confluence / Pullback / Breakout.
-Отключено: WT-DIP, RSI-DIPBUY, BOUNCE, SQZ-DIP.
+Из v22.3 сохранено:
+- Confluence / Pullback / Breakout
+- BTC/ETH/stables off
+- Alt Breadth (medRSI<38 → блок)
+- Score≥6, RR≥2.0, 1 вход/30мин, 4/час
+- force_close fix
+- Кликабельные ссылки TradingView
 """
 
 import os
@@ -35,11 +39,11 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
 WORK_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_FILE = os.path.join(WORK_DIR, "bybit_scanner_v223.log")
-STATE_FILE = os.path.join(WORK_DIR, "bybit_state_v223.json")
-TRADES_FILE = os.path.join(WORK_DIR, "bybit_trades_v223.json")
-CB_FILE = os.path.join(WORK_DIR, "bybit_cb_v223.json")
-SUBSCRIBERS_FILE = os.path.join(WORK_DIR, "subscribers_v223.json")
+LOG_FILE = os.path.join(WORK_DIR, "bybit_scanner_v224.log")
+STATE_FILE = os.path.join(WORK_DIR, "bybit_state_v224.json")
+TRADES_FILE = os.path.join(WORK_DIR, "bybit_trades_v224.json")
+CB_FILE = os.path.join(WORK_DIR, "bybit_cb_v224.json")
+SUBSCRIBERS_FILE = os.path.join(WORK_DIR, "subscribers_v224.json")
 
 
 BASE_URL = "https://api.bybit.com/v5/market"
@@ -62,7 +66,7 @@ WS_SUBSCRIBE_PAUSE = 0.15
 WS_SILENCE_TIMEOUT = 150
 
 
-# ==================== РИСК (v22.3 HARD) ====================
+# ==================== РИСК (v22.4 OBSERVE) ====================
 MAX_OPEN_POSITIONS = 5
 MAX_TRADES_PER_HOUR = 4
 MAX_TRADES_PER_30MIN = 1
@@ -80,6 +84,10 @@ PARTIAL_TP_ATR = 3.5
 TRAILING_STEP_ATR = 2.5
 TIME_STOP_HOURS = 72
 
+# v22.4: режим наблюдения
+NO_PARTIAL_TP = True
+BREAKEVEN_AT_R = 0.5
+
 RISK_PER_TRADE_PCT = 0.75
 MAX_PORTFOLIO_RISK_PCT = 4.0
 
@@ -95,7 +103,7 @@ BTC_DROP_6H_PCT = -3.5
 BTC_ADX_BLOCK = 50
 
 
-# ==================== ALT BREADTH (v22.3) ====================
+# ==================== ALT BREADTH ====================
 ALT_BREADTH_ENABLED = True
 ALT_BREADTH_MEDIAN_RSI = 38.0
 ALT_BREADTH_LOW_PCT = 60.0
@@ -130,24 +138,20 @@ STATUS_ADX_MIN, STATUS_ADX_MAX = 18, 55
 TG_MSG_LIMIT = 3900
 
 
-# ==================== СТЕЙБЛ-ФИЛЬТР (v22.3 расширен) ====================
+# ==================== СТЕЙБЛ-ФИЛЬТР ====================
 STABLE_BASES = {
-    # Фиат
     "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "TRY", "BRL", "MXN",
     "INR", "SGD", "HKD", "ZAR", "NZD", "NOK", "SEK",
-    # Стейблы USDT-квота
     "USDC", "DAI", "TUSD", "FDUSD", "PYUSD", "USDD", "USDE",
     "USDS", "RLUSD", "USDX", "USD1", "GUSD", "BUSD", "USDP",
     "USTC", "USDY", "SUSD", "LUSD", "FRAX", "WUSD", "XUSD",
     "DUSD", "AUSD", "USDF", "USD0", "EURT", "EURS", "EURI",
     "USDR", "USDTB", "EURQ", "EUROP", "FRNT", "BRL1",
-    # Золото
     "XAUT", "PAXG",
-    # Крупные мажоры — не альты
     "BTC", "ETH",
 }
 # ==================== ЛОГИ ====================
-logger = logging.getLogger("bybit-scanner-v223")
+logger = logging.getLogger("bybit-scanner-v224")
 
 
 def setup_logging():
@@ -399,12 +403,6 @@ def get_price(symbol):
 
 
 def get_universe():
-    """
-    v22.3: усиленный фильтр.
-    - base в STABLE_BASES → пропуск
-    - base.endswith("USD") → пропуск (универсальная маска)
-    - иначе — по обороту и цене
-    """
     j = api_get("/v5/market/tickers", {"category": "spot"})
     if not j:
         return []
@@ -585,13 +583,6 @@ def btc_allows_longs():
 
 
 def alt_breadth_allows_longs():
-    """
-    v22.3: блок новых лонгов, если альты в панике.
-    Условия блока:
-      - медиана RSI по вселенной < 38
-      - или > 60% пар с RSI < 40
-    Данные берутся из LAST_ANALYSIS (заполняется WS-тиками).
-    """
     if not ALT_BREADTH_ENABLED:
         return True, "off"
     now = time.time()
@@ -715,21 +706,12 @@ def append_trade(trade):
         logger.error("append_trade error: %s", e)
 
 
-def portfolio_risk_used():
-    with state_lock:
-        return sum(
-            float(p.get("account_risk_pct", 0.0))
-            for p in state.values()
-            if p.get("position") == "open"
-        )
-
-
 def cb_can_trade():
     with cb_lock:
         return time.time() >= float(cb.get("paused_until", 0.0))
 
 
-def can_enter(symbol, account_risk_pct):
+def can_enter(symbol):
     now = time.time()
     if not cb_can_trade():
         return False
@@ -737,8 +719,6 @@ def can_enter(symbol, account_risk_pct):
         open_count = sum(1 for p in state.values()
                          if p.get("position") == "open")
         if open_count >= MAX_OPEN_POSITIONS:
-            return False
-        if portfolio_risk_used() + float(account_risk_pct) > MAX_PORTFOLIO_RISK_PCT:
             return False
         old = state.get(symbol, {})
         if old.get("position") == "open":
@@ -774,9 +754,6 @@ def make_signal(symbol, strategy, entry, atr_value, score, parts,
     rr = (target - entry) / (entry - stop)
     if rr < MIN_RR:
         return None
-    size = RISK_PER_TRADE_PCT / max(risk_pct, 0.1)
-    size = max(0.05, min(1.0, size))
-    account_risk_pct = size * risk_pct
     if entry_low is None:
         entry_low = entry * ENTRY_TOLERANCE_LOW
     if entry_high is None:
@@ -787,8 +764,7 @@ def make_signal(symbol, strategy, entry, atr_value, score, parts,
         "target": float(target), "atr": float(atr_value),
         "score": int(score), "parts": list(parts),
         "risk_pct": float(risk_pct),
-        "account_risk_pct": float(account_risk_pct),
-        "size_fraction": float(size), "rr": float(rr),
+        "rr": float(rr),
         "entry_low": float(entry_low), "entry_high": float(entry_high),
         "expires": time.time() + float(expiry_sec),
     }
@@ -822,7 +798,7 @@ def expire_armed():
                 # ==================== ОТКРЫТИЕ ПОЗИЦИИ ====================
 def open_position(sig):
     symbol = sig["symbol"]
-    if not can_enter(symbol, sig["account_risk_pct"]):
+    if not can_enter(symbol):
         return False
     now = time.time()
     with state_lock:
@@ -835,15 +811,14 @@ def open_position(sig):
             "atr_ref": sig["atr"],
             "score": sig["score"],
             "risk_pct": sig["risk_pct"],
-            "account_risk_pct": sig["account_risk_pct"],
-            "size_fraction": sig["size_fraction"],
             "rr": sig["rr"],
             "entry_ts": now,
             "entry_time": datetime.now(timezone.utc).isoformat(),
             "last_entry_ts": now,
             "last_loss_ts": 0.0,
             "last_exit_ts": 0.0,
-            "partial_done": False,
+            "partial_done": False,       # технический флаг trailing
+            "breakeven_moved": False,    # v22.4: отдельный флаг BE
             "highest": sig["entry"],
             "last_reversal_check": 0.0,
         }
@@ -854,12 +829,14 @@ def open_position(sig):
     with armed_lock:
         ARMED.pop(symbol, None)
     parts_txt = esc(" / ".join(sig["parts"]))
+    sl_pct = (sig["stop"] - sig["entry"]) / sig["entry"] * 100
+    tp_pct = (sig["target"] - sig["entry"]) / sig["entry"] * 100
     send_telegram(
         f"🟢 <b>ВХОД {sig['strategy'].upper()}</b>\n"
         f"Пара: {tv_link(symbol)}\n"
         f"Цена: {sig['entry']:.8f}\n"
-        f"SL: {sig['stop']:.8f}\n"
-        f"TP: {sig['target']:.8f}\n"
+        f"SL: {sig['stop']:.8f} ({sl_pct:+.2f}%)\n"
+        f"TP: {sig['target']:.8f} ({tp_pct:+.2f}%)\n"
         f"Score: {sig['score']} · RR: {sig['rr']:.2f}\n"
         f"<i>{parts_txt}</i>"
     )
@@ -870,16 +847,17 @@ def open_position(sig):
 
 
 # ==================== RECORD TRADE ====================
-def record_trade(symbol, pos, exit_price, reason, fraction, force_close=False):
+def record_trade(symbol, pos, exit_price, reason, force_close=False):
+    """
+    v22.4: fraction всегда 1.0 (без частичных).
+    contribution_pct = pnl_pct (size=1.0).
+    """
     entry = float(pos.get("entry_price", 0.0))
     if entry <= 0:
         return None
-    size = float(pos.get("size_fraction", 1.0))
-    fraction = float(fraction)
     pnl_pct = (float(exit_price) - entry) / entry * 100.0
-    contribution_pct = size * pnl_pct * fraction
+    contribution_pct = pnl_pct  # size=1.0
     now = time.time()
-    full_close = force_close or fraction >= 0.999
     trade = {
         "time": datetime.now(timezone.utc).isoformat(),
         "symbol": symbol,
@@ -887,10 +865,9 @@ def record_trade(symbol, pos, exit_price, reason, fraction, force_close=False):
         "entry": entry,
         "exit": float(exit_price),
         "reason": reason,
-        "fraction": fraction,
+        "fraction": 1.0,
         "pnl_pct": pnl_pct,
         "contribution_pct": contribution_pct,
-        "size_fraction": size,
     }
     append_trade(trade)
     with cb_lock:
@@ -900,10 +877,9 @@ def record_trade(symbol, pos, exit_price, reason, fraction, force_close=False):
             cb["day_pnl"] = 0.0
             cb["consec"] = 0
         cb["day_pnl"] = float(cb.get("day_pnl", 0.0)) + contribution_pct
-        if contribution_pct < 0:
+        if pnl_pct < 0:
             cb["consec"] = int(cb.get("consec", 0)) + 1
-            if full_close:
-                pos["last_loss_ts"] = now
+            pos["last_loss_ts"] = now
         else:
             cb["consec"] = 0
         if cb["consec"] >= CB_CONSEC_LOSSES or cb["day_pnl"] <= CB_DAILY_LOSS_PCT:
@@ -912,14 +888,18 @@ def record_trade(symbol, pos, exit_price, reason, fraction, force_close=False):
                 "CIRCUIT BREAKER: consec=%s day_pnl=%.2f%% pause=%s min",
                 cb["consec"], cb["day_pnl"], CB_PAUSE_SECONDS // 60)
         save_cb()
-    if full_close:
+    if force_close:
         pos["last_exit_ts"] = now
         pos["position"] = "closed"
-    return pnl_pct, contribution_pct
+    return pnl_pct
 
 
 # ==================== ЗАКРЫТИЕ ====================
-def close_position(symbol, price, reason, fraction=1.0, force_close=False):
+def close_position(symbol, price, reason, force_close=True):
+    """
+    v22.4: без fraction, всегда полное закрытие.
+    Формат: только PnL по цене.
+    """
     with state_lock:
         pos = state.get(symbol)
         if not pos or pos.get("position") != "open":
@@ -928,14 +908,13 @@ def close_position(symbol, price, reason, fraction=1.0, force_close=False):
             if time.time() - float(pos["closing_lock_ts"]) < 5:
                 return
         pos["closing_lock_ts"] = time.time()
-        result = record_trade(symbol, pos, price, reason, fraction,
+        result = record_trade(symbol, pos, price, reason,
                               force_close=force_close)
-        if not result:
+        if result is None:
             pos.pop("closing_lock_ts", None)
             state[symbol] = pos
             return
-        pnl_pct, contribution = result
-        size = float(pos.get("size_fraction", 1.0))
+        pnl_pct = result
         entry = float(pos.get("entry_price", 0.0))
         state[symbol] = pos
         save_state()
@@ -944,11 +923,10 @@ def close_position(symbol, price, reason, fraction=1.0, force_close=False):
         f"{icon} <b>ВЫХОД · {reason}</b>\n"
         f"Пара: {tv_link(symbol)}\n"
         f"Вход: {entry:.8f} → Выход: {float(price):.8f}\n"
-        f"PnL по цене: <b>{pnl_pct:+.2f}%</b> (доля {fraction*100:.0f}%)\n"
-        f"<i>Вклад в счёт: {contribution:+.3f}% (size {size:.2f})</i>"
+        f"PnL по цене: <b>{pnl_pct:+.2f}%</b>"
     )
-    logger.info("CLOSE %s %s price=%.8f fraction=%.2f pnl=%.2f%%",
-                symbol, reason, float(price), float(fraction), pnl_pct)
+    logger.info("CLOSE %s %s price=%.8f pnl=%.2f%%",
+                symbol, reason, float(price), pnl_pct)
 
 
 # ==================== ПРОВЕРКА ЦЕНЫ ====================
@@ -963,57 +941,53 @@ def check_position_price(symbol, price):
         atr_ref = float(pos.get("atr_ref", 0.0))
         stop = float(pos.get("stop", 0.0))
         target = float(pos.get("target", 0.0))
-        partial = bool(pos.get("partial_done", False))
+        be_moved = bool(pos.get("breakeven_moved", False))
         highest = max(float(pos.get("highest", entry)), float(price))
         if entry <= 0 or atr_ref <= 0:
             return
         pos["highest"] = highest
         state[symbol] = pos
 
+    # Стоп (полное закрытие)
     if price <= stop:
-        if partial:
-            close_position(symbol, stop, "BE/Trailing Stop",
-                           fraction=0.5, force_close=True)
-        else:
-            close_position(symbol, stop, "Stop-Loss",
-                           fraction=1.0, force_close=True)
+        reason = "BE/Trailing Stop" if be_moved else "Stop-Loss"
+        close_position(symbol, stop, reason, force_close=True)
         return
 
+    # Тейк (полное закрытие)
     if price >= target:
-        if partial:
-            close_position(symbol, target, "Take-Profit",
-                           fraction=0.5, force_close=True)
-        else:
-            close_position(symbol, target, "Take-Profit",
-                           fraction=1.0, force_close=True)
+        close_position(symbol, target, "Take-Profit", force_close=True)
         return
 
-    if not partial and price >= entry + PARTIAL_TP_ATR * atr_ref:
-        part_price = entry + PARTIAL_TP_ATR * atr_ref
+    # v22.4: BE при +0.5R вместо partial TP
+    if (not be_moved
+            and price >= entry + BREAKEVEN_AT_R * atr_ref):
         with state_lock:
             pos = state.get(symbol)
-            if not pos or pos.get("partial_done"):
+            if not pos or pos.get("breakeven_moved"):
                 return
-            result = record_trade(symbol, pos, part_price, "Partial TP 50%", 0.5)
-            if not result:
-                return
-            pnl_pct, contribution = result
-            pos["partial_done"] = True
-            pos["stop"] = max(stop, entry * 1.001)
-            state[symbol] = pos
-            save_state()
-        send_telegram(
-            f"💰 <b>ЧАСТИЧНЫЙ TP 50%</b>\n"
-            f"Пара: {tv_link(symbol)}\n"
-            f"Вход: {entry:.8f} → TP: {part_price:.8f}\n"
-            f"PnL по цене: <b>{pnl_pct:+.2f}%</b>\n"
-            f"Стоп переведён в безубыток."
-        )
-        logger.info("PARTIAL TP %s @ %.8f pnl=%.2f%%",
-                    symbol, part_price, pnl_pct)
+            old_stop = float(pos.get("stop", 0))
+            new_stop = max(old_stop, entry * 1.001)
+            if new_stop > old_stop:
+                pos["stop"] = new_stop
+                pos["breakeven_moved"] = True
+                pos["partial_done"] = True  # для совместимости (trailing)
+                state[symbol] = pos
+                save_state()
+                pnl_now = (price - entry) / entry * 100
+                send_telegram(
+                    f"🔒 <b>СТОП В БЕЗУБЫТОК</b>\n"
+                    f"Пара: {tv_link(symbol)}\n"
+                    f"Вход: {entry:.8f} → текущая: {float(price):.8f}\n"
+                    f"PnL сейчас: <b>{pnl_now:+.2f}%</b>\n"
+                    f"Новый стоп: {new_stop:.8f} (безубыток)"
+                )
+                logger.info("BE moved %s entry=%.8f new_stop=%.8f",
+                            symbol, entry, new_stop)
         return
 
-    if partial:
+    # Trailing после BE
+    if be_moved:
         new_stop = highest - TRAILING_STEP_ATR * atr_ref
         floor = entry * 1.001
         with state_lock:
@@ -1207,10 +1181,6 @@ def process_ws_closed(symbol):
 
 
 def detect_consolidation(symbol):
-    """
-    v22.3: боковик с диапазоном < CONSOL_MIN_RANGE_PCT отбрасывается
-    (это стейбл или мёртвая пара).
-    """
     dfd = fetch_klines(symbol, "D", 80)
     if dfd is None or len(dfd) < CONSOL_DAYS + 5:
         return None
@@ -1331,9 +1301,7 @@ def periodic_exit_checks():
         if age_hours >= TIME_STOP_HOURS:
             r_multiple = (price - entry) / atr_ref
             if r_multiple < 1.0:
-                fraction = 0.5 if pos.get("partial_done") else 1.0
-                close_position(symbol, price, "Time Stop", fraction,
-                               force_close=True)
+                close_position(symbol, price, "Time Stop", force_close=True)
                 continue
         if now - float(pos.get("last_reversal_check", 0)) > 900:
             with state_lock:
@@ -1345,8 +1313,7 @@ def periodic_exit_checks():
             df4 = fetch_klines(symbol, "240", 80)
             a4 = analyze_frame(df4, drop_last=True)
             if a4 and a4["ema9"] < a4["ema21"] and price > entry * 1.005:
-                fraction = 0.5 if pos.get("partial_done") else 1.0
-                close_position(symbol, price, "EMA reversal 4h", fraction,
+                close_position(symbol, price, "EMA reversal 4h",
                                force_close=True)
                 # ==================== СТАТУС ====================
 def send_status():
@@ -1376,7 +1343,7 @@ def send_status():
     now_str = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M")
 
     lines = []
-    lines.append(f"📡 <b>СТАТУС v22.3 HARD-SAFE</b> | <i>{now_str} UTC</i>")
+    lines.append(f"📡 <b>СТАТУС v22.4 OBSERVE</b> | <i>{now_str} UTC</i>")
     lines.append("━━━━━━━━━━━━━━━━━━━━━")
     lines.append(f"🔹 Пар WS kline: <b>{kline_count}</b> · "
                  f"WS tickers: <b>{ticker_count}/{WS_TICKER_MAX}</b>")
@@ -1397,6 +1364,7 @@ def send_status():
 
     # ===== Позиции =====
     if opens:
+        lines.append("💰 <b>ОТКРЫТЫЕ ПОЗИЦИИ</b>")
         for s, p in opens:
             entry = float(p.get("entry_price", 0))
             cur = CURRENT_PRICE.get(s, entry)
@@ -1404,7 +1372,7 @@ def send_status():
             pnl_icon = "🟢" if pnl_live > 0 else "🔴"
             tag = "🎯" if p.get("strategy") == "confluence" else (
                   "🌊" if p.get("strategy") == "pullback" else "🚀")
-            be = " · 🔒BE" if p.get("partial_done") else ""
+            be = " · 🔒BE" if p.get("breakeven_moved") else ""
             lines.append(
                 f"{tag} {tv_link(s)} "
                 f"{entry:.6g} → {cur:.6g} · "
@@ -1462,19 +1430,15 @@ def send_status():
         lines.append("— нет боковиков")
     lines.append("</blockquote>")
 
-    # ===== Footer =====
     lines.append("")
     lines.append("━━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"🔄 Следующий статус через 2 ч")
-    lines.append(f"🛡 v22.3 HARD: BTC/ETH off · стейблы off · "
-                 f"medRSI&lt;38 блок")
-    lines.append(f"🎯 Score≥{MIN_SIGNAL_SCORE} · "
-                 f"RR≥{MIN_RR:.1f} · "
-                 f"1 вход/30мин · {MAX_TRADES_PER_HOUR}/час")
-    lines.append(f"🎯 Стратегии: Confluence · Pullback · Breakout")
-    lines.append(f"/status · /help · /start · /stop")
+    lines.append("🛡 v22.4 OBSERVE: size 100% · без partial · BE +0.5R")
+    lines.append("🎯 Confluence · Pullback · Breakout")
+    lines.append("🔧 BTC/ETH/stables off · Alt Breadth блок при medRSI<38")
+    lines.append("/status · /help · /start · /stop")
 
     send_telegram("\n".join(lines))
+
 
 # ==================== WEBSOCKET KLINE ====================
 def touch_ws_ts(kind):
@@ -1775,7 +1739,7 @@ def polling_loop():
                     if add_subscriber(int(cid)):
                         _post_telegram(cid,
                             "🟢 <b>Подписка оформлена</b>\n"
-                            "v22.3 HARD-SAFE запущен.\n"
+                            "v22.4 OBSERVE запущен.\n"
                             "/stop — отписаться, /help — справка.")
                     else:
                         _post_telegram(cid, "✅ Вы уже подписаны.")
@@ -1786,11 +1750,13 @@ def polling_loop():
                         _post_telegram(cid, "Вы и так не подписаны.")
                 elif text == "/help":
                     _post_telegram(cid,
-                        "📡 <b>Bybit Scanner v22.3 HARD-SAFE</b>\n"
+                        "📡 <b>Bybit Scanner v22.4 OBSERVE</b>\n"
                         "Стратегии: Confluence, Pullback, Breakout.\n"
-                        "BTC/ETH off, стейблы off.\n"
+                        "BTC/ETH/stables off.\n"
+                        "Alt Breadth: medRSI&lt;38 → блок.\n"
                         "Score≥6 · RR≥2.0 · 1 вход/30мин.\n"
-                        "Alt Breadth: medRSI<38 → блок.\n"
+                        "Size = 100% депо (наблюдение).\n"
+                        "Без partial TP, BE при +0.5R.\n"
                         "Команды: /start, /stop, /help, /status.")
                 elif text == "/status":
                     threading.Thread(target=send_status, daemon=True).start()
@@ -1839,7 +1805,7 @@ def main():
     load_state()
     load_cb()
     load_subscribers()
-    logger.info("Bybit Scanner v22.3 HARD-SAFE starting")
+    logger.info("Bybit Scanner v22.4 OBSERVE starting")
     pairs = get_universe()
     if not pairs:
         logger.critical("Не удалось получить вселенную пар")
@@ -1855,13 +1821,14 @@ def main():
     threading.Thread(target=watchdog_loop, daemon=True).start()
     threading.Thread(target=polling_loop, daemon=True).start()
     send_telegram(
-        "🟢 <b>Bybit Scanner v22.3 HARD-SAFE запущен</b>\n"
+        "🟢 <b>Bybit Scanner v22.4 OBSERVE запущен</b>\n"
         "WS kline 15m + WS tickers.\n"
         "Стратегии: Confluence / Pullback / Breakout.\n"
         "BTC/ETH/stables — off.\n"
-        "Score≥6 · RR≥2.0 · 1 вход/30мин · 4/час.\n"
-        "Alt Breadth: medRSI<38 → блок лонгов.\n"
-        "CB: 3 стопа или -2% → пауза 12ч."
+        "Size = 100% депо (режим наблюдения).\n"
+        "БЕЗ partial TP. BE при +0.5R.\n"
+        "Score≥6 · RR≥2.0 · 1 вход/30мин.\n"
+        "Alt Breadth: medRSI<38 → блок."
     )
     manage_loop()
 
