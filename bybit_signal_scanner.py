@@ -246,7 +246,7 @@ def esc(text):
 
 
 # ==================== TELEGRAM ====================
-def _post_telegram(chat_id, text):
+def _post_telegram(chat_id, text, reply_markup=None):
     if not TELEGRAM_BOT_TOKEN:
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -255,6 +255,8 @@ def _post_telegram(chat_id, text):
                    "disable_web_page_preview": True}
         if parse_mode:
             payload["parse_mode"] = parse_mode
+        if reply_markup:
+            payload["reply_markup"] = json.dumps(reply_markup)
         try:
             r = SESSION.post(url, data=payload, timeout=15)
             j = r.json()
@@ -282,7 +284,7 @@ def split_text(text, limit=TG_MSG_LIMIT):
     return chunks or [""]
 
 
-def send_telegram(text):
+def send_telegram(text, reply_markup=None):
     if not TELEGRAM_BOT_TOKEN:
         return
     with sub_lock:
@@ -291,7 +293,7 @@ def send_telegram(text):
         targets = [TELEGRAM_CHAT_ID]
     for chunk in split_text(text):
         for cid in targets:
-            _post_telegram(cid, chunk)
+            _post_telegram(cid, chunk, reply_markup=reply_markup)
 
 
 def load_subscribers():
@@ -1437,7 +1439,18 @@ def send_status():
     lines.append("🔧 BTC/ETH/stables off · Alt Breadth блок при medRSI<38")
     lines.append("/status · /help · /start · /stop")
 
-    send_telegram("\n".join(lines))
+        # v22.4.1: inline-кнопки для открытых позиций и топ-кандидатов
+    keyboard = []
+    for s, _ in opens[:5]:
+        url = f"https://www.tradingview.com/chart/?symbol=BYBIT:{s}"
+        keyboard.append([{"text": f"📦 {s}", "url": url}])
+    for c in cands[:5]:
+        s = c.get("symbol")
+        url = f"https://www.tradingview.com/chart/?symbol=BYBIT:{s}"
+        keyboard.append([{"text": f"📈 {s}", "url": url}])
+
+    reply_markup = {"inline_keyboard": keyboard} if keyboard else None
+    send_telegram("\n".join(lines), reply_markup=reply_markup)
 
 
 # ==================== WEBSOCKET KLINE ====================
