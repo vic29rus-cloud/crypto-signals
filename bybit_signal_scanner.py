@@ -245,16 +245,73 @@ def esc(text):
             .replace(">", "&gt;"))
 
 
+# v22.4.1: HTML-sanitize вне известных тегов
+import re as _re
+
+_TAG_RE = _re.compile(
+    r'<(/?)(a|b|i|u|s|code|pre|blockquote|em|strong|tg-spoiler)(\s[^<>]*)?>',
+    _re.IGNORECASE,
+)
+
+
+def _escape_non_tags(text):
+    """Эскейпит & < > только вне разрешённых Telegram-тегов."""
+    if not text:
+        return text
+    text = text.replace("&lt;", "\x00LT\x00")
+    text = text.replace("&gt;", "\x00GT\x00")
+    text = text.replace("&amp;", "\x00AMP\x00")
+
+    out = []
+    pos = 0
+    for m in _TAG_RE.finditer(text):
+        chunk = text[pos:m.start()]
+        chunk = (chunk.replace("&", "&amp;")
+                      .replace("<", "&lt;")
+                      .replace(">", "&gt;"))
+        out.append(chunk)
+        out.append(m.group(0))
+        pos = m.end()
+    tail = text[pos:]
+    tail = (tail.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;"))
+    out.append(tail)
+    result = "".join(out)
+
+    result = result.replace("\x00LT\x00", "&lt;")
+    result = result.replace("\x00GT\x00", "&gt;")
+    result = result.replace("\x00AMP\x00", "&amp;")
+    return result
+
+
+def _strip_tags(text):
+    if not text:
+        return text
+    return _re.sub(r'<[^>]+>', '', text)
+
+
 # ==================== TELEGRAM ====================
 def _post_telegram(chat_id, text, reply_markup=None):
     if not TELEGRAM_BOT_TOKEN:
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    for parse_mode in ("HTML", None):
-        payload = {"chat_id": chat_id, "text": text,
-                   "disable_web_page_preview": True}
-        if parse_mode:
-            payload["parse_mode"] = parse_mode
+
+    # v22.4.1: HTML с escape вне тегов, при ошибке — plain со strip
+    for mode in ("HTML", "PLAIN"):
+        if mode == "HTML":
+            payload = {
+                "chat_id": chat_id,
+                "text": _escape_non_tags(text),
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+        else:
+            payload = {
+                "chat_id": chat_id,
+                "text": _strip_tags(text),
+                "disable_web_page_preview": True,
+            }
         if reply_markup:
             payload["reply_markup"] = json.dumps(reply_markup)
         try:
@@ -262,8 +319,11 @@ def _post_telegram(chat_id, text, reply_markup=None):
             j = r.json()
             if j.get("ok"):
                 return True
-            desc = str(j.get("description", "")).lower()
-            if any(k in desc for k in ("blocked", "chat not found",
+            desc = str(j.get("description", ""))
+            logger.error("Telegram отклонил (mode=%s, chat=%s): %s",
+                         mode, chat_id, desc)
+            low = desc.lower()
+            if any(k in low for k in ("blocked", "chat not found",
                                        "deactivated", "kicked")):
                 remove_subscriber(int(chat_id))
                 return False
@@ -1440,17 +1500,7 @@ def send_status():
     lines.append("/status · /help · /start · /stop")
 
         # v22.4.1: inline-кнопки для открытых позиций и топ-кандидатов
-    keyboard = []
-    for s, _ in opens[:5]:
-        url = f"https://www.tradingview.com/chart/?symbol=BYBIT:{s}"
-        keyboard.append([{"text": f"📦 {s}", "url": url}])
-    for c in cands[:5]:
-        s = c.get("symbol")
-        url = f"https://www.tradingview.com/chart/?symbol=BYBIT:{s}"
-        keyboard.append([{"text": f"📈 {s}", "url": url}])
-
-    reply_markup = {"inline_keyboard": keyboard} if keyboard else None
-    send_telegram("\n".join(lines), reply_markup=reply_markup)
+        send_telegram("\n".join(lines))
 
 
 # ==================== WEBSOCKET KLINE ====================
