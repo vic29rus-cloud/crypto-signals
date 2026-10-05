@@ -1424,7 +1424,6 @@ def send_status():
         f"RR≥{MIN_RR:.1f}")
     lines.append("━━━━━━━━━━━━━━━━━━━━━")
 
-    # ===== Позиции =====
     if opens:
         lines.append("💰 <b>ОТКРЫТЫЕ ПОЗИЦИИ</b>")
         for s, p in opens:
@@ -1444,7 +1443,6 @@ def send_status():
     else:
         lines.append("💰 Позиций нет")
 
-    # ===== Топ кандидатов =====
     lines.append("")
     lines.append("🔵🔵🔵 <b>ТОП КАНДИДАТОВ</b> 🔵🔵🔵")
     lines.append("<blockquote expandable>")
@@ -1466,7 +1464,6 @@ def send_status():
         lines.append("— нет кандидатов")
     lines.append("</blockquote>")
 
-    # ===== Боковики =====
     lines.append("")
     lines.append("🟡🟡🟡 <b>МОНЕТЫ В БОКОВИКЕ (20 ДНЕЙ)</b> 🟡🟡🟡")
     lines.append("<blockquote expandable>")
@@ -1499,10 +1496,7 @@ def send_status():
     lines.append("🔧 BTC/ETH/stables off · Alt Breadth блок при medRSI<38")
     lines.append("/status · /help · /start · /stop")
 
-        # v22.4.1: inline-кнопки для открытых позиций и топ-кандидатов
-        send_telegram("\n".join(lines))
-
-
+    send_telegram("\n".join(lines))
 # ==================== WEBSOCKET KLINE ====================
 def touch_ws_ts(kind):
     global LAST_WS_KLINE_TS, LAST_WS_TICKER_TS
