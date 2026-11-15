@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BYBIT SCANNER v22.5 AMD + SWEEP + CVD (OBSERVE)
+BYBIT SCANNER v22.5 AMD + SWEEP + CVD (OBSERVE) — FIXED
 
-Что нового относительно v22.4:
-- AMD-модель: Accumulation (сжатие) → Manipulation (Sweep) → Distribution
-- Liquidity Sweep: вход ТОЛЬКО после снятия ликвидности (прокол + возврат)
-- Order Flow (аппроксимация): CVD по OHLCV (деление объёма по телу свечи)
-- Стоп за хвост Sweep (широкий, логичный), а не +0.1% BE
-- Убран старый Pullback (он входил в манипуляцию, а не после неё)
-
-Режим наблюдения:
-- size = 1.0 всегда
-- НЕТ partial TP
-- BE при +1.5R (а не +0.5R), стоп на +0.3R
+Исправления относительно исходного v22.5:
+- Добавлена detect_consolidation() (была потеряна → scan_cycle падал)
+- Заполняется LAST_ANALYSIS (Breadth больше не "n/a (0)" вечно)
+- Ошибки скана логируются на WARNING (первые 5)
+- BE: +1.5R и +0.3R теперь считаются от risk = entry - initial_stop
+- Кэш дневных свечей (detect_consolidation + get_trend)
+- Миграция старых позиций в load_state (добавляется risk)
 """
 
 import os
+import re as _re
 import json
 import time
 import logging
@@ -71,19 +68,17 @@ MAX_TRADES_PER_30MIN = 1
 
 ENTRY_COOLDOWN_SECONDS = 3600
 PAIR_LOSS_COOLDOWN_SECONDS = 86400
-BE_EXIT_COOLDOWN_SECONDS = 4 * 3600  # v22.5: кулдаун после BE-выхода
+BE_EXIT_COOLDOWN_SECONDS = 4 * 3600
 
 MIN_SIGNAL_SCORE = 6
 MIN_STOP_DISTANCE_PCT = 1.0
 MIN_RR = 2.0
 
-# v22.5: стоп за хвост Sweep + ATR-буфер
 SWEEP_STOP_BUFFER_ATR = 0.5
 ATR_MULT_TP = 8.0
 
 TIME_STOP_HOURS = 72
 
-# v22.5: BE при +1.5R, стоп на +0.3R (а не +0.1%)
 NO_PARTIAL_TP = True
 BREAKEVEN_AT_R = 1.5
 BE_OFFSET_R = 0.3
@@ -104,21 +99,21 @@ BTC_DROP_6H_PCT = -3.5
 BTC_ADX_BLOCK = 50
 
 
-# ==================== ALT BREADTH (с гистерезисом) ====================
+# ==================== ALT BREADTH ====================
 ALT_BREADTH_ENABLED = True
 ALT_BREADTH_MEDIAN_RSI_BLOCK = 38.0
-ALT_BREADTH_MEDIAN_RSI_UNBLOCK = 42.0  # v22.5: гистерезис
+ALT_BREADTH_MEDIAN_RSI_UNBLOCK = 42.0
 ALT_BREADTH_LOW_PCT = 60.0
 ALT_BREADTH_MIN_SAMPLES = 20
 
 
-# ==================== AMD / SWEEP (v22.5) ====================
+# ==================== AMD / SWEEP ====================
 AMD_ENABLED = True
-AMD_ACCUM_LOOKBACK = 20          # свечей для поиска сжатия
-AMD_ACCUM_RANGE_ATR_MULT = 3.0   # диапазон < 3*ATR = накопление
-AMD_SWEEP_PENETRATION_ATR = 0.3  # прокол минимум на 0.3*ATR
-AMD_SWEEP_RECLAIM_BARS = 3       # возврат в течение 3 свечей
-AMD_SWEEP_LOOKBACK = 10          # искать sweep в последних 10 свечах
+AMD_ACCUM_LOOKBACK = 20
+AMD_ACCUM_RANGE_ATR_MULT = 3.0
+AMD_SWEEP_PENETRATION_ATR = 0.3
+AMD_SWEEP_RECLAIM_BARS = 3
+AMD_SWEEP_LOOKBACK = 10
 
 CVD_ENABLED = True
 CVD_LOOKBACK = 20
@@ -139,7 +134,6 @@ STATUS_ADX_MIN, STATUS_ADX_MAX = 18, 55
 TG_MSG_LIMIT = 3900
 
 
-# ==================== СТЕЙБЛ-ФИЛЬТР ====================
 STABLE_BASES = {
     "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "TRY", "BRL", "MXN",
     "INR", "SGD", "HKD", "ZAR", "NZD", "NOK", "SEK",
@@ -151,7 +145,8 @@ STABLE_BASES = {
     "XAUT", "PAXG",
     "BTC", "ETH",
 }
-# ==================== ЛОГИ ====================
+
+
 logger = logging.getLogger("bybit-scanner-v225")
 
 
@@ -212,6 +207,10 @@ analysis_lock = threading.RLock()
 TREND_CACHE = {}
 trend_lock = threading.RLock()
 
+DAILY_CACHE = {}
+daily_cache_lock = threading.RLock()
+DAILY_CACHE_TTL = 1800
+
 BTC_CACHE = {"ts": 0.0, "ok": True, "reason": "init"}
 btc_lock = threading.RLock()
 
@@ -233,7 +232,7 @@ ws_ts_lock = threading.RLock()
 STOP_EVENT = threading.Event()
 
 
-# ==================== HTML-HELPERS ====================
+# ==================== HTML ====================
 def tv_link(symbol):
     url = f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol}"
     return f'<a href="{url}">📈 {symbol}</a>'
@@ -245,8 +244,6 @@ def esc(text):
             .replace("<", "&lt;")
             .replace(">", "&gt;"))
 
-
-import re as _re
 
 _TAG_RE = _re.compile(
     r'<(/?)(a|b|i|u|s|code|pre|blockquote|em|strong|tg-spoiler)(\s[^<>]*)?>',
@@ -397,7 +394,9 @@ def remove_subscriber(chat_id):
         subscribers.discard(int(chat_id))
     save_subscribers()
     return True
-    # ==================== REST BYBIT ====================
+
+
+# ==================== REST BYBIT ====================
 def api_get(path, params, timeout=15, retries=3):
     url = "https://api.bybit.com" + path
     for attempt in range(retries):
@@ -441,6 +440,18 @@ def fetch_klines(symbol, interval, limit=200):
     if not out:
         return None
     return pd.DataFrame(out)
+
+
+def get_daily_cached(symbol, ttl=DAILY_CACHE_TTL):
+    now = time.time()
+    with daily_cache_lock:
+        item = DAILY_CACHE.get(symbol)
+        if item and now - item["ts"] < ttl:
+            return item["df"]
+    df = fetch_klines(symbol, "D", 120)
+    with daily_cache_lock:
+        DAILY_CACHE[symbol] = {"ts": now, "df": df}
+    return df
 
 
 def get_price(symbol):
@@ -585,11 +596,6 @@ def confirmed_df(symbol):
 
 # ==================== AMD: ACCUMULATION ====================
 def detect_accumulation(df):
-    """
-    Ищем сжатие (Accumulation) по последним AMD_ACCUM_LOOKBACK свечам.
-    Диапазон = (high.max() - low.min()) / close.
-    Если диапазон < AMD_ACCUM_RANGE_ATR_MULT * ATR, считаем накоплением.
-    """
     if df is None or len(df) < AMD_ACCUM_LOOKBACK + 5:
         return None
     window = df.tail(AMD_ACCUM_LOOKBACK)
@@ -613,21 +619,15 @@ def detect_accumulation(df):
     }
 
 
-# ==================== AMD: LIQUIDITY SWEEP ====================
+# ==================== AMD: SWEEP ====================
 def detect_sweep(df, accum):
-    """
-    Ищем Sweep (Manipulation) в последних AMD_SWEEP_LOOKBACK свечах.
-    Условие для лонга (снятие ликвидности снизу):
-      - low < accum.lower - AMD_SWEEP_PENETRATION_ATR * ATR
-      - close > accum.lower (возврат внутрь диапазона)
-    """
     if df is None or accum is None or len(df) < AMD_SWEEP_LOOKBACK + 2:
         return None
     atr_val = float(atr(df).iloc[-1])
     if pd.isna(atr_val) or atr_val <= 0:
         return None
     pen = AMD_SWEEP_PENETRATION_ATR * atr_val
-    recent = df.tail(AMD_SWEEP_LOOKBACK + 1).iloc[:-1]  # без текущей
+    recent = df.tail(AMD_SWEEP_LOOKBACK + 1).iloc[:-1]
     for i in range(len(recent) - 1, -1, -1):
         row = recent.iloc[i]
         if row["low"] < accum["lower"] - pen and row["close"] > accum["lower"]:
@@ -641,14 +641,8 @@ def detect_sweep(df, accum):
     return None
 
 
-# ==================== ORDER FLOW: CVD АППРОКСИМАЦИЯ ====================
+# ==================== CVD ====================
 def approx_cvd(df, lookback=CVD_LOOKBACK):
-    """
-    Аппроксимация CVD по OHLCV.
-    Если close > open: объём * (close - open) / (high - low) идёт в "покупки".
-    Если close < open: в "продажи".
-    CVD = cumsum(buy_vol - sell_vol) за lookback.
-    """
     if df is None or len(df) < lookback + 2:
         return 0.0
     d = df.tail(lookback).copy()
@@ -659,6 +653,47 @@ def approx_cvd(df, lookback=CVD_LOOKBACK):
     return float(delta.sum())
 
 
+# ==================== CONSOLIDATION (НОВАЯ) ====================
+def detect_consolidation(symbol):
+    """
+    20-дневный боковик на дневных свечах.
+    Возвращает upper/lower/range_pct/adx, либо None.
+    """
+    df = get_daily_cached(symbol)
+    if df is None or len(df) < CONSOL_DAYS + 15:
+        return None
+    if len(df) > 1:
+        df = df.iloc[:-1]
+    if len(df) < CONSOL_DAYS:
+        return None
+    window = df.tail(CONSOL_DAYS)
+    upper = float(window["high"].max())
+    lower = float(window["low"].min())
+    close = float(window["close"].iloc[-1])
+    if close <= 0 or upper <= lower:
+        return None
+    range_pct = (upper - lower) / lower * 100.0
+    if range_pct > CONSOL_MAX_RANGE_PCT:
+        return None
+    if range_pct < CONSOL_MIN_RANGE_PCT:
+        return None
+    adx_val = 0.0
+    try:
+        adx_series = adx(df)
+        v = adx_series.iloc[-1]
+        if v == v:
+            adx_val = float(v)
+    except Exception:
+        adx_val = 0.0
+    return {
+        "upper": upper,
+        "lower": lower,
+        "days": CONSOL_DAYS,
+        "range_pct": range_pct,
+        "adx": adx_val,
+    }
+
+
 # ==================== ТРЕНД / BTC / BREADTH ====================
 def get_trend(symbol, force=False):
     now = time.time()
@@ -667,9 +702,9 @@ def get_trend(symbol, force=False):
         if not force and item and now - item.get("ts", 0) < 1800:
             return item
     df4 = fetch_klines(symbol, "240", 120)
-    dfd = fetch_klines(symbol, "D", 120)
+    dfd = get_daily_cached(symbol)
     a4 = analyze_frame(df4, drop_last=True)
-    ad = analyze_frame(dfd, drop_last=True)
+    ad = analyze_frame(dfd, drop_last=True) if dfd is not None else None
     score = 0
     if a4 and a4["ema9"] > a4["ema21"]:
         score += 1
@@ -757,7 +792,9 @@ def alt_breadth_allows_longs():
         BREADTH_CACHE["reason"] = reason
         BREADTH_CACHE["blocked"] = not ok
     return ok, reason
-    # ==================== СОСТОЯНИЕ ====================
+
+
+# ==================== STATE ====================
 def save_state():
     try:
         with state_lock:
@@ -784,16 +821,27 @@ def load_state():
     now = time.time()
     with state_lock:
         for sym, pos in list(state.items()):
-            if pos.get("position") == "open":
-                if float(pos.get("atr_ref", 0)) <= 0:
-                    entry = float(pos.get("entry_price", 0))
-                    stop = float(pos.get("stop", 0))
-                    if entry > 0 and stop > 0 and entry > stop:
-                        pos["atr_ref"] = (entry - stop) / SWEEP_STOP_BUFFER_ATR
-                    else:
-                        pos["position"] = "closed"
-                        pos["last_exit_ts"] = now
-                        pos["last_exit_reason"] = "invalid_state"
+            if pos.get("position") != "open":
+                continue
+            entry = float(pos.get("entry_price", 0))
+            stop = float(pos.get("stop", 0))
+            if float(pos.get("atr_ref", 0)) <= 0:
+                if entry > 0 and stop > 0 and entry > stop:
+                    pos["atr_ref"] = (entry - stop) / SWEEP_STOP_BUFFER_ATR
+                else:
+                    pos["position"] = "closed"
+                    pos["last_exit_ts"] = now
+                    pos["last_exit_reason"] = "invalid_state"
+                    state[sym] = pos
+                    continue
+            if "risk" not in pos or float(pos.get("risk", 0)) <= 0:
+                if entry > stop > 0:
+                    pos["risk"] = entry - stop
+                else:
+                    pos["risk"] = float(pos.get("atr_ref", 0)) * SWEEP_STOP_BUFFER_ATR
+            if "initial_stop" not in pos and stop > 0:
+                pos["initial_stop"] = stop
+            state[sym] = pos
 
 
 def save_cb():
@@ -878,13 +926,9 @@ def can_enter(symbol):
     return True
 
 
-# ==================== СИГНАЛЫ (v22.5 SWEEP) ====================
+# ==================== СИГНАЛ ====================
 def make_sweep_signal(symbol, entry, sweep_low, atr_value, score, parts,
                       accum=None, cvd_val=None):
-    """
-    Стоп = sweep_low - SWEEP_STOP_BUFFER_ATR * ATR.
-    TP = entry + (entry - stop) * (ATR_MULT_TP / SWEEP_STOP_BUFFER_ATR)
-    """
     if entry <= 0 or atr_value <= 0 or sweep_low <= 0:
         return None
     stop = sweep_low - SWEEP_STOP_BUFFER_ATR * atr_value
@@ -902,6 +946,7 @@ def make_sweep_signal(symbol, entry, sweep_low, atr_value, score, parts,
         "symbol": symbol, "strategy": "sweep",
         "entry": float(entry), "stop": float(stop),
         "target": float(target), "atr": float(atr_value),
+        "risk": float(risk),
         "sweep_low": float(sweep_low),
         "score": int(score), "parts": list(parts),
         "risk_pct": float(risk_pct),
@@ -940,7 +985,7 @@ def expire_armed():
                 ARMED.pop(sym, None)
 
 
-# ==================== ОТКРЫТИЕ ПОЗИЦИИ ====================
+# ==================== ОТКРЫТИЕ ====================
 def open_position(sig):
     symbol = sig["symbol"]
     if not can_enter(symbol):
@@ -952,8 +997,10 @@ def open_position(sig):
             "strategy": sig["strategy"],
             "entry_price": sig["entry"],
             "stop": sig["stop"],
+            "initial_stop": sig["stop"],
             "target": sig["target"],
             "atr_ref": sig["atr"],
+            "risk": sig["risk"],
             "sweep_low": sig.get("sweep_low", 0),
             "score": sig["score"],
             "risk_pct": sig["risk_pct"],
@@ -984,7 +1031,8 @@ def open_position(sig):
         f"Цена: {sig['entry']:.8f}\n"
         f"SL: {sig['stop']:.8f} ({sl_pct:+.2f}%)\n"
         f"TP: {sig['target']:.8f} ({tp_pct:+.2f}%)\n"
-        f"Score: {sig['score']} · RR: {sig['rr']:.2f}\n"
+        f"Risk: {sig['risk_pct']:.2f}% · RR: {sig['rr']:.2f}\n"
+        f"Score: {sig['score']}\n"
         f"<i>{parts_txt}</i>"
     )
     logger.info("OPEN %s %s entry=%.8f sl=%.8f tp=%.8f score=%s",
@@ -1057,6 +1105,7 @@ def close_position(symbol, price, reason, force_close=True):
         entry = float(pos.get("entry_price", 0.0))
         if reason in ("BE/Trailing Stop", "СТОП В БЕЗУБЫТОК") and pnl_pct < 0.5:
             pos["last_be_exit_ts"] = time.time()
+        pos.pop("closing_lock_ts", None)
         state[symbol] = pos
         save_state()
     icon = "🟢" if pnl_pct > 0 else "🔴"
@@ -1068,7 +1117,9 @@ def close_position(symbol, price, reason, force_close=True):
     )
     logger.info("CLOSE %s %s price=%.8f pnl=%.2f%%",
                 symbol, reason, float(price), pnl_pct)
-    # ==================== ПРОВЕРКА ЦЕНЫ ====================
+
+
+# ==================== ПРОВЕРКА ЦЕНЫ ====================
 def check_position_price(symbol, price):
     if not price or price <= 0:
         return
@@ -1078,11 +1129,14 @@ def check_position_price(symbol, price):
             return
         entry = float(pos.get("entry_price", 0.0))
         atr_ref = float(pos.get("atr_ref", 0.0))
+        risk = float(pos.get("risk", 0.0))
+        if risk <= 0:
+            risk = atr_ref * SWEEP_STOP_BUFFER_ATR
         stop = float(pos.get("stop", 0.0))
         target = float(pos.get("target", 0.0))
         be_moved = bool(pos.get("breakeven_moved", False))
         highest = max(float(pos.get("highest", entry)), float(price))
-        if entry <= 0 or atr_ref <= 0:
+        if entry <= 0 or atr_ref <= 0 or risk <= 0:
             return
         pos["highest"] = highest
         state[symbol] = pos
@@ -1096,15 +1150,15 @@ def check_position_price(symbol, price):
         close_position(symbol, target, "Take-Profit", force_close=True)
         return
 
-    # v22.5: BE при +1.5R, стоп на +0.3R
+    # BE: +1.5R → стоп на +0.3R
     if (not be_moved
-            and price >= entry + BREAKEVEN_AT_R * atr_ref):
+            and price >= entry + BREAKEVEN_AT_R * risk):
         with state_lock:
             pos = state.get(symbol)
             if not pos or pos.get("breakeven_moved"):
                 return
             old_stop = float(pos.get("stop", 0))
-            new_stop = max(old_stop, entry + BE_OFFSET_R * atr_ref)
+            new_stop = max(old_stop, entry + BE_OFFSET_R * risk)
             if new_stop > old_stop:
                 pos["stop"] = new_stop
                 pos["breakeven_moved"] = True
@@ -1125,7 +1179,7 @@ def check_position_price(symbol, price):
 
     if be_moved:
         new_stop = highest - TRAILING_STEP_ATR * atr_ref
-        floor = entry + BE_OFFSET_R * atr_ref
+        floor = entry + BE_OFFSET_R * risk
         with state_lock:
             pos = state.get(symbol)
             if pos and pos.get("position") == "open":
@@ -1160,18 +1214,13 @@ def check_armed_price(symbol, price):
         open_position(new_sig)
 
 
-# ==================== СТРАТЕГИЯ: SWEEP (v22.5) ====================
-def evaluate_sweep_signal(symbol, df, trend, accum, sweep):
-    """
-    Вход ТОЛЬКО после Sweep.
-    Проверяем: тренд, RSI, ADX, объём, CVD.
-    """
-    if not sweep or not accum:
+# ==================== СТРАТЕГИЯ SWEEP ====================
+def evaluate_sweep_signal(symbol, df, a, trend, accum, sweep):
+    if not sweep or not accum or not a:
         return None
     if trend["score"] < 2:
         return None
-    a = analyze_frame(df, drop_last=False)
-    if not a or a["atr"] <= 0:
+    if a["atr"] <= 0:
         return None
     entry = float(df["close"].iloc[-1])
     if entry <= 0:
@@ -1183,7 +1232,6 @@ def evaluate_sweep_signal(symbol, df, trend, accum, sweep):
     if a["vol_ratio"] < MIN_VOL_MULT:
         return None
 
-    # CVD: если sweep был вниз, CVD должен быть > 0 (покупатели агрессивны)
     cvd_val = approx_cvd(df, CVD_LOOKBACK)
     if CVD_ENABLED and sweep["side"] == "low" and cvd_val <= 0:
         return None
@@ -1196,15 +1244,12 @@ def evaluate_sweep_signal(symbol, df, trend, accum, sweep):
     if a["ema9"] > a["ema21"]:
         score += 1
         parts.append("EMA9>21 +1")
-    if RSI_MIN <= a["rsi"] <= RSI_MAX:
-        score += 1
-        parts.append(f"RSI {a['rsi']:.0f} +1")
-    if ADX_MIN <= trend["adx_4h"] <= ADX_MAX:
-        score += 1
-        parts.append(f"ADX4h {trend['adx_4h']:.0f} +1")
-    if a["vol_ratio"] >= MIN_VOL_MULT:
-        score += 1
-        parts.append(f"Vol {a['vol_ratio']:.1f}x +1")
+    score += 1
+    parts.append(f"RSI {a['rsi']:.0f} +1")
+    score += 1
+    parts.append(f"ADX4h {trend['adx_4h']:.0f} +1")
+    score += 1
+    parts.append(f"Vol {a['vol_ratio']:.1f}x +1")
     score += 2
     parts.append(f"Sweep (low={sweep['sweep_low']:.6g}) +2")
     if cvd_val > 0:
@@ -1228,6 +1273,7 @@ def scan_cycle():
         pairs = list(PAIRS)
     candidates = []
     consolidations = []
+    scan_errors = 0
     logger.info("Scan started: pairs=%d btc=%s breadth=%s",
                 len(pairs), btc_reason, breadth_reason)
 
@@ -1235,15 +1281,25 @@ def scan_cycle():
         try:
             df15 = fetch_klines(symbol, "15", 180)
             a15 = analyze_frame(df15, drop_last=True)
+
+            if a15:
+                with analysis_lock:
+                    LAST_ANALYSIS[symbol] = {
+                        "analysis": a15,
+                        "ts": time.time(),
+                    }
+
             trend = get_trend(symbol)
             cons = detect_consolidation(symbol)
             cons_upper = None
+
             if cons:
                 cons_upper = cons["upper"]
                 with cons_lock:
                     CONS_LEVEL[symbol] = cons_upper
                 try:
-                    cur_price = CURRENT_PRICE.get(symbol) or (a15["close"] if a15 else 0)
+                    cur_price = (CURRENT_PRICE.get(symbol)
+                                 or (a15["close"] if a15 else 0))
                     dist_pct = ((cons_upper - cur_price) / cur_price * 100.0
                                 if cur_price > 0 else 999)
                 except Exception:
@@ -1259,29 +1315,39 @@ def scan_cycle():
                     "dist_pct": dist_pct,
                 })
 
-            # v22.5: AMD + Sweep
+            # AMD + Sweep
             if df15 is not None and len(df15) >= 40:
                 accum = detect_accumulation(df15)
                 sweep = detect_sweep(df15, accum) if accum else None
                 if accum and sweep and a15:
-                    sig = evaluate_sweep_signal(symbol, df15, trend, accum, sweep)
-                    if sig and btc_ok and breadth_ok:
-                        arm_signal(symbol, sig)
-                    candidates.append({
-                        "symbol": symbol,
-                        "price": a15["close"],
-                        "score": sig["score"] if sig else 0,
-                        "trend": trend["score"],
-                        "rsi": a15["rsi"],
-                        "adx_4h": trend["adx_4h"],
-                        "vol": a15["vol_ratio"],
-                        "atr": a15["atr"],
-                        "strategy": sig["strategy"] if sig else "watch",
-                        "armed": symbol in ARMED,
-                    })
+                    a_now = analyze_frame(df15, drop_last=False)
+                    if a_now:
+                        sig = evaluate_sweep_signal(
+                            symbol, df15, a_now, trend, accum, sweep)
+                        if sig and btc_ok and breadth_ok:
+                            arm_signal(symbol, sig)
+                        candidates.append({
+                            "symbol": symbol,
+                            "price": a15["close"],
+                            "score": sig["score"] if sig else 0,
+                            "trend": trend["score"],
+                            "rsi": a15["rsi"],
+                            "adx_4h": trend["adx_4h"],
+                            "vol": a15["vol_ratio"],
+                            "atr": a15["atr"],
+                            "strategy": sig["strategy"] if sig else "watch",
+                            "armed": symbol in ARMED,
+                        })
             time.sleep(0.12)
         except Exception as e:
-            logger.debug("scan %s error: %s", symbol, e)
+            scan_errors += 1
+            if scan_errors <= 5:
+                logger.warning("scan %s error: %s", symbol, e)
+            else:
+                logger.debug("scan %s error: %s", symbol, e)
+
+    if scan_errors:
+        logger.warning("Scan errors total: %d/%d", scan_errors, len(pairs))
 
     candidates.sort(key=lambda x: (-x.get("score", 0), x.get("rsi", 100)))
     consolidations.sort(key=lambda x: x.get("dist_pct", 999))
@@ -1403,7 +1469,9 @@ def send_status():
     lines.append("/status · /help · /start · /stop")
 
     send_telegram("\n".join(lines))
-    # ==================== WEBSOCKET KLINE ====================
+
+
+# ==================== WEBSOCKET KLINE ====================
 def touch_ws_ts(kind):
     global LAST_WS_KLINE_TS, LAST_WS_TICKER_TS
     now = time.time()
@@ -1484,6 +1552,12 @@ def on_kline_message(ws, message):
                 process_ws_closed(symbol)
     except Exception as e:
         logger.debug("WS kline message error: %s", e)
+
+
+def process_ws_closed(symbol):
+    """Хук на закрытие свечи. По умолчанию ничего не делает —
+    вся логика входа выполняется в scan_cycle и check_*_price."""
+    return
 
 
 def on_kline_error(ws, error):
@@ -1752,6 +1826,18 @@ def manage_loop():
         except Exception as e:
             logger.exception("Manage loop error: %s", e)
         time.sleep(MANAGE_SLEEP_SECONDS)
+
+
+def periodic_exit_checks():
+    """Проверка выходов по текущей цене для позиций без WS-ticker."""
+    with state_lock:
+        opens = [(s, dict(p)) for s, p in state.items()
+                 if p.get("position") == "open"]
+    for sym, _pos in opens:
+        with price_lock:
+            price = CURRENT_PRICE.get(sym)
+        if price:
+            check_position_price(sym, price)
 
 
 def handle_stop(signum, frame):
