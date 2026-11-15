@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BYBIT SCANNER v22.5 AMD + SWEEP + CVD (OBSERVE) — FIXED
+BYBIT SCANNER v22.5 AMD + SWEEP + CVD (OBSERVE) — FIXED#2
 
-Исправления относительно исходного v22.5:
-- Добавлена detect_consolidation() (была потеряна → scan_cycle падал)
-- Заполняется LAST_ANALYSIS (Breadth больше не "n/a (0)" вечно)
-- Ошибки скана логируются на WARNING (первые 5)
-- BE: +1.5R и +0.3R теперь считаются от risk = entry - initial_stop
-- Кэш дневных свечей (detect_consolidation + get_trend)
-- Миграция старых позиций в load_state (добавляется risk)
+Что нового в этой ревизии:
+- Breadth вычисляется ПОСЛЕ заполнения LAST_ANALYSIS в scan_cycle
+  (было: n/a (0) навсегда и использование устаревшего breadth при арме)
+- Сигналы армируются только после проверки свежего breadth
+- BREADTH_CACHE сбрасывается в конце скана → /status показывает реальные цифры
+- Флаг "armed" в списке кандидатов выставляется по факту после арма
+
+Предыдущие фиксы (сохранены):
+- detect_consolidation() добавлена
+- LAST_ANALYSIS заполняется в scan_cycle
+- Ошибки скана на WARNING (первые 5)
+- BE: +1.5R и +0.3R считаются от risk = entry - initial_stop
+- Кэш дневных свечей
+- Миграция старых позиций в load_state
 """
 
 import os
@@ -47,6 +54,11 @@ WS_URL = "wss://stream.bybit.com/v5/public/spot"
 
 # ==================== СКАН / WS ====================
 TOP_N = 150
+# Если пар в статусе < 50 — ослабьте фильтры ниже.
+# На спокойном рынке 35 пар — это нормально для 3M/0.0001.
+# Для расширения охвата попробуйте:
+#   MIN_TURNOVER_USDT = 1_000_000
+#   MIN_PRICE = 0.00001
 MIN_TURNOVER_USDT = 3_000_000
 MIN_PRICE = 0.0001
 
@@ -61,7 +73,7 @@ WS_SUBSCRIBE_PAUSE = 0.15
 WS_SILENCE_TIMEOUT = 150
 
 
-# ==================== РИСК (v22.5) ====================
+# ==================== РИСК ====================
 MAX_OPEN_POSITIONS = 5
 MAX_TRADES_PER_HOUR = 4
 MAX_TRADES_PER_30MIN = 1
@@ -653,12 +665,8 @@ def approx_cvd(df, lookback=CVD_LOOKBACK):
     return float(delta.sum())
 
 
-# ==================== CONSOLIDATION (НОВАЯ) ====================
+# ==================== CONSOLIDATION ====================
 def detect_consolidation(symbol):
-    """
-    20-дневный боковик на дневных свечах.
-    Возвращает upper/lower/range_pct/adx, либо None.
-    """
     df = get_daily_cached(symbol)
     if df is None or len(df) < CONSOL_DAYS + 15:
         return None
@@ -1150,7 +1158,6 @@ def check_position_price(symbol, price):
         close_position(symbol, target, "Take-Profit", force_close=True)
         return
 
-    # BE: +1.5R → стоп на +0.3R
     if (not be_moved
             and price >= entry + BREAKEVEN_AT_R * risk):
         with state_lock:
@@ -1268,14 +1275,13 @@ def evaluate_sweep_signal(symbol, df, a, trend, accum, sweep):
 def scan_cycle():
     global CANDIDATES, CONSOLIDATIONS, LAST_SCAN_TS
     btc_ok, btc_reason = btc_allows_longs()
-    breadth_ok, breadth_reason = alt_breadth_allows_longs()
     with pairs_lock:
         pairs = list(PAIRS)
     candidates = []
     consolidations = []
+    potential_signals = []
     scan_errors = 0
-    logger.info("Scan started: pairs=%d btc=%s breadth=%s",
-                len(pairs), btc_reason, breadth_reason)
+    logger.info("Scan started: pairs=%d btc=%s", len(pairs), btc_reason)
 
     for symbol in pairs:
         try:
@@ -1315,7 +1321,6 @@ def scan_cycle():
                     "dist_pct": dist_pct,
                 })
 
-            # AMD + Sweep
             if df15 is not None and len(df15) >= 40:
                 accum = detect_accumulation(df15)
                 sweep = detect_sweep(df15, accum) if accum else None
@@ -1324,8 +1329,8 @@ def scan_cycle():
                     if a_now:
                         sig = evaluate_sweep_signal(
                             symbol, df15, a_now, trend, accum, sweep)
-                        if sig and btc_ok and breadth_ok:
-                            arm_signal(symbol, sig)
+                        if sig:
+                            potential_signals.append((symbol, sig))
                         candidates.append({
                             "symbol": symbol,
                             "price": a15["close"],
@@ -1336,7 +1341,7 @@ def scan_cycle():
                             "vol": a15["vol_ratio"],
                             "atr": a15["atr"],
                             "strategy": sig["strategy"] if sig else "watch",
-                            "armed": symbol in ARMED,
+                            "armed": False,  # обновим ниже по факту
                         })
             time.sleep(0.12)
         except Exception as e:
@@ -1349,15 +1354,36 @@ def scan_cycle():
     if scan_errors:
         logger.warning("Scan errors total: %d/%d", scan_errors, len(pairs))
 
+    # Сбрасываем кэш breadth, чтобы пересчитать по свежему LAST_ANALYSIS
+    with breadth_lock:
+        BREADTH_CACHE["ts"] = 0.0
+    breadth_ok, breadth_reason = alt_breadth_allows_longs()
+
+    # Армируем только то, что проходит и btc, и свежий breadth
+    armed_count = 0
+    if btc_ok and breadth_ok and potential_signals:
+        for sym, sig in potential_signals:
+            arm_signal(sym, sig)
+            armed_count += 1
+
+    # Обновляем флаг armed в candidates по факту
+    with armed_lock:
+        armed_now = set(ARMED.keys())
+    for c in candidates:
+        c["armed"] = c["symbol"] in armed_now
+
     candidates.sort(key=lambda x: (-x.get("score", 0), x.get("rsi", 100)))
     consolidations.sort(key=lambda x: x.get("dist_pct", 999))
     with scan_lock:
         CANDIDATES = candidates[:30]
         CONSOLIDATIONS = consolidations[:30]
     LAST_SCAN_TS = time.time()
-    logger.info("Scan done: candidates=%d cons=%d btc=%s breadth=%s",
-                len(CANDIDATES), len(CONSOLIDATIONS),
-                btc_reason, breadth_reason)
+    logger.info(
+        "Scan done: candidates=%d cons=%d potential=%d armed_new=%d "
+        "btc=%s breadth=%s",
+        len(CANDIDATES), len(CONSOLIDATIONS),
+        len(potential_signals), armed_count,
+        btc_reason, breadth_reason)
     update_ticker_subscription()
 
 
@@ -1555,8 +1581,6 @@ def on_kline_message(ws, message):
 
 
 def process_ws_closed(symbol):
-    """Хук на закрытие свечи. По умолчанию ничего не делает —
-    вся логика входа выполняется в scan_cycle и check_*_price."""
     return
 
 
@@ -1829,7 +1853,6 @@ def manage_loop():
 
 
 def periodic_exit_checks():
-    """Проверка выходов по текущей цене для позиций без WS-ticker."""
     with state_lock:
         opens = [(s, dict(p)) for s, p in state.items()
                  if p.get("position") == "open"]
