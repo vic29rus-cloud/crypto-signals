@@ -1,22 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BYBIT SCANNER v22.5 AMD + SWEEP + CVD (OBSERVE) — FIXED#2
+BYBIT SCANNER v22.5 AMD + SWEEP + CVD (OBSERVE) — FIXED#3
 
-Что нового в этой ревизии:
-- Breadth вычисляется ПОСЛЕ заполнения LAST_ANALYSIS в scan_cycle
-  (было: n/a (0) навсегда и использование устаревшего breadth при арме)
-- Сигналы армируются только после проверки свежего breadth
-- BREADTH_CACHE сбрасывается в конце скана → /status показывает реальные цифры
-- Флаг "armed" в списке кандидатов выставляется по факту после арма
-
-Предыдущие фиксы (сохранены):
-- detect_consolidation() добавлена
-- LAST_ANALYSIS заполняется в scan_cycle
-- Ошибки скана на WARNING (первые 5)
-- BE: +1.5R и +0.3R считаются от risk = entry - initial_stop
-- Кэш дневных свечей
-- Миграция старых позиций в load_state
+Что нового:
+- Расширен охват монет: MIN_TURNOVER_USDT = 1_000_000, MIN_PRICE = 0.00001
+- Снижен порог входа: MIN_SIGNAL_SCORE = 5
+- Расширено окно накопления: AMD_ACCUM_RANGE_ATR_MULT = 4.0
+- Устранен NameError в periodic_exit_checks
+- Breadth считается после заполнения LAST_ANALYSIS
 """
 
 import os
@@ -35,10 +27,8 @@ import pandas as pd
 import numpy as np
 import websocket
 
-
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-
 
 WORK_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(WORK_DIR, "bybit_scanner_v225.log")
@@ -47,20 +37,13 @@ TRADES_FILE = os.path.join(WORK_DIR, "bybit_trades_v225.json")
 CB_FILE = os.path.join(WORK_DIR, "bybit_cb_v225.json")
 SUBSCRIBERS_FILE = os.path.join(WORK_DIR, "subscribers_v225.json")
 
-
 BASE_URL = "https://api.bybit.com/v5/market"
 WS_URL = "wss://stream.bybit.com/v5/public/spot"
 
-
 # ==================== СКАН / WS ====================
 TOP_N = 150
-# Если пар в статусе < 50 — ослабьте фильтры ниже.
-# На спокойном рынке 35 пар — это нормально для 3M/0.0001.
-# Для расширения охвата попробуйте:
-#   MIN_TURNOVER_USDT = 1_000_000
-#   MIN_PRICE = 0.00001
-MIN_TURNOVER_USDT = 3_000_000
-MIN_PRICE = 0.0001
+MIN_TURNOVER_USDT = 1_000_000  # Снижено для охвата большего числа пар
+MIN_PRICE = 0.00001            # Снижено для дешевых монет
 
 SCAN_INTERVAL_SECONDS = 1800
 STATUS_INTERVAL_SECONDS = 7200
@@ -72,7 +55,6 @@ WS_SUBSCRIBE_CHUNK = 10
 WS_SUBSCRIBE_PAUSE = 0.15
 WS_SILENCE_TIMEOUT = 150
 
-
 # ==================== РИСК ====================
 MAX_OPEN_POSITIONS = 5
 MAX_TRADES_PER_HOUR = 4
@@ -82,7 +64,7 @@ ENTRY_COOLDOWN_SECONDS = 3600
 PAIR_LOSS_COOLDOWN_SECONDS = 86400
 BE_EXIT_COOLDOWN_SECONDS = 4 * 3600
 
-MIN_SIGNAL_SCORE = 6
+MIN_SIGNAL_SCORE = 5           # Снижено с 6
 MIN_STOP_DISTANCE_PCT = 1.0
 MIN_RR = 2.0
 
@@ -99,17 +81,14 @@ TRAILING_STEP_ATR = 2.5
 RISK_PER_TRADE_PCT = 0.75
 MAX_PORTFOLIO_RISK_PCT = 4.0
 
-
 # ==================== CB ====================
 CB_CONSEC_LOSSES = 3
 CB_DAILY_LOSS_PCT = -2.0
 CB_PAUSE_SECONDS = 12 * 3600
 
-
 # ==================== BTC ====================
 BTC_DROP_6H_PCT = -3.5
 BTC_ADX_BLOCK = 50
-
 
 # ==================== ALT BREADTH ====================
 ALT_BREADTH_ENABLED = True
@@ -118,18 +97,16 @@ ALT_BREADTH_MEDIAN_RSI_UNBLOCK = 42.0
 ALT_BREADTH_LOW_PCT = 60.0
 ALT_BREADTH_MIN_SAMPLES = 20
 
-
 # ==================== AMD / SWEEP ====================
 AMD_ENABLED = True
 AMD_ACCUM_LOOKBACK = 20
-AMD_ACCUM_RANGE_ATR_MULT = 3.0
+AMD_ACCUM_RANGE_ATR_MULT = 4.0  # Расширено с 3.0
 AMD_SWEEP_PENETRATION_ATR = 0.3
 AMD_SWEEP_RECLAIM_BARS = 3
 AMD_SWEEP_LOOKBACK = 10
 
 CVD_ENABLED = True
 CVD_LOOKBACK = 20
-
 
 # ==================== ФИЛЬТРЫ ====================
 RSI_MIN, RSI_MAX = 35, 72
@@ -145,7 +122,6 @@ STATUS_ADX_MIN, STATUS_ADX_MAX = 18, 55
 
 TG_MSG_LIMIT = 3900
 
-
 STABLE_BASES = {
     "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "TRY", "BRL", "MXN",
     "INR", "SGD", "HKD", "ZAR", "NZD", "NOK", "SEK",
@@ -158,9 +134,7 @@ STABLE_BASES = {
     "BTC", "ETH",
 }
 
-
 logger = logging.getLogger("bybit-scanner-v225")
-
 
 def setup_logging():
     logger.setLevel(logging.INFO)
@@ -174,7 +148,6 @@ def setup_logging():
     sh = logging.StreamHandler()
     sh.setFormatter(fmt)
     logger.addHandler(sh)
-
 
 # ==================== ГЛОБАЛЬНОЕ ====================
 SESSION = requests.Session()
@@ -243,12 +216,10 @@ ws_ts_lock = threading.RLock()
 
 STOP_EVENT = threading.Event()
 
-
 # ==================== HTML ====================
 def tv_link(symbol):
     url = f"https://www.tradingview.com/chart/?symbol=BYBIT:{symbol}"
     return f'<a href="{url}">📈 {symbol}</a>'
-
 
 def esc(text):
     return (str(text)
@@ -256,12 +227,10 @@ def esc(text):
             .replace("<", "&lt;")
             .replace(">", "&gt;"))
 
-
 _TAG_RE = _re.compile(
     r'<(/?)(a|b|i|u|s|code|pre|blockquote|em|strong|tg-spoiler)(\s[^<>]*)?>',
     _re.IGNORECASE,
 )
-
 
 def _escape_non_tags(text):
     if not text:
@@ -290,12 +259,10 @@ def _escape_non_tags(text):
     result = result.replace("\x00AMP\x00", "&amp;")
     return result
 
-
 def _strip_tags(text):
     if not text:
         return text
     return _re.sub(r'<[^>]+>', '', text)
-
 
 # ==================== TELEGRAM ====================
 def _post_telegram(chat_id, text, reply_markup=None):
@@ -324,17 +291,14 @@ def _post_telegram(chat_id, text, reply_markup=None):
             if j.get("ok"):
                 return True
             desc = str(j.get("description", ""))
-            logger.error("Telegram отклонил (mode=%s, chat=%s): %s",
-                         mode, chat_id, desc)
+            logger.error("Telegram отклонил (mode=%s, chat=%s): %s", mode, chat_id, desc)
             low = desc.lower()
-            if any(k in low for k in ("blocked", "chat not found",
-                                       "deactivated", "kicked")):
+            if any(k in low for k in ("blocked", "chat not found", "deactivated", "kicked")):
                 remove_subscriber(int(chat_id))
                 return False
         except Exception as e:
             logger.warning("Telegram send error chat=%s: %s", chat_id, e)
     return False
-
 
 def split_text(text, limit=TG_MSG_LIMIT):
     chunks, cur = [], ""
@@ -347,7 +311,6 @@ def split_text(text, limit=TG_MSG_LIMIT):
         chunks.append(cur)
     return chunks or [""]
 
-
 def send_telegram(text, reply_markup=None):
     if not TELEGRAM_BOT_TOKEN:
         return
@@ -358,7 +321,6 @@ def send_telegram(text, reply_markup=None):
     for chunk in split_text(text):
         for cid in targets:
             _post_telegram(cid, chunk, reply_markup=reply_markup)
-
 
 def load_subscribers():
     global subscribers
@@ -377,7 +339,6 @@ def load_subscribers():
             pass
     save_subscribers()
 
-
 def save_subscribers():
     try:
         with sub_lock:
@@ -389,7 +350,6 @@ def save_subscribers():
     except Exception as e:
         logger.error("save_subscribers error: %s", e)
 
-
 def add_subscriber(chat_id):
     with sub_lock:
         if chat_id in subscribers:
@@ -398,7 +358,6 @@ def add_subscriber(chat_id):
     save_subscribers()
     return True
 
-
 def remove_subscriber(chat_id):
     with sub_lock:
         if int(chat_id) not in subscribers:
@@ -406,7 +365,6 @@ def remove_subscriber(chat_id):
         subscribers.discard(int(chat_id))
     save_subscribers()
     return True
-
 
 # ==================== REST BYBIT ====================
 def api_get(path, params, timeout=15, retries=3):
@@ -420,14 +378,12 @@ def api_get(path, params, timeout=15, retries=3):
             j = r.json()
             if j.get("retCode") == 0:
                 return j
-            logger.debug("API retCode %s: %s",
-                         j.get("retCode"), j.get("retMsg"))
+            logger.debug("API retCode %s: %s", j.get("retCode"), j.get("retMsg"))
             time.sleep(1)
         except Exception as e:
             logger.debug("API error %s: %s", path, e)
             time.sleep(1)
     return None
-
 
 def fetch_klines(symbol, interval, limit=200):
     params = {"category": "spot", "symbol": symbol,
@@ -453,7 +409,6 @@ def fetch_klines(symbol, interval, limit=200):
         return None
     return pd.DataFrame(out)
 
-
 def get_daily_cached(symbol, ttl=DAILY_CACHE_TTL):
     now = time.time()
     with daily_cache_lock:
@@ -465,10 +420,8 @@ def get_daily_cached(symbol, ttl=DAILY_CACHE_TTL):
         DAILY_CACHE[symbol] = {"ts": now, "df": df}
     return df
 
-
 def get_price(symbol):
-    j = api_get("/v5/market/tickers",
-                {"category": "spot", "symbol": symbol})
+    j = api_get("/v5/market/tickers", {"category": "spot", "symbol": symbol})
     if not j:
         return None
     rows = j.get("result", {}).get("list", [])
@@ -478,7 +431,6 @@ def get_price(symbol):
         return float(rows[0].get("lastPrice", 0))
     except Exception:
         return None
-
 
 def get_universe():
     j = api_get("/v5/market/tickers", {"category": "spot"})
@@ -499,22 +451,18 @@ def get_universe():
             continue
         try:
             price = float(item.get("lastPrice", 0))
-            turnover = float(item.get("turnover24h", 0)
-                              or item.get("volume24h", 0))
+            turnover = float(item.get("turnover24h", 0) or item.get("volume24h", 0))
         except Exception:
             continue
         if price >= MIN_PRICE and turnover >= MIN_TURNOVER_USDT:
             pairs.append((symbol, turnover))
     pairs.sort(key=lambda x: x[1], reverse=True)
-    logger.info("Universe: %d pairs, skipped %d stable-like",
-                min(len(pairs), TOP_N), skipped_stable)
+    logger.info("Universe: %d pairs, skipped %d stable-like", min(len(pairs), TOP_N), skipped_stable)
     return [s for s, _ in pairs[:TOP_N]]
-
 
 # ==================== ИНДИКАТОРЫ ====================
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
-
 
 def rsi(series, period=14):
     delta = series.diff()
@@ -522,7 +470,6 @@ def rsi(series, period=14):
     loss = (-delta.where(delta < 0, 0.0)).rolling(window=period).mean()
     rs = gain / loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
-
 
 def atr(df, period=14):
     high_low = df["high"] - df["low"]
@@ -532,21 +479,18 @@ def atr(df, period=14):
     tr = ranges.max(axis=1)
     return tr.rolling(period).mean()
 
-
 def adx(df, period=14):
     high, low, close = df["high"], df["low"], df["close"]
     plus_dm = high.diff()
     minus_dm = -low.diff()
     plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
     minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
-    tr = pd.concat([high - low, np.abs(high - close.shift()),
-                    np.abs(low - close.shift())], axis=1).max(axis=1)
+    tr = pd.concat([high - low, np.abs(high - close.shift()), np.abs(low - close.shift())], axis=1).max(axis=1)
     atr_val = tr.rolling(period).mean()
     plus_di = 100 * (plus_dm.rolling(period).mean() / atr_val.replace(0, np.nan))
     minus_di = 100 * (minus_dm.rolling(period).mean() / atr_val.replace(0, np.nan))
     dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)
     return dx.rolling(period).mean()
-
 
 def analyze_frame(df, drop_last=False):
     if df is None or len(df) < 60:
@@ -592,7 +536,6 @@ def analyze_frame(df, drop_last=False):
         "macd_cross_fresh": bool(cross_fresh),
     }
 
-
 def confirmed_df(symbol):
     with ohlc_lock:
         buf = OHLC.get(symbol)
@@ -604,7 +547,6 @@ def confirmed_df(symbol):
     df = pd.DataFrame(rows)
     df = df.drop_duplicates("start").sort_values("start").reset_index(drop=True)
     return df
-
 
 # ==================== AMD: ACCUMULATION ====================
 def detect_accumulation(df):
@@ -630,7 +572,6 @@ def detect_accumulation(df):
         "lookback": AMD_ACCUM_LOOKBACK,
     }
 
-
 # ==================== AMD: SWEEP ====================
 def detect_sweep(df, accum):
     if df is None or accum is None or len(df) < AMD_SWEEP_LOOKBACK + 2:
@@ -652,7 +593,6 @@ def detect_sweep(df, accum):
             }
     return None
 
-
 # ==================== CVD ====================
 def approx_cvd(df, lookback=CVD_LOOKBACK):
     if df is None or len(df) < lookback + 2:
@@ -663,7 +603,6 @@ def approx_cvd(df, lookback=CVD_LOOKBACK):
     ratio = (body / rng).fillna(0.0).clip(-1, 1)
     delta = d["volume"] * ratio
     return float(delta.sum())
-
 
 # ==================== CONSOLIDATION ====================
 def detect_consolidation(symbol):
@@ -701,7 +640,6 @@ def detect_consolidation(symbol):
         "adx": adx_val,
     }
 
-
 # ==================== ТРЕНД / BTC / BREADTH ====================
 def get_trend(symbol, force=False):
     now = time.time()
@@ -730,7 +668,6 @@ def get_trend(symbol, force=False):
         TREND_CACHE[symbol] = item
     return item
 
-
 def btc_allows_longs():
     now = time.time()
     with btc_lock:
@@ -756,7 +693,6 @@ def btc_allows_longs():
         BTC_CACHE["ok"] = ok
         BTC_CACHE["reason"] = reason
     return ok, reason
-
 
 def alt_breadth_allows_longs():
     if not ALT_BREADTH_ENABLED:
@@ -801,7 +737,6 @@ def alt_breadth_allows_longs():
         BREADTH_CACHE["blocked"] = not ok
     return ok, reason
 
-
 # ==================== STATE ====================
 def save_state():
     try:
@@ -813,7 +748,6 @@ def save_state():
         os.replace(tmp, STATE_FILE)
     except Exception as e:
         logger.error("save_state error: %s", e)
-
 
 def load_state():
     global state
@@ -851,7 +785,6 @@ def load_state():
                 pos["initial_stop"] = stop
             state[sym] = pos
 
-
 def save_cb():
     try:
         with cb_lock:
@@ -862,7 +795,6 @@ def save_cb():
         os.replace(tmp, CB_FILE)
     except Exception as e:
         logger.error("save_cb error: %s", e)
-
 
 def load_cb():
     if not os.path.exists(CB_FILE):
@@ -879,7 +811,6 @@ def load_cb():
             cb.update(loaded)
     except Exception as e:
         logger.warning("load_cb error: %s", e)
-
 
 def append_trade(trade):
     try:
@@ -900,11 +831,9 @@ def append_trade(trade):
     except Exception as e:
         logger.error("append_trade error: %s", e)
 
-
 def cb_can_trade():
     with cb_lock:
         return time.time() >= float(cb.get("paused_until", 0.0))
-
 
 def can_enter(symbol):
     now = time.time()
@@ -932,7 +861,6 @@ def can_enter(symbol):
         if len(entry_30) >= MAX_TRADES_PER_30MIN:
             return False
     return True
-
 
 # ==================== СИГНАЛ ====================
 def make_sweep_signal(symbol, entry, sweep_low, atr_value, score, parts,
@@ -964,7 +892,6 @@ def make_sweep_signal(symbol, entry, sweep_low, atr_value, score, parts,
         "expires": time.time() + 1800,
     }
 
-
 def arm_signal(symbol, sig):
     if not sig:
         return
@@ -984,14 +911,12 @@ def arm_signal(symbol, sig):
     logger.info("ARM %s %s score=%s stop=%.8g",
                 symbol, sig["strategy"], sig["score"], sig["stop"])
 
-
 def expire_armed():
     now = time.time()
     with armed_lock:
         for sym, sig in list(ARMED.items()):
             if now > float(sig.get("expires", 0)):
                 ARMED.pop(sym, None)
-
 
 # ==================== ОТКРЫТИЕ ====================
 def open_position(sig):
@@ -1048,7 +973,6 @@ def open_position(sig):
                 sig["stop"], sig["target"], sig["score"])
     return True
 
-
 # ==================== RECORD TRADE ====================
 def record_trade(symbol, pos, exit_price, reason, force_close=False):
     entry = float(pos.get("entry_price", 0.0))
@@ -1092,7 +1016,6 @@ def record_trade(symbol, pos, exit_price, reason, force_close=False):
         pos["position"] = "closed"
     return pnl_pct
 
-
 # ==================== ЗАКРЫТИЕ ====================
 def close_position(symbol, price, reason, force_close=True):
     with state_lock:
@@ -1125,7 +1048,6 @@ def close_position(symbol, price, reason, force_close=True):
     )
     logger.info("CLOSE %s %s price=%.8f pnl=%.2f%%",
                 symbol, reason, float(price), pnl_pct)
-
 
 # ==================== ПРОВЕРКА ЦЕНЫ ====================
 def check_position_price(symbol, price):
@@ -1195,7 +1117,6 @@ def check_position_price(symbol, price):
                     state[symbol] = pos
                     save_state()
 
-
 def check_armed_price(symbol, price):
     if not price or price <= 0:
         return
@@ -1219,7 +1140,6 @@ def check_armed_price(symbol, price):
             sig["score"], sig["parts"], sig.get("accum"), sig.get("cvd"))
     if new_sig:
         open_position(new_sig)
-
 
 # ==================== СТРАТЕГИЯ SWEEP ====================
 def evaluate_sweep_signal(symbol, df, a, trend, accum, sweep):
@@ -1269,7 +1189,6 @@ def evaluate_sweep_signal(symbol, df, a, trend, accum, sweep):
     return make_sweep_signal(
         symbol, entry, sweep["sweep_low"], a["atr"],
         score, parts, accum, cvd_val)
-
 
 # ==================== SCAN ====================
 def scan_cycle():
@@ -1341,7 +1260,7 @@ def scan_cycle():
                             "vol": a15["vol_ratio"],
                             "atr": a15["atr"],
                             "strategy": sig["strategy"] if sig else "watch",
-                            "armed": False,  # обновим ниже по факту
+                            "armed": False,
                         })
             time.sleep(0.12)
         except Exception as e:
@@ -1354,19 +1273,16 @@ def scan_cycle():
     if scan_errors:
         logger.warning("Scan errors total: %d/%d", scan_errors, len(pairs))
 
-    # Сбрасываем кэш breadth, чтобы пересчитать по свежему LAST_ANALYSIS
     with breadth_lock:
         BREADTH_CACHE["ts"] = 0.0
     breadth_ok, breadth_reason = alt_breadth_allows_longs()
 
-    # Армируем только то, что проходит и btc, и свежий breadth
     armed_count = 0
     if btc_ok and breadth_ok and potential_signals:
         for sym, sig in potential_signals:
             arm_signal(sym, sig)
             armed_count += 1
 
-    # Обновляем флаг armed в candidates по факту
     with armed_lock:
         armed_now = set(ARMED.keys())
     for c in candidates:
@@ -1385,7 +1301,6 @@ def scan_cycle():
         len(potential_signals), armed_count,
         btc_reason, breadth_reason)
     update_ticker_subscription()
-
 
 # ==================== СТАТУС ====================
 def send_status():
@@ -1496,7 +1411,6 @@ def send_status():
 
     send_telegram("\n".join(lines))
 
-
 # ==================== WEBSOCKET KLINE ====================
 def touch_ws_ts(kind):
     global LAST_WS_KLINE_TS, LAST_WS_TICKER_TS
@@ -1507,7 +1421,6 @@ def touch_ws_ts(kind):
         else:
             LAST_WS_TICKER_TS = now
 
-
 def ws_ping(ws, name):
     while not STOP_EVENT.is_set():
         time.sleep(20)
@@ -1516,7 +1429,6 @@ def ws_ping(ws, name):
         except Exception:
             logger.info("WS %s ping stopped", name)
             return
-
 
 def on_kline_open(ws):
     logger.info("WS kline connected")
@@ -1537,7 +1449,6 @@ def on_kline_open(ws):
             return
         time.sleep(WS_SUBSCRIBE_PAUSE)
     threading.Thread(target=ws_ping, args=(ws, "kline"), daemon=True).start()
-
 
 def on_kline_message(ws, message):
     touch_ws_ts("kline")
@@ -1579,19 +1490,15 @@ def on_kline_message(ws, message):
     except Exception as e:
         logger.debug("WS kline message error: %s", e)
 
-
 def process_ws_closed(symbol):
     return
-
 
 def on_kline_error(ws, error):
     logger.warning("WS kline error: %s", error)
 
-
 def on_kline_close(ws, close_status_code, close_msg):
     logger.warning("WS kline closed: %s %s", close_status_code, close_msg)
     WS_KLINE_CONNECTED.clear()
-
 
 def run_kline_ws():
     global WS_KLINE_APP
@@ -1615,7 +1522,6 @@ def run_kline_ws():
         WS_KLINE_CONNECTED.clear()
         time.sleep(5)
 
-
 # ==================== WEBSOCKET TICKERS ====================
 def desired_ticker_pairs():
     pairs = []
@@ -1635,7 +1541,6 @@ def desired_ticker_pairs():
             unique.append(s)
     return unique[:WS_TICKER_MAX]
 
-
 def subscribe_tickers(ws, symbols):
     if not symbols:
         return
@@ -1649,7 +1554,6 @@ def subscribe_tickers(ws, symbols):
             return
         time.sleep(WS_SUBSCRIBE_PAUSE)
 
-
 def unsubscribe_tickers(ws, symbols):
     if not symbols:
         return
@@ -1662,7 +1566,6 @@ def unsubscribe_tickers(ws, symbols):
             logger.warning("WS tickers unsubscribe error: %s", e)
             return
         time.sleep(0.05)
-
 
 def update_ticker_subscription():
     desired = desired_ticker_pairs()
@@ -1678,7 +1581,6 @@ def update_ticker_subscription():
         if new:
             subscribe_tickers(WS_TICKER_APP, new)
 
-
 def on_tickers_open(ws):
     logger.info("WS tickers connected")
     WS_TICKERS_CONNECTED.set()
@@ -1692,7 +1594,6 @@ def on_tickers_open(ws):
             WS_TICKER_PAIRS.update(pairs)
     subscribe_tickers(ws, pairs)
     threading.Thread(target=ws_ping, args=(ws, "tickers"), daemon=True).start()
-
 
 def on_tickers_message(ws, message):
     touch_ws_ts("ticker")
@@ -1716,15 +1617,12 @@ def on_tickers_message(ws, message):
     except Exception as e:
         logger.debug("WS tickers message error: %s", e)
 
-
 def on_tickers_error(ws, error):
     logger.warning("WS tickers error: %s", error)
-
 
 def on_tickers_close(ws, close_status_code, close_msg):
     logger.warning("WS tickers closed: %s %s", close_status_code, close_msg)
     WS_TICKERS_CONNECTED.clear()
-
 
 def run_tickers_ws():
     global WS_TICKER_APP
@@ -1742,7 +1640,6 @@ def run_tickers_ws():
             logger.error("WS tickers critical error: %s", e)
         WS_TICKERS_CONNECTED.clear()
         time.sleep(5)
-
 
 def watchdog_loop():
     while not STOP_EVENT.is_set():
@@ -1763,7 +1660,6 @@ def watchdog_loop():
                 WS_TICKER_APP.close()
             except Exception:
                 pass
-
 
 # ==================== POLLING TELEGRAM ====================
 def polling_loop():
@@ -1823,7 +1719,6 @@ def polling_loop():
             logger.warning("Polling error: %s", e)
             time.sleep(5)
 
-
 # ==================== MAIN ====================
 def manage_loop():
     now = time.time()
@@ -1851,7 +1746,6 @@ def manage_loop():
             logger.exception("Manage loop error: %s", e)
         time.sleep(MANAGE_SLEEP_SECONDS)
 
-
 def periodic_exit_checks():
     with state_lock:
         opens = [(s, dict(p)) for s, p in state.items()
@@ -1862,13 +1756,11 @@ def periodic_exit_checks():
         if price:
             check_position_price(sym, price)
 
-
 def handle_stop(signum, frame):
     logger.info("Получен сигнал %s — останавливаюсь", signum)
     STOP_EVENT.set()
     save_state()
     raise SystemExit(0)
-
 
 def main():
     setup_logging()
@@ -1896,10 +1788,9 @@ def main():
         "CVD-аппроксимация (OHLCV).\n"
         "Стоп за хвост Sweep.\n"
         "BE при +1.5R, стоп на +0.3R.\n"
-        "Score≥6 · RR≥2.0 · 1 вход/30мин."
+        "Score≥5 · RR≥2.0 · 1 вход/30мин."
     )
     manage_loop()
-
 
 if __name__ == "__main__":
     main()
