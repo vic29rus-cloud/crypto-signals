@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Бэктестер для стратегии AMD + Sweep (Оптимизированная версия).
+Бэктестер для стратегии AMD + Sweep (ФИНАЛЬНАЯ ОПТИМИЗАЦИЯ).
+Сначала собирает все возможные сетапы, потом перебирает комбинации.
 """
 
 import os
@@ -106,93 +107,8 @@ def adx(df, period=14):
     dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)
     return dx.rolling(period).mean()
 
-def backtest_combo(pairs_data, cvd_enabled, rsi_range, adx_range, vol_mult, trend_score_min):
-    total_trades = 0
-    wins = 0
-    total_pnl = 0.0
-    
-    for symbol, df in pairs_data.items():
-        if df is None or len(df) < 100: continue
-        
-        # Предрасчет индикаторов ОДИН РАЗ для всей пары
-        df = df.copy()
-        df["atr"] = atr(df)
-        df["rsi"] = rsi(df["close"])
-        df["adx"] = adx(df)
-        df["vol_sma"] = df["volume"].rolling(20).mean()
-        df["vol_ratio"] = df["volume"] / df["vol_sma"].replace(0, np.nan)
-        df["ema9"] = ema(df["close"], 9)
-        df["ema21"] = ema(df["close"], 21)
-        
-        # Быстрый проход по свечам
-        for i in range(100, len(df) - 5):
-            row = df.iloc[i]
-            if pd.isna(row["atr"]) or row["atr"] <= 0: continue
-            
-            # 1. Проверка накопления
-            window_20 = df.iloc[i - 20 + 1 : i+1]
-            high_20 = window_20["high"].max()
-            low_20 = window_20["low"].min()
-            if (high_20 - low_20) / row["atr"] > AMD_ACCUM_RANGE_ATR_MULT: continue
-            
-            # 2. Проверка sweep
-            window_10 = df.iloc[i - 10 + 1 : i+1]
-            pen = AMD_SWEEP_PENETRATION_ATR * row["atr"]
-            sweep_low = None
-            for j in range(len(window_10) - 1, -1, -1):
-                r = window_10.iloc[j]
-                if r["low"] < low_20 - pen and r["close"] > low_20:
-                    sweep_low = r["low"]
-                    break
-            if sweep_low is None: continue
-            
-            # 3. Фильтры
-            if not (rsi_range[0] <= row["rsi"] <= rsi_range[1]): continue
-            if not (adx_range[0] <= row["adx"] <= adx_range[1]): continue
-            if row["vol_ratio"] < vol_mult: continue
-            
-            if cvd_enabled:
-                body = window_20["close"] - window_20["open"]
-                rng = (window_20["high"] - window_20["low"]).replace(0, np.nan)
-                ratio = (body / rng).fillna(0.0).clip(-1, 1)
-                cvd_val = float((window_20["volume"] * ratio).sum())
-                if cvd_val <= 0: continue
-            
-            t_score = 1 if row["ema9"] > row["ema21"] else 0
-            if t_score < trend_score_min: continue
-            
-            # 4. Симуляция сделки
-            entry = float(row["close"])
-            if entry <= 0: continue
-            stop = sweep_low - SWEEP_STOP_BUFFER_ATR * row["atr"]
-            if stop >= entry: continue
-            risk = entry - stop
-            if (risk / entry * 100) < 1.0: continue
-            target = entry + risk * (ATR_MULT_TP / SWEEP_STOP_BUFFER_ATR)
-            
-            result = None
-            for j in range(i+1, min(i+6, len(df))):
-                future = df.iloc[j]
-                if future["low"] <= stop: result = -1.0; break
-                if future["high"] >= target: result = (target - entry) / risk; break
-            
-            if result is None: continue
-            
-            total_trades += 1
-            total_pnl += result
-            if result > 0: wins += 1
-            
-    if total_trades == 0: return None
-    winrate = wins / total_trades * 100
-    profit_factor = total_pnl / abs(total_trades - wins) if total_trades > wins else 999
-    return {
-        "trades": total_trades, "wins": wins, "winrate": winrate, "total_pnl_r": total_pnl,
-        "profit_factor": profit_factor, "cvd": cvd_enabled, "rsi": rsi_range, "adx": adx_range,
-        "vol": vol_mult, "trend_min": trend_score_min,
-    }
-
 def main():
-    print("🚀 Запуск оптимизированного бэктестера...")
+    print("🚀 Запуск ФИНАЛЬНОГО оптимизированного бэктестера...")
     pairs = get_universe()
     print(f"📊 Загружено пар: {len(pairs)}")
     
@@ -205,23 +121,110 @@ def main():
             print(f"   [{idx}/{len(pairs)}] Скачано...")
         time.sleep(0.05)
     
-    print(f"✅ Готово. Пар для анализа: {len(pairs_data)}")
+    print(f"✅ Скачивание завершено. Пар: {len(pairs_data)}")
     
+    # ЭТАП 1: Сбор всех сетапов
+    print("🔍 Этап 1: Поиск всех сетапов AMD+Sweep...")
+    all_signals = []
+    
+    for symbol, df in pairs_data.items():
+        df = df.copy()
+        df["atr"] = atr(df)
+        df["rsi"] = rsi(df["close"])
+        df["adx"] = adx(df)
+        df["vol_sma"] = df["volume"].rolling(20).mean()
+        df["vol_ratio"] = df["volume"] / df["vol_sma"]
+        df["ema9"] = ema(df["close"], 9)
+        df["ema21"] = ema(df["close"], 21)
+        
+        # Векторный расчет CVD и диапазонов
+        body = df["close"] - df["open"]
+        rng = (df["high"] - df["low"]).replace(0, np.nan)
+        df["delta"] = (df["volume"] * (body / rng).fillna(0).clip(-1, 1)).rolling(20).sum()
+        
+        df["high_20"] = df["high"].rolling(20).max()
+        df["low_20"] = df["low"].rolling(20).min()
+        df["range_atr"] = (df["high_20"] - df["low_20"]) / df["atr"]
+        
+        for i in range(100, len(df) - 5):
+            row = df.iloc[i]
+            if pd.isna(row["atr"]) or row["atr"] <= 0: continue
+            if row["range_atr"] > AMD_ACCUM_RANGE_ATR_MULT: continue
+            
+            # Проверка Sweep (ищем минимум за 10 свечей)
+            past_10 = df.iloc[i-10:i]
+            min_low = past_10["low"].min()
+            pen = AMD_SWEEP_PENETRATION_ATR * row["atr"]
+            
+            # Если был прокол ниже диапазона
+            if min_low < row["low_20"] - pen:
+                sweep_low = min_low
+            else:
+                continue
+                
+            # Симуляция сделки
+            entry = row["close"]
+            stop = sweep_low - SWEEP_STOP_BUFFER_ATR * row["atr"]
+            if stop >= entry: continue
+            risk = entry - stop
+            if (risk / entry * 100) < 1.0: continue
+            target = entry + risk * (ATR_MULT_TP / SWEEP_STOP_BUFFER_ATR)
+            
+            result = None
+            for j in range(i+1, min(i+6, len(df))):
+                if df.iloc[j]["low"] <= stop: result = -1.0; break
+                if df.iloc[j]["high"] >= target: result = (target - entry) / risk; break
+            
+            if result is not None:
+                all_signals.append({
+                    "symbol": symbol,
+                    "rsi": row["rsi"],
+                    "adx": row["adx"],
+                    "vol_ratio": row["vol_ratio"],
+                    "cvd": row["delta"],
+                    "trend": 1 if row["ema9"] > row["ema21"] else 0,
+                    "result": result
+                })
+    
+    print(f"🎯 Найдено потенциальных сетапов: {len(all_signals)}")
+    if not all_signals:
+        print("❌ Нет сетапов вообще. Попробуйте увеличить CANDLE_LIMIT.")
+        return
+
+    # ЭТАП 2: Перебор комбинаций (займет миллисекунды)
+    print("🔄 Этап 2: Перебор комбинаций фильтров...")
     results = []
     combos = list(itertools.product(TEST_CVD, TEST_RSI, TEST_ADX, TEST_VOL, TEST_TREND_SCORE))
-    print(f"🔄 Перебираем {len(combos)} комбинаций (это займет секунды)...")
     
-    for idx, (cvd, rsi_r, adx_r, vol, t_min) in enumerate(combos):
-        res = backtest_combo(pairs_data, cvd, rsi_r, adx_r, vol, t_min)
-        if res and res["trades"] >= 5:
-            results.append(res)
-        if (idx + 1) % 20 == 0:
-            print(f"   [{idx+1}/{len(combos)}]...")
+    for cvd, rsi_r, adx_r, vol, t_min in combos:
+        trades = 0
+        wins = 0
+        pnl = 0.0
+        
+        for sig in all_signals:
+            if cvd and sig["cvd"] <= 0: continue
+            if not (rsi_r[0] <= sig["rsi"] <= rsi_r[1]): continue
+            if not (adx_r[0] <= sig["adx"] <= adx_r[1]): continue
+            if sig["vol_ratio"] < vol: continue
+            if sig["trend"] < t_min: continue
+            
+            trades += 1
+            pnl += sig["result"]
+            if sig["result"] > 0: wins += 1
+            
+        if trades >= 5:
+            winrate = wins / trades * 100
+            pf = pnl / abs(trades - wins) if trades > wins else 999
+            results.append({
+                "trades": trades, "wins": wins, "winrate": winrate, "total_pnl_r": pnl,
+                "profit_factor": pf, "cvd": cvd, "rsi": rsi_r, "adx": adx_r,
+                "vol": vol, "trend_min": t_min
+            })
     
     results.sort(key=lambda x: (x["profit_factor"], x["total_pnl_r"]), reverse=True)
     
     print("\n" + "="*80)
-    print("🏆 ТОП-10 ЛУЧШИХ КОМБИНАЦИЙ (по Profit Factor):")
+    print("🏆 ТОП-10 ЛУЧШИХ КОМБИНАЦИЙ:")
     print("="*80)
     for i, r in enumerate(results[:10], 1):
         print(f"\n#{i} | PF: {r['profit_factor']:.2f} | Winrate: {r['winrate']:.1f}% "
@@ -232,8 +235,7 @@ def main():
     with open("backtest_results.json", "w", encoding="utf-8") as f:
         json.dump(results[:50], f, indent=2, default=str)
     
-    print("\n💾 Результаты сохранены в backtest_results.json")
-    print("✅ Готово!")
+    print("\n✅ Готово! Результаты сохранены.")
 
 if __name__ == "__main__":
     main()
