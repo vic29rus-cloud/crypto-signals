@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Бэктестер для стратегии AMD + Sweep (ФИНАЛЬНАЯ ОПТИМИЗАЦИЯ).
-Сначала собирает все возможные сетапы, потом перебирает комбинации.
+Бэктестер для стратегии AMD + Sweep (ИСПРАВЛЕННАЯ ЛОГИКА).
 """
+
 import os
 import json
 import time
@@ -114,7 +114,7 @@ def adx(df, period=14):
     return dx.rolling(period).mean()
 
 def main():
-    print("🚀 Запуск ФИНАЛЬНОГО оптимизированного бэктестера...")
+    print("🚀 Запуск ИСПРАВЛЕННОГО бэктестера (фикс логики Sweep)...")
     pairs = get_universe()
     print(f"📊 Загружено пар: {len(pairs)}")
     
@@ -125,11 +125,10 @@ def main():
             pairs_data[symbol] = df
         if idx % 50 == 0:
             print(f"   [{idx}/{len(pairs)}] Скачано...")
-        time.sleep(0.12)  # Увеличено для соблюдения лимитов API
+        time.sleep(0.12)
     
     print(f"✅ Скачивание завершено. Пар: {len(pairs_data)}")
     
-    # ЭТАП 1: Сбор всех сетапов
     print("🔍 Этап 1: Поиск всех сетапов AMD+Sweep...")
     all_signals = []
     
@@ -143,28 +142,31 @@ def main():
         df["ema9"] = ema(df["close"], 9)
         df["ema21"] = ema(df["close"], 21)
         
-        # Векторный расчет CVD и диапазонов
         body = df["close"] - df["open"]
         rng = (df["high"] - df["low"]).replace(0, np.nan)
         df["delta"] = (df["volume"] * (body / rng).fillna(0).clip(-1, 1)).rolling(20).sum()
-        df["high_20"] = df["high"].rolling(20).max()
-        df["low_20"] = df["low"].rolling(20).min()
-        df["range_atr"] = (df["high_20"] - df["low_20"]) / df["atr"]
         
-        for i in range(100, len(df) - 5):
+        # ИСПРАВЛЕНИЕ: Боковик считаем за 20 свечей, которые закончились 10 свечей назад!
+        df["high_20_past"] = df["high"].shift(10).rolling(20).max()
+        df["low_20_past"] = df["low"].shift(10).rolling(20).min()
+        df["range_atr"] = (df["high_20_past"] - df["low_20_past"]) / df["atr"]
+        
+        for i in range(40, len(df) - 5):
             row = df.iloc[i]
-            if pd.isna(row["atr"]) or row["atr"] <= 0:
-                continue
-            if row["range_atr"] > AMD_ACCUM_RANGE_ATR_MULT:
+            if pd.isna(row["atr"]) or row["atr"] <= 0 or pd.isna(row["low_20_past"]):
                 continue
             
-            # Проверка Sweep (ищем минимум за 10 свечей)
-            past_10 = df.iloc[i-10:i]
+            # 1. Проверка накопления (диапазон ДО прокола)
+            if row["range_atr"] > AMD_ACCUM_RANGE_ATR_MULT:
+                continue
+                
+            # 2. Проверка Sweep в последних 10 свечах
+            past_10 = df.iloc[i-9 : i+1]
             min_low = past_10["low"].min()
             pen = AMD_SWEEP_PENETRATION_ATR * row["atr"]
             
-            # Если был прокол ниже диапазона
-            if min_low < row["low_20"] - pen:
+            # Если пробили нижнюю границу накопления и закрылись ВЫШЕ неё
+            if min_low < row["low_20_past"] - pen and row["close"] > row["low_20_past"]:
                 sweep_low = min_low
             else:
                 continue
@@ -201,10 +203,9 @@ def main():
     
     print(f"🎯 Найдено потенциальных сетапов: {len(all_signals)}")
     if not all_signals:
-        print("❌ Нет сетапов вообще. Попробуйте увеличить CANDLE_LIMIT.")
+        print("❌ Все равно нет сетапов.")
         return
     
-    # ЭТАП 2: Перебор комбинаций (займет миллисекунды)
     print("🔄 Этап 2: Перебор комбинаций фильтров...")
     results = []
     combos = list(itertools.product(TEST_CVD, TEST_RSI, TEST_ADX, TEST_VOL, TEST_TREND_SCORE))
@@ -214,36 +215,23 @@ def main():
         wins = 0
         pnl = 0.0
         for sig in all_signals:
-            if cvd and sig["cvd"] <= 0:
-                continue
-            if not (rsi_r[0] <= sig["rsi"] <= rsi_r[1]):
-                continue
-            if not (adx_r[0] <= sig["adx"] <= adx_r[1]):
-                continue
-            if sig["vol_ratio"] < vol:
-                continue
-            if sig["trend"] < t_min:
-                continue
+            if cvd and sig["cvd"] <= 0: continue
+            if not (rsi_r[0] <= sig["rsi"] <= rsi_r[1]): continue
+            if not (adx_r[0] <= sig["adx"] <= adx_r[1]): continue
+            if sig["vol_ratio"] < vol: continue
+            if sig["trend"] < t_min: continue
             
             trades += 1
             pnl += sig["result"]
-            if sig["result"] > 0:
-                wins += 1
+            if sig["result"] > 0: wins += 1
         
         if trades >= 5:
             winrate = wins / trades * 100
             pf = pnl / abs(trades - wins) if trades > wins else 999.0
             results.append({
-                "trades": trades,
-                "wins": wins,
-                "winrate": winrate,
-                "total_pnl_r": pnl,
-                "profit_factor": pf,
-                "cvd": cvd,
-                "rsi": rsi_r,
-                "adx": adx_r,
-                "vol": vol,
-                "trend_min": t_min
+                "trades": trades, "wins": wins, "winrate": winrate, "total_pnl_r": pnl,
+                "profit_factor": pf, "cvd": cvd, "rsi": rsi_r, "adx": adx_r,
+                "vol": vol, "trend_min": t_min
             })
     
     results.sort(key=lambda x: (x["profit_factor"], x["total_pnl_r"]), reverse=True)
