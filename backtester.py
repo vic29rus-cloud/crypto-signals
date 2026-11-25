@@ -4,7 +4,6 @@
 Бэктестер для стратегии AMD + Sweep (ФИНАЛЬНАЯ ОПТИМИЗАЦИЯ).
 Сначала собирает все возможные сетапы, потом перебирает комбинации.
 """
-
 import os
 import json
 import time
@@ -27,7 +26,6 @@ AMD_ACCUM_LOOKBACK = 20
 AMD_ACCUM_RANGE_ATR_MULT = 4.0
 AMD_SWEEP_PENETRATION_ATR = 0.3
 AMD_SWEEP_LOOKBACK = 10
-
 SWEEP_STOP_BUFFER_ATR = 0.5
 ATR_MULT_TP = 8.0
 
@@ -64,7 +62,8 @@ def fetch_klines(symbol, interval, limit):
         try:
             out.append({"start": int(x[0]), "open": float(x[1]), "high": float(x[2]),
                         "low": float(x[3]), "close": float(x[4]), "volume": float(x[5])})
-        except Exception: continue
+        except Exception:
+            continue
     return pd.DataFrame(out) if out else None
 
 def get_universe():
@@ -73,17 +72,20 @@ def get_universe():
     pairs = []
     for item in j.get("result", {}).get("list", []):
         symbol = item.get("symbol", "")
-        if not symbol.endswith("USDT"): continue
+        if not symbol.endswith("USDT"):
+            continue
         try:
             price = float(item.get("lastPrice", 0))
             turnover = float(item.get("turnover24h", 0) or item.get("volume24h", 0))
-        except Exception: continue
+        except Exception:
+            continue
         if price >= MIN_PRICE and turnover >= MIN_TURNOVER_USDT:
             pairs.append((symbol, turnover))
     pairs.sort(key=lambda x: x[1], reverse=True)
     return [s for s, _ in pairs[:TOP_N]]
 
-def ema(series, period): return series.ewm(span=period, adjust=False).mean()
+def ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
 
 def rsi(series, period=14):
     delta = series.diff()
@@ -93,14 +95,18 @@ def rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 def atr(df, period=14):
-    tr = pd.concat([df["high"] - df["low"], np.abs(df["high"] - df["close"].shift()), np.abs(df["low"] - df["close"].shift())], axis=1).max(axis=1)
+    tr = pd.concat([df["high"] - df["low"], 
+                    np.abs(df["high"] - df["close"].shift()), 
+                    np.abs(df["low"] - df["close"].shift())], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
 def adx(df, period=14):
     high, low, close = df["high"], df["low"], df["close"]
     plus_dm = high.diff().where((high.diff() > -low.diff()) & (high.diff() > 0), 0.0)
     minus_dm = -low.diff().where((-low.diff() > high.diff()) & (-low.diff() > 0), 0.0)
-    tr = pd.concat([high - low, np.abs(high - close.shift()), np.abs(low - close.shift())], axis=1).max(axis=1)
+    tr = pd.concat([high - low, 
+                    np.abs(high - close.shift()), 
+                    np.abs(low - close.shift())], axis=1).max(axis=1)
     atr_val = tr.rolling(period).mean()
     plus_di = 100 * (plus_dm.rolling(period).mean() / atr_val.replace(0, np.nan))
     minus_di = 100 * (minus_dm.rolling(period).mean() / atr_val.replace(0, np.nan))
@@ -119,7 +125,7 @@ def main():
             pairs_data[symbol] = df
         if idx % 50 == 0:
             print(f"   [{idx}/{len(pairs)}] Скачано...")
-        time.sleep(0.05)
+        time.sleep(0.12)  # Увеличено для соблюдения лимитов API
     
     print(f"✅ Скачивание завершено. Пар: {len(pairs_data)}")
     
@@ -141,15 +147,16 @@ def main():
         body = df["close"] - df["open"]
         rng = (df["high"] - df["low"]).replace(0, np.nan)
         df["delta"] = (df["volume"] * (body / rng).fillna(0).clip(-1, 1)).rolling(20).sum()
-        
         df["high_20"] = df["high"].rolling(20).max()
         df["low_20"] = df["low"].rolling(20).min()
         df["range_atr"] = (df["high_20"] - df["low_20"]) / df["atr"]
         
         for i in range(100, len(df) - 5):
             row = df.iloc[i]
-            if pd.isna(row["atr"]) or row["atr"] <= 0: continue
-            if row["range_atr"] > AMD_ACCUM_RANGE_ATR_MULT: continue
+            if pd.isna(row["atr"]) or row["atr"] <= 0:
+                continue
+            if row["range_atr"] > AMD_ACCUM_RANGE_ATR_MULT:
+                continue
             
             # Проверка Sweep (ищем минимум за 10 свечей)
             past_10 = df.iloc[i-10:i]
@@ -161,36 +168,42 @@ def main():
                 sweep_low = min_low
             else:
                 continue
-                
+            
             # Симуляция сделки
             entry = row["close"]
             stop = sweep_low - SWEEP_STOP_BUFFER_ATR * row["atr"]
-            if stop >= entry: continue
+            if stop >= entry:
+                continue
             risk = entry - stop
-            if (risk / entry * 100) < 1.0: continue
+            if (risk / entry * 100) < 1.0:
+                continue
             target = entry + risk * (ATR_MULT_TP / SWEEP_STOP_BUFFER_ATR)
             
             result = None
             for j in range(i+1, min(i+6, len(df))):
-                if df.iloc[j]["low"] <= stop: result = -1.0; break
-                if df.iloc[j]["high"] >= target: result = (target - entry) / risk; break
+                if df.iloc[j]["low"] <= stop:
+                    result = -1.0
+                    break
+                if df.iloc[j]["high"] >= target:
+                    result = (target - entry) / risk
+                    break
             
             if result is not None:
                 all_signals.append({
                     "symbol": symbol,
-                    "rsi": row["rsi"],
-                    "adx": row["adx"],
-                    "vol_ratio": row["vol_ratio"],
-                    "cvd": row["delta"],
+                    "rsi": float(row["rsi"]) if pd.notna(row["rsi"]) else 0.0,
+                    "adx": float(row["adx"]) if pd.notna(row["adx"]) else 0.0,
+                    "vol_ratio": float(row["vol_ratio"]) if pd.notna(row["vol_ratio"]) else 0.0,
+                    "cvd": float(row["delta"]) if pd.notna(row["delta"]) else 0.0,
                     "trend": 1 if row["ema9"] > row["ema21"] else 0,
-                    "result": result
+                    "result": float(result)
                 })
     
     print(f"🎯 Найдено потенциальных сетапов: {len(all_signals)}")
     if not all_signals:
         print("❌ Нет сетапов вообще. Попробуйте увеличить CANDLE_LIMIT.")
         return
-
+    
     # ЭТАП 2: Перебор комбинаций (займет миллисекунды)
     print("🔄 Этап 2: Перебор комбинаций фильтров...")
     results = []
@@ -200,25 +213,37 @@ def main():
         trades = 0
         wins = 0
         pnl = 0.0
-        
         for sig in all_signals:
-            if cvd and sig["cvd"] <= 0: continue
-            if not (rsi_r[0] <= sig["rsi"] <= rsi_r[1]): continue
-            if not (adx_r[0] <= sig["adx"] <= adx_r[1]): continue
-            if sig["vol_ratio"] < vol: continue
-            if sig["trend"] < t_min: continue
+            if cvd and sig["cvd"] <= 0:
+                continue
+            if not (rsi_r[0] <= sig["rsi"] <= rsi_r[1]):
+                continue
+            if not (adx_r[0] <= sig["adx"] <= adx_r[1]):
+                continue
+            if sig["vol_ratio"] < vol:
+                continue
+            if sig["trend"] < t_min:
+                continue
             
             trades += 1
             pnl += sig["result"]
-            if sig["result"] > 0: wins += 1
-            
+            if sig["result"] > 0:
+                wins += 1
+        
         if trades >= 5:
             winrate = wins / trades * 100
-            pf = pnl / abs(trades - wins) if trades > wins else 999
+            pf = pnl / abs(trades - wins) if trades > wins else 999.0
             results.append({
-                "trades": trades, "wins": wins, "winrate": winrate, "total_pnl_r": pnl,
-                "profit_factor": pf, "cvd": cvd, "rsi": rsi_r, "adx": adx_r,
-                "vol": vol, "trend_min": t_min
+                "trades": trades,
+                "wins": wins,
+                "winrate": winrate,
+                "total_pnl_r": pnl,
+                "profit_factor": pf,
+                "cvd": cvd,
+                "rsi": rsi_r,
+                "adx": adx_r,
+                "vol": vol,
+                "trend_min": t_min
             })
     
     results.sort(key=lambda x: (x["profit_factor"], x["total_pnl_r"]), reverse=True)
@@ -226,6 +251,7 @@ def main():
     print("\n" + "="*80)
     print("🏆 ТОП-10 ЛУЧШИХ КОМБИНАЦИЙ:")
     print("="*80)
+    
     for i, r in enumerate(results[:10], 1):
         print(f"\n#{i} | PF: {r['profit_factor']:.2f} | Winrate: {r['winrate']:.1f}% "
               f"| Сделок: {r['trades']} | PnL: {r['total_pnl_r']:.1f}R")
@@ -233,9 +259,9 @@ def main():
               f"| Vol: {r['vol']} | Trend: {r['trend_min']}")
     
     with open("backtest_results.json", "w", encoding="utf-8") as f:
-        json.dump(results[:50], f, indent=2, default=str)
+        json.dump(results[:50], f, indent=2)
     
-    print("\n✅ Готово! Результаты сохранены.")
+    print("\n✅ Готово! Результаты сохранены в backtest_results.json")
 
 if __name__ == "__main__":
     main()
