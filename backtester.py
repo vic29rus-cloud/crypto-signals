@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Бэктестер для стратегии AMD + Sweep (ИСПРАВЛЕННАЯ ЛОГИКА).
+Бэктестер для стратегии AMD + Sweep (ШИРОКИЙ СТОП + УМЕРЕННЫЙ ТЕЙК).
 """
 
 import os
@@ -26,15 +26,18 @@ AMD_ACCUM_LOOKBACK = 20
 AMD_ACCUM_RANGE_ATR_MULT = 4.0
 AMD_SWEEP_PENETRATION_ATR = 0.3
 AMD_SWEEP_LOOKBACK = 10
-SWEEP_STOP_BUFFER_ATR = 0.5
-ATR_MULT_TP = 8.0
+
+# НОВЫЕ ПАРАМЕТРЫ РИСКА
+SWEEP_STOP_BUFFER_ATR = 1.5  # Широкий стоп (было 0.5)
+TARGET_RR = 1.5              # Умеренный тейк (было 2.0 или 16.0)
+MAX_HOLD_CANDLES = 20        # Держим до 20 свечей
 
 # Что перебираем
 TEST_CVD = [True, False]
 TEST_RSI = [(35, 72), (40, 80), (30, 80)]
 TEST_ADX = [(15, 55), (20, 60), (10, 60)]
 TEST_VOL = [1.0, 1.1, 1.2]
-TEST_TREND_SCORE = [0, 1, 2]
+TEST_TREND_SCORE = [1, 2]  # Убрали 0, чтобы не торговать против тренда
 
 def api_get(path, params, retries=3):
     url = BASE_URL + path
@@ -114,7 +117,7 @@ def adx(df, period=14):
     return dx.rolling(period).mean()
 
 def main():
-    print("🚀 Запуск ИСПРАВЛЕННОГО бэктестера (фикс логики Sweep)...")
+    print("🚀 Запуск ИСПРАВЛЕННОГО бэктестера (Широкий стоп)...")
     pairs = get_universe()
     print(f"📊 Загружено пар: {len(pairs)}")
     
@@ -146,65 +149,63 @@ def main():
         rng = (df["high"] - df["low"]).replace(0, np.nan)
         df["delta"] = (df["volume"] * (body / rng).fillna(0).clip(-1, 1)).rolling(20).sum()
         
-        # ИСПРАВЛЕНИЕ: Боковик считаем за 20 свечей, которые закончились 10 свечей назад!
         df["high_20_past"] = df["high"].shift(10).rolling(20).max()
         df["low_20_past"] = df["low"].shift(10).rolling(20).min()
         df["range_atr"] = (df["high_20_past"] - df["low_20_past"]) / df["atr"]
         
-        for i in range(40, len(df) - 5):
+        for i in range(40, len(df) - MAX_HOLD_CANDLES):
             row = df.iloc[i]
             if pd.isna(row["atr"]) or row["atr"] <= 0 or pd.isna(row["low_20_past"]):
                 continue
             
-            # 1. Проверка накопления (диапазон ДО прокола)
             if row["range_atr"] > AMD_ACCUM_RANGE_ATR_MULT:
                 continue
                 
-            # 2. Проверка Sweep в последних 10 свечах
             past_10 = df.iloc[i-9 : i+1]
             min_low = past_10["low"].min()
             pen = AMD_SWEEP_PENETRATION_ATR * row["atr"]
             
-            # Если пробили нижнюю границу накопления и закрылись ВЫШЕ неё
             if min_low < row["low_20_past"] - pen and row["close"] > row["low_20_past"]:
                 sweep_low = min_low
             else:
                 continue
             
-            # Симуляция сделки
             entry = row["close"]
+            # ИСПРАВЛЕНИЕ: Стоп теперь шире (1.5 ATR)
             stop = sweep_low - SWEEP_STOP_BUFFER_ATR * row["atr"]
             if stop >= entry:
                 continue
             risk = entry - stop
             if (risk / entry * 100) < 1.0:
                 continue
-            target = entry + risk * (ATR_MULT_TP / SWEEP_STOP_BUFFER_ATR)
+            
+            target = entry + risk * TARGET_RR
             
             result = None
-            for j in range(i+1, min(i+6, len(df))):
+            for j in range(i+1, min(i+1+MAX_HOLD_CANDLES, len(df))):
                 if df.iloc[j]["low"] <= stop:
                     result = -1.0
                     break
                 if df.iloc[j]["high"] >= target:
-                    result = (target - entry) / risk
+                    result = TARGET_RR
                     break
             
-            if result is not None:
-                all_signals.append({
-                    "symbol": symbol,
-                    "rsi": float(row["rsi"]) if pd.notna(row["rsi"]) else 0.0,
-                    "adx": float(row["adx"]) if pd.notna(row["adx"]) else 0.0,
-                    "vol_ratio": float(row["vol_ratio"]) if pd.notna(row["vol_ratio"]) else 0.0,
-                    "cvd": float(row["delta"]) if pd.notna(row["delta"]) else 0.0,
-                    "trend": 1 if row["ema9"] > row["ema21"] else 0,
-                    "result": float(result)
-                })
+            # Если по времени не закрылось, закрываем по цене
+            if result is None:
+                exit_price = df.iloc[i+MAX_HOLD_CANDLES]["close"]
+                result = (exit_price - entry) / risk
+            
+            all_signals.append({
+                "symbol": symbol,
+                "rsi": float(row["rsi"]) if pd.notna(row["rsi"]) else 0.0,
+                "adx": float(row["adx"]) if pd.notna(row["adx"]) else 0.0,
+                "vol_ratio": float(row["vol_ratio"]) if pd.notna(row["vol_ratio"]) else 0.0,
+                "cvd": float(row["delta"]) if pd.notna(row["delta"]) else 0.0,
+                "trend": 1 if row["ema9"] > row["ema21"] else 0,
+                "result": float(result)
+            })
     
     print(f"🎯 Найдено потенциальных сетапов: {len(all_signals)}")
-    if not all_signals:
-        print("❌ Все равно нет сетапов.")
-        return
     
     print("🔄 Этап 2: Перебор комбинаций фильтров...")
     results = []
@@ -214,6 +215,9 @@ def main():
         trades = 0
         wins = 0
         pnl = 0.0
+        gross_profit = 0.0
+        gross_loss = 0.0
+        
         for sig in all_signals:
             if cvd and sig["cvd"] <= 0: continue
             if not (rsi_r[0] <= sig["rsi"] <= rsi_r[1]): continue
@@ -223,11 +227,16 @@ def main():
             
             trades += 1
             pnl += sig["result"]
-            if sig["result"] > 0: wins += 1
+            if sig["result"] > 0:
+                wins += 1
+                gross_profit += sig["result"]
+            else:
+                gross_loss += abs(sig["result"])
         
-        if trades >= 5:
+        if trades >= 10: # требуем минимум 10 сделок
             winrate = wins / trades * 100
-            pf = pnl / abs(trades - wins) if trades > wins else 999.0
+            pf = gross_profit / gross_loss if gross_loss > 0 else 999.0
+            
             results.append({
                 "trades": trades, "wins": wins, "winrate": winrate, "total_pnl_r": pnl,
                 "profit_factor": pf, "cvd": cvd, "rsi": rsi_r, "adx": adx_r,
