@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Бэктестер для стратегии AMD + Sweep (ШИРОКИЙ СТОП + УМЕРЕННЫЙ ТЕЙК).
+Бэктестер для стратегии AMD + Sweep (ТЕСТ ШОРТОВ).
+Ищем ложный пробой вверх (Sweep Highs) и продаем.
 """
 
 import os
@@ -27,9 +28,9 @@ AMD_ACCUM_RANGE_ATR_MULT = 4.0
 AMD_SWEEP_PENETRATION_ATR = 0.3
 AMD_SWEEP_LOOKBACK = 10
 
-# НОВЫЕ ПАРАМЕТРЫ РИСКА
-SWEEP_STOP_BUFFER_ATR = 1.5  # Широкий стоп (было 0.5)
-TARGET_RR = 1.5              # Умеренный тейк (было 2.0 или 16.0)
+# ПАРАМЕТРЫ РИСКА ДЛЯ ШОРТА
+SWEEP_STOP_BUFFER_ATR = 1.5  # Широкий стоп
+TARGET_RR = 1.5              # Тейк 1.5R
 MAX_HOLD_CANDLES = 20        # Держим до 20 свечей
 
 # Что перебираем
@@ -37,7 +38,7 @@ TEST_CVD = [True, False]
 TEST_RSI = [(35, 72), (40, 80), (30, 80)]
 TEST_ADX = [(15, 55), (20, 60), (10, 60)]
 TEST_VOL = [1.0, 1.1, 1.2]
-TEST_TREND_SCORE = [1, 2]  # Убрали 0, чтобы не торговать против тренда
+TEST_TREND_SCORE = [1, 2] 
 
 def api_get(path, params, retries=3):
     url = BASE_URL + path
@@ -75,13 +76,11 @@ def get_universe():
     pairs = []
     for item in j.get("result", {}).get("list", []):
         symbol = item.get("symbol", "")
-        if not symbol.endswith("USDT"):
-            continue
+        if not symbol.endswith("USDT"): continue
         try:
             price = float(item.get("lastPrice", 0))
             turnover = float(item.get("turnover24h", 0) or item.get("volume24h", 0))
-        except Exception:
-            continue
+        except Exception: continue
         if price >= MIN_PRICE and turnover >= MIN_TURNOVER_USDT:
             pairs.append((symbol, turnover))
     pairs.sort(key=lambda x: x[1], reverse=True)
@@ -107,9 +106,7 @@ def adx(df, period=14):
     high, low, close = df["high"], df["low"], df["close"]
     plus_dm = high.diff().where((high.diff() > -low.diff()) & (high.diff() > 0), 0.0)
     minus_dm = -low.diff().where((-low.diff() > high.diff()) & (-low.diff() > 0), 0.0)
-    tr = pd.concat([high - low, 
-                    np.abs(high - close.shift()), 
-                    np.abs(low - close.shift())], axis=1).max(axis=1)
+    tr = pd.concat([high - low, np.abs(high - close.shift()), np.abs(low - close.shift())], axis=1).max(axis=1)
     atr_val = tr.rolling(period).mean()
     plus_di = 100 * (plus_dm.rolling(period).mean() / atr_val.replace(0, np.nan))
     minus_di = 100 * (minus_dm.rolling(period).mean() / atr_val.replace(0, np.nan))
@@ -117,9 +114,8 @@ def adx(df, period=14):
     return dx.rolling(period).mean()
 
 def main():
-    print("🚀 Запуск ИСПРАВЛЕННОГО бэктестера (Широкий стоп)...")
+    print("🚀 Запуск бэктестера ШОРТОВ (Sweep Highs)...")
     pairs = get_universe()
-    print(f"📊 Загружено пар: {len(pairs)}")
     
     pairs_data = {}
     for idx, symbol in enumerate(pairs):
@@ -130,9 +126,7 @@ def main():
             print(f"   [{idx}/{len(pairs)}] Скачано...")
         time.sleep(0.12)
     
-    print(f"✅ Скачивание завершено. Пар: {len(pairs_data)}")
-    
-    print("🔍 Этап 1: Поиск всех сетапов AMD+Sweep...")
+    print(f"✅ Пар: {len(pairs_data)}. Ищем сетапы для ШОРТА...")
     all_signals = []
     
     for symbol, df in pairs_data.items():
@@ -155,88 +149,78 @@ def main():
         
         for i in range(40, len(df) - MAX_HOLD_CANDLES):
             row = df.iloc[i]
-            if pd.isna(row["atr"]) or row["atr"] <= 0 or pd.isna(row["low_20_past"]):
+            if pd.isna(row["atr"]) or row["atr"] <= 0 or pd.isna(row["high_20_past"]):
                 continue
             
             if row["range_atr"] > AMD_ACCUM_RANGE_ATR_MULT:
                 continue
                 
             past_10 = df.iloc[i-9 : i+1]
-            min_low = past_10["low"].min()
+            max_high = past_10["high"].max() # Ищем максимум для шорта
             pen = AMD_SWEEP_PENETRATION_ATR * row["atr"]
             
-            if min_low < row["low_20_past"] - pen and row["close"] > row["low_20_past"]:
-                sweep_low = min_low
+            # ЛОГИКА ШОРТА: Прокол ВВЕРХ и возврат ВНИЗ
+            if max_high > row["high_20_past"] + pen and row["close"] < row["high_20_past"]:
+                sweep_high = max_high
             else:
                 continue
             
             entry = row["close"]
-            # ИСПРАВЛЕНИЕ: Стоп теперь шире (1.5 ATR)
-            stop = sweep_low - SWEEP_STOP_BUFFER_ATR * row["atr"]
-            if stop >= entry:
-                continue
-            risk = entry - stop
-            if (risk / entry * 100) < 1.0:
-                continue
+            stop = sweep_high + SWEEP_STOP_BUFFER_ATR * row["atr"] # Стоп ВЫШЕ прокола
+            if stop <= entry: continue
+            risk = stop - entry
+            if (risk / entry * 100) < 1.0: continue
             
-            target = entry + risk * TARGET_RR
+            target = entry - risk * TARGET_RR # Тейк НИЖЕ входа
             
             result = None
             for j in range(i+1, min(i+1+MAX_HOLD_CANDLES, len(df))):
-                if df.iloc[j]["low"] <= stop:
+                if df.iloc[j]["high"] >= stop: # Цена пошла вверх = ЛОСЬ
                     result = -1.0
                     break
-                if df.iloc[j]["high"] >= target:
+                if df.iloc[j]["low"] <= target: # Цена пошла вниз = ПРОФИТ
                     result = TARGET_RR
                     break
             
-            # Если по времени не закрылось, закрываем по цене
             if result is None:
                 exit_price = df.iloc[i+MAX_HOLD_CANDLES]["close"]
-                result = (exit_price - entry) / risk
-            
+                result = (entry - exit_price) / risk # PnL для шорта
+                
             all_signals.append({
                 "symbol": symbol,
                 "rsi": float(row["rsi"]) if pd.notna(row["rsi"]) else 0.0,
                 "adx": float(row["adx"]) if pd.notna(row["adx"]) else 0.0,
                 "vol_ratio": float(row["vol_ratio"]) if pd.notna(row["vol_ratio"]) else 0.0,
                 "cvd": float(row["delta"]) if pd.notna(row["delta"]) else 0.0,
-                "trend": 1 if row["ema9"] > row["ema21"] else 0,
+                # Для шорта тренд = 1, если EMA9 < EMA21 (нисходящий)
+                "trend": 1 if row["ema9"] < row["ema21"] else 0,
                 "result": float(result)
             })
     
-    print(f"🎯 Найдено потенциальных сетапов: {len(all_signals)}")
+    print(f"🎯 Найдено сетапов для ШОРТА: {len(all_signals)}")
     
-    print("🔄 Этап 2: Перебор комбинаций фильтров...")
     results = []
     combos = list(itertools.product(TEST_CVD, TEST_RSI, TEST_ADX, TEST_VOL, TEST_TREND_SCORE))
     
     for cvd, rsi_r, adx_r, vol, t_min in combos:
-        trades = 0
-        wins = 0
-        pnl = 0.0
-        gross_profit = 0.0
-        gross_loss = 0.0
+        trades = 0; wins = 0; pnl = 0.0; gross_profit = 0.0; gross_loss = 0.0
         
         for sig in all_signals:
-            if cvd and sig["cvd"] <= 0: continue
+            if cvd and sig["cvd"] >= 0: continue # Для шорта CVD должен быть отрицательным
             if not (rsi_r[0] <= sig["rsi"] <= rsi_r[1]): continue
             if not (adx_r[0] <= sig["adx"] <= adx_r[1]): continue
             if sig["vol_ratio"] < vol: continue
             if sig["trend"] < t_min: continue
             
-            trades += 1
-            pnl += sig["result"]
+            trades += 1; pnl += sig["result"]
             if sig["result"] > 0:
-                wins += 1
-                gross_profit += sig["result"]
+                wins += 1; gross_profit += sig["result"]
             else:
                 gross_loss += abs(sig["result"])
         
-        if trades >= 10: # требуем минимум 10 сделок
+        if trades >= 10:
             winrate = wins / trades * 100
             pf = gross_profit / gross_loss if gross_loss > 0 else 999.0
-            
             results.append({
                 "trades": trades, "wins": wins, "winrate": winrate, "total_pnl_r": pnl,
                 "profit_factor": pf, "cvd": cvd, "rsi": rsi_r, "adx": adx_r,
@@ -246,7 +230,7 @@ def main():
     results.sort(key=lambda x: (x["profit_factor"], x["total_pnl_r"]), reverse=True)
     
     print("\n" + "="*80)
-    print("🏆 ТОП-10 ЛУЧШИХ КОМБИНАЦИЙ:")
+    print("🏆 ТОП-10 КОМБИНАЦИЙ ДЛЯ ШОРТА:")
     print("="*80)
     
     for i, r in enumerate(results[:10], 1):
@@ -254,11 +238,9 @@ def main():
               f"| Сделок: {r['trades']} | PnL: {r['total_pnl_r']:.1f}R")
         print(f"     CVD: {r['cvd']} | RSI: {r['rsi']} | ADX: {r['adx']} "
               f"| Vol: {r['vol']} | Trend: {r['trend_min']}")
-    
+        
     with open("backtest_results.json", "w", encoding="utf-8") as f:
         json.dump(results[:50], f, indent=2)
-    
-    print("\n✅ Готово! Результаты сохранены в backtest_results.json")
 
 if __name__ == "__main__":
     main()
